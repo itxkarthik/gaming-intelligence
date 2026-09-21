@@ -1,0 +1,32 @@
+{
+  "type": "record",
+  "name": "GameplayEvent",
+  "namespace": "com.gaming.events",
+  "doc": "Individual action or combat event during a competitive match",
+  "fields": [
+    {"name": "event_id", "type": "string", "doc": "Unique UUID for the event"},
+    {
+      "name": "event_type",
+      "type": {
+        "type": "enum",
+        "name": "GameplayEventType",
+        "symbols": ["KILL", "DEATH", "DAMAGE", "HEADSHOT", "ABILITY_USE", "ITEM_PURCHASE", "MOVEMENT", "SHOT_FIRED", "RELOAD", "GRENADE_THROW"]
+      }
+    },
+    {"name": "match_id", "type": "string", "doc": "Match identifier"},
+    {"name": "player_id", "type": "string", "doc": "Player emitting the event"},
+    {"name": "team_id", "type": "string", "doc": "Team A or Team B identifier"},
+    {"name": "target_player_id", "type": ["null", "string"], "default": null, "doc": "Target player if engagement"},
+    {"name": "weapon_id", "type": ["null", "string"], "default": null, "doc": "Weapon or ability used"},
+    {"name": "damage", "type": ["null", "float"], "default": null, "doc": "Damage dealt"},
+    {"name": "position_x", "type": "float", "doc": "Map X coordinate"},
+    {"name": "position_y", "type": "float", "doc": "Map Y coordinate"},
+    {"name": "position_z", "type": "float", "doc": "Map Z coordinate (altitude/level)"},
+    {"name": "accuracy", "type": ["null", "float"], "default": null, "doc": "Calculated shot accuracy 0.0-1.0"},
+    {"name": "distance", "type": ["null", "float"], "default": null, "doc": "Distance in meters to target"},
+    {"name": "reaction_time_ms", "type": ["null", "int"], "default": null, "doc": "Time between target visibility and shot in ms"},
+    {"name": "is_headshot", "type": "boolean", "default": false},
+    {"name": "event_time", "type": {"type": "long", "logicalType": "timestamp-millis"}, "doc": "UTC timestamp of event creation"},
+    {"name": "server_id", "type": "string", "doc": "Originating game server instance"}
+  ]
+}

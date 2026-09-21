@@ -1,0 +1,18 @@
+{
+  "type": "record",
+  "name": "ServerMetric",
+  "namespace": "com.gaming.events",
+  "doc": "Periodic health and resource metrics emitted by game server nodes",
+  "fields": [
+    {"name": "server_id", "type": "string", "doc": "Unique game server node identifier"},
+    {"name": "region", "type": "string", "doc": "Deployment region e.g. us-east, eu-west, ap-south"},
+    {"name": "cpu_percent", "type": "float", "doc": "CPU utilization percentage (0.0 - 100.0)"},
+    {"name": "ram_percent", "type": "float", "doc": "Memory utilization percentage (0.0 - 100.0)"},
+    {"name": "tick_rate", "type": "int", "doc": "Current simulation tick rate e.g. 128 or 64"},
+    {"name": "packet_loss_percent", "type": "float", "doc": "Packet loss rate (0.0 - 100.0)"},
+    {"name": "avg_latency_ms", "type": "float", "doc": "Average network round-trip time across clients in ms"},
+    {"name": "active_players", "type": "int", "doc": "Number of active connected players"},
+    {"name": "active_matches", "type": "int", "doc": "Number of matches currently running on instance"},
+    {"name": "timestamp", "type": {"type": "long", "logicalType": "timestamp-millis"}, "doc": "UTC timestamp of metrics sample"}
+  ]
+}

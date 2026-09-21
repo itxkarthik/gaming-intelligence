@@ -1,0 +1,23 @@
+name: "Aimbot Cheater"
+skill_tier: "silver"  # Low apparent account rank
+accuracy:
+  mean: 0.93
+  std: 0.03
+headshot_ratio:
+  mean: 0.88
+  std: 0.05
+reaction_time_ms:
+  mean: 85
+  std: 10
+kills_per_minute:
+  mean: 4.5
+  std: 0.80
+deaths_per_minute:
+  mean: 0.2
+  std: 0.10
+movement:
+  pattern: "natural"  # Movement might still look normal
+  speed_variance: 0.15
+item_purchase_delay_ms:
+  mean: 3000
+  std: 1000

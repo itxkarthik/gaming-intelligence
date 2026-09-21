@@ -1,0 +1,30 @@
+{
+  "type": "record",
+  "name": "Alert",
+  "namespace": "com.gaming.events",
+  "doc": "Structured alerts produced by real-time streaming analytics jobs",
+  "fields": [
+    {"name": "alert_id", "type": "string", "doc": "Unique alert UUID"},
+    {
+      "name": "alert_type",
+      "type": {
+        "type": "enum",
+        "name": "AlertType",
+        "symbols": ["CHEAT_DETECTED", "SMURF_DETECTED", "SERVER_DEGRADED", "BEHAVIOR_ANOMALY", "MATCH_QUALITY_LOW"]
+      }
+    },
+    {
+      "name": "severity",
+      "type": {
+        "type": "enum",
+        "name": "Severity",
+        "symbols": ["INFO", "WARNING", "CRITICAL"]
+      }
+    },
+    {"name": "entity_type", "type": "string", "doc": "Entity subject e.g. PLAYER, SERVER, MATCH"},
+    {"name": "entity_id", "type": "string", "doc": "Subject ID"},
+    {"name": "message", "type": "string", "doc": "Human readable alert message"},
+    {"name": "details", "type": {"type": "map", "values": "string"}, "doc": "Key-value attributes explaining metrics & anomaly score"},
+    {"name": "timestamp", "type": {"type": "long", "logicalType": "timestamp-millis"}, "doc": "UTC timestamp when alert was generated"}
+  ]
+}

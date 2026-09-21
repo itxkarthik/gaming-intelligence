@@ -1,0 +1,26 @@
+name: "Smurf Account"
+skill_tier: "bronze"  # New / low-rank account
+account_age_days: 3
+games_played: 12
+accuracy:
+  mean: 0.62
+  std: 0.06
+headshot_ratio:
+  mean: 0.35
+  std: 0.05
+reaction_time_ms:
+  mean: 160
+  std: 25
+kills_per_minute:
+  mean: 2.5
+  std: 0.50
+deaths_per_minute:
+  mean: 0.3
+  std: 0.10
+movement:
+  pattern: "precise"  # Advanced movement mechanics in low-tier lobbies
+  speed_variance: 0.08
+win_rate: 0.92
+item_purchase_delay_ms:
+  mean: 1000
+  std: 300

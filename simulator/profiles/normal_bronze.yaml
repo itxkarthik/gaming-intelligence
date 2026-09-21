@@ -1,0 +1,23 @@
+name: "Normal Bronze Player"
+skill_tier: "bronze"
+accuracy:
+  mean: 0.18
+  std: 0.06
+headshot_ratio:
+  mean: 0.08
+  std: 0.03
+reaction_time_ms:
+  mean: 380
+  std: 80
+kills_per_minute:
+  mean: 0.4
+  std: 0.15
+deaths_per_minute:
+  mean: 0.9
+  std: 0.25
+movement:
+  pattern: "erratic"
+  speed_variance: 0.25
+item_purchase_delay_ms:
+  mean: 5000
+  std: 2000

@@ -1,0 +1,23 @@
+name: "Normal Gold Player"
+skill_tier: "gold"
+accuracy:
+  mean: 0.28
+  std: 0.08
+headshot_ratio:
+  mean: 0.15
+  std: 0.05
+reaction_time_ms:
+  mean: 260
+  std: 50
+kills_per_minute:
+  mean: 0.8
+  std: 0.25
+deaths_per_minute:
+  mean: 0.7
+  std: 0.20
+movement:
+  pattern: "natural"
+  speed_variance: 0.15
+item_purchase_delay_ms:
+  mean: 3000
+  std: 1000

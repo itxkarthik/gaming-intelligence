@@ -1,0 +1,22 @@
+{
+  "type": "record",
+  "name": "PlayerEvent",
+  "namespace": "com.gaming.events",
+  "doc": "Lifecycle and session events for players",
+  "fields": [
+    {"name": "event_id", "type": "string", "doc": "Unique UUID for the event"},
+    {"name": "player_id", "type": "string", "doc": "Player identifier"},
+    {
+      "name": "event_type",
+      "type": {
+        "type": "enum",
+        "name": "PlayerEventType",
+        "symbols": ["LOGIN", "LOGOUT", "MATCHMAKING_START", "MATCHMAKING_FOUND", "MATCH_JOIN", "MATCH_LEAVE", "DISCONNECT", "RECONNECT", "REPORT_PLAYER", "CHAT_MESSAGE"]
+      }
+    },
+    {"name": "match_id", "type": ["null", "string"], "default": null, "doc": "Associated match ID if in-match"},
+    {"name": "metadata", "type": ["null", {"type": "map", "values": "string"}], "default": null, "doc": "Arbitrary metadata like chat content or report reason"},
+    {"name": "event_time", "type": {"type": "long", "logicalType": "timestamp-millis"}, "doc": "UTC timestamp of event creation"},
+    {"name": "server_id", "type": ["null", "string"], "default": null, "doc": "Server ID if connected to one"}
+  ]
+}

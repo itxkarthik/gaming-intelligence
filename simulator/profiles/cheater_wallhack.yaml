@@ -1,0 +1,23 @@
+name: "Wallhack Cheater"
+skill_tier: "gold"
+accuracy:
+  mean: 0.45
+  std: 0.08
+headshot_ratio:
+  mean: 0.20
+  std: 0.06
+reaction_time_ms:
+  mean: 120  # Unusually fast engagement because of pre-aiming through walls
+  std: 20
+kills_per_minute:
+  mean: 2.8
+  std: 0.50
+deaths_per_minute:
+  mean: 0.3
+  std: 0.10
+movement:
+  pattern: "suspicious"  # Tracks player models through geometry
+  speed_variance: 0.10
+item_purchase_delay_ms:
+  mean: 2000
+  std: 800

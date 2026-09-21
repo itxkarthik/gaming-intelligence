@@ -1,0 +1,23 @@
+name: "Normal Diamond Player"
+skill_tier: "diamond"
+accuracy:
+  mean: 0.42
+  std: 0.07
+headshot_ratio:
+  mean: 0.28
+  std: 0.06
+reaction_time_ms:
+  mean: 190
+  std: 30
+kills_per_minute:
+  mean: 1.2
+  std: 0.30
+deaths_per_minute:
+  mean: 0.5
+  std: 0.15
+movement:
+  pattern: "precise"
+  speed_variance: 0.08
+item_purchase_delay_ms:
+  mean: 1500
+  std: 500
