@@ -458,16 +458,22 @@ server_stream = spark.readStream \
     .option("subscribe", "server_metrics") \
     .load()
 
-# Parse Avro (or JSON for simplicity initially)
-parsed = server_stream \
-    .select(from_json(col("value").cast("string"), schema).alias("data")) \
-    .select("data.*")
+# Parse JSON stream and convert epoch to TimestampType
+parsed = parse_server_metric_stream(server_stream)
 
-# 10-second tumbling window
-health_scores = parsed \
-    .withWatermark("timestamp", "5 seconds") \
+# Tick penalty handles both 64-tick and 128-tick servers
+tick_penalty = when(
+    col("tick_rate") >= 100,
+    greatest(lit(0.0), (lit(128.0) - col("tick_rate")) * 2.0)
+).otherwise(
+    greatest(lit(0.0), (lit(64.0) - col("tick_rate")) * 2.5)
+)
+
+# 10-second tumbling window with 10-second watermark
+health_scores = parsed.withColumn("tick_penalty", tick_penalty) \
+    .withWatermark("metric_timestamp", "10 seconds") \
     .groupBy(
-        window("timestamp", "10 seconds"),
+        window("metric_timestamp", "10 seconds"),
         "server_id",
         "region"
     ) \
@@ -477,19 +483,22 @@ health_scores = parsed \
         avg("tick_rate").alias("avg_tick_rate"),
         avg("packet_loss_percent").alias("avg_packet_loss"),
         avg("avg_latency_ms").alias("avg_latency"),
-        max("active_players").alias("peak_players"),
-        # Health score: weighted composite
-        (
-            100
-            - (avg("cpu_percent") * 0.2)
-            - (avg("packet_loss_percent") * 3)
-            - (greatest(lit(0), lit(128) - avg("tick_rate")) * 2)
-            - (greatest(lit(0), avg("avg_latency_ms") - lit(50)) * 0.5)
-        ).alias("health_score")
-    )
+        avg("tick_penalty").alias("avg_tick_penalty"),
+        max("active_players").alias("peak_players")
+    ) \
+    .withColumn(
+        "raw_score",
+        lit(100.0)
+        - (col("avg_cpu") * 0.20)
+        - (col("avg_ram") * 0.15)
+        - (col("avg_packet_loss") * 3.5)
+        - col("avg_tick_penalty")
+        - (greatest(lit(0.0), col("avg_latency") - lit(50.0)) * 0.4)
+    ) \
+    .withColumn("health_score", greatest(lit(0.0), least(lit(100.0), col("raw_score"))))
 
 # Alert on degraded servers
-alerts = health_scores.filter(col("health_score") < 50)
+alerts = health_scores.filter(col("health_score") < 50.0)
 ```
 
 ### Job 2: Cheat Detection (The flagship job)
@@ -635,30 +644,43 @@ Player 821
     → BEHAVIORAL ANOMALY
 ```
 
-### ML Anomaly Detection (Spark MLlib)
+### ML Anomaly Detection Methodology
 
-Train an Isolation Forest or use statistical z-score approach:
+Instead of naively re-training an unsupervised model on tiny 3-second micro-batches (which arbitrarily flags 5% of players in every batch), use one of two robust Big Data approaches:
 
+#### Approach A: Calibrated Statistical Z-Score / IQR Scoring (Recommended)
+Compute feature deviation against calibrated population distributions (e.g. Gold/Diamond baselines):
 ```python
-# Use Spark MLlib's StandardScaler + manual z-score
-# Or use sklearn in foreachBatch for Isolation Forest
+# Composite suspicion heuristic based on standard deviation distance
+# Normal Gold: Acc mean 0.28 (std 0.08), HS mean 0.15 (std 0.05), Rxn mean 260ms (std 50ms)
+z_accuracy = (col("avg_accuracy") - lit(0.28)) / lit(0.08)
+z_headshot = (col("headshot_ratio") - lit(0.15)) / lit(0.05)
+z_reaction = (lit(260.0) - col("avg_reaction_time")) / lit(50.0)
 
-from sklearn.ensemble import IsolationForest
-
-def detect_anomalies(batch_df, batch_id):
-    pdf = batch_df.toPandas()
-    features = pdf[['accuracy', 'headshot_ratio', 'reaction_time_ms',
-                     'kills_per_min', 'damage_per_min']].values
-
-    model = IsolationForest(contamination=0.05)
-    pdf['anomaly'] = model.fit_predict(features)
-    # anomaly = -1 means outlier
-
-    flagged = pdf[pdf['anomaly'] == -1]
-    # Write flagged players to Redis/alerts
+# Flag when multiple combat features deviate simultaneously (z > 3.0)
+suspicion_score = (z_accuracy * 0.4) + (z_headshot * 0.4) + (z_reaction * 0.2)
 ```
 
-> **NOTE:** For a BTP, using `foreachBatch` with sklearn is perfectly acceptable. You're demonstrating that you understand how to integrate ML into a streaming pipeline. You don't need a production-grade online learning system.
+#### Approach B: Offline Training, Online Streaming Inference
+Train the `IsolationForest` or `XGBoost` model offline on historical/simulated training batches, serialize it to disk, and broadcast the trained model to Spark workers:
+```python
+import joblib
+
+# Load pre-trained model once
+trained_model = joblib.load("models/anti_cheat_isolation_forest.joblib")
+
+def detect_anomalies(batch_df, batch_id):
+    if batch_df.isEmpty():
+        return
+    pdf = batch_df.toPandas()
+    features = pdf[['accuracy', 'headshot_ratio', 'reaction_time_ms']].values
+    
+    # Run online inference only (do NOT fit_predict on microbatches!)
+    scores = trained_model.score_samples(features)
+    pdf['anomaly_score'] = scores
+    flagged = pdf[pdf['anomaly_score'] < -0.6]
+    # Write flagged players to Redis
+```
 
 ### Deliverables
 

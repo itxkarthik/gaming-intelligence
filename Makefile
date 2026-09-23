@@ -1,8 +1,8 @@
-.PHONY: up down restart logs ps clean kafka-topics kafka-console-consumer simulator-build simulator-run spark-submit help
+.PHONY: up down restart logs ps clean kafka-topics kafka-console-consumer simulator-build simulator-run simulator-dry-run spark-submit api-run help
 
 # ─── Docker Infrastructure ────────────────────────────────────────────────
 up:
-	docker compose up -d
+	docker compose up -d --build
 
 down:
 	docker compose down
@@ -17,31 +17,38 @@ ps:
 
 # ─── Kafka Utilities ──────────────────────────────────────────────────────
 kafka-topics:
-	docker exec -it gaming-kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list
+	docker exec gaming-kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list
 
 kafka-console-consumer:
 	@if [ -z "$(TOPIC)" ]; then \
 		echo "Usage: make kafka-console-consumer TOPIC=gameplay_events"; \
 		exit 1; \
 	fi
-	docker exec -it gaming-kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic $(TOPIC) --from-beginning
+	docker exec gaming-kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic $(TOPIC) --from-beginning
 
 # ─── Simulator (Go) ───────────────────────────────────────────────────────
 simulator-build:
 	cd simulator && go build -o bin/simulator ./cmd/simulator
 
 simulator-run: simulator-build
-	cd simulator && ./bin/simulator --players 1000 --events-per-sec 5000 --duration 1m
+	cd simulator && ./bin/simulator --players 500 --events-per-sec 2000 --duration 5m
+
+simulator-dry-run: simulator-build
+	cd simulator && ./bin/simulator --dry-run --players 200 --events-per-sec 1000 --duration 10s
 
 # ─── Spark Jobs ───────────────────────────────────────────────────────────
 spark-submit:
 	@if [ -z "$(JOB)" ]; then \
-		echo "Usage: make spark-submit JOB=server_health"; \
+		echo "Usage: make spark-submit JOB=server_health (or cheat_detection)"; \
 		exit 1; \
 	fi
-	docker exec -it gaming-spark-master /opt/spark/bin/spark-submit \
+	docker exec gaming-spark-master /opt/spark/bin/spark-submit \
 		--packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1 \
 		/opt/spark-apps/src/jobs/$(JOB).py
+
+# ─── API Service ──────────────────────────────────────────────────────────
+api-run:
+	uvicorn api.main:app --reload --host 0.0.0.0 --port 8000
 
 # ─── Cleanup ──────────────────────────────────────────────────────────────
 clean:
@@ -52,12 +59,14 @@ clean:
 # ─── Help ─────────────────────────────────────────────────────────────────
 help:
 	@echo "🎮 Gaming Intelligence Platform - Commands:"
-	@echo "  make up                     Start Kafka, Spark, Redis, Postgres"
+	@echo "  make up                     Start Kafka, Spark, Redis, Postgres (builds images)"
 	@echo "  make down                   Stop all containers"
 	@echo "  make logs                   Tail container logs"
 	@echo "  make kafka-topics           List all Kafka topics"
 	@echo "  make kafka-console-consumer TOPIC=<name> Read stream in console"
 	@echo "  make simulator-build        Compile the Go simulator binary"
-	@echo "  make simulator-run          Execute Go simulator with test args"
-	@echo "  make spark-submit JOB=<job> Submit a PySpark streaming job"
+	@echo "  make simulator-run          Execute Go simulator against Kafka"
+	@echo "  make simulator-dry-run      Execute Go simulator in dry-run mode (no Kafka)"
+	@echo "  make spark-submit JOB=<job> Submit a PySpark streaming job (server_health, cheat_detection)"
+	@echo "  make api-run                Start FastAPI backend on port 8000"
 	@echo "  make clean                  Clean temp caches and binaries"

@@ -110,18 +110,18 @@ gaming-intelligence-platform/
 
 ## 🚦 Roadmap Progress
 
-- [x] **Phase 0: Foundation & Environment Setup** (Docker Compose, Avro schemas, behavior profiles, boilerplate)
-- [ ] **Phase 1: Game Event Simulator** (Go-based event generation engine with goroutines & Kafka producer)
-- [ ] **Phase 2: Core Streaming Pipeline** (Server Health, Cheat Detection, Match Quality with PySpark)
-- [ ] **Phase 3: Advanced Analytics & ML** (Smurf detection, CUSUM behavioral shift, Isolation Forest)
-- [ ] **Phase 4: Alert Engine & API Layer** (Go alert deduplicator + FastAPI WebSockets)
+- [x] **Phase 0: Foundation & Environment Setup** (Docker Compose, schemas, behavior profiles, boilerplate)
+- [x] **Phase 1: Game Event Simulator** (Go-based concurrent event generation engine with goroutines & Kafka producer)
+- [x] **Phase 2: Core Streaming Pipeline** (Server Health Monitor & Cheat Detection with PySpark & Redis)
+- [ ] **Phase 3: Advanced Analytics & Smurf Detection** (Match Quality, CUSUM behavioral shift)
+- [ ] **Phase 4: API & Alert Layer** (FastAPI backend + Redis integration + WebSockets)
 - [ ] **Phase 5: Dashboard & Visualization** (React UI with live event streams & charts)
 - [ ] **Phase 6: Benchmarking & Historical Analysis** (Throughput vs. Latency evaluation)
 - [ ] **Phase 7: Polish & Documentation** (Final reporting, BTP submission assets)
 
 ---
 
-## 🚀 Quick Start (Phase 0)
+## 🚀 Quick Start
 
 ### 1. Launch the Infrastructure
 ```bash
@@ -129,21 +129,42 @@ make up
 ```
 
 This starts:
-- Kafka Broker on port `9092` (internal) and `9094` (external)
+- Kafka Broker on port `9092` (internal Docker) and `9094` (external host)
 - Spark Master Web UI at [http://localhost:8080](http://localhost:8080)
-- 2 Spark Workers (2 cores, 2GB memory each)
+- 2 Spark Workers (2 cores, 2GB memory each) with Python ML packages installed
 - Redis on port `6379`
-- PostgreSQL on port `5432`
+- PostgreSQL on host port `5433` (container port `5432`)
 
 ### 2. Verify Kafka Topics
 ```bash
 make kafka-topics
 ```
 
-### 3. Build & Test Simulator CLI
+### 3. Run Event Simulator
+Run against local Kafka:
 ```bash
 make simulator-run
 ```
+Or test locally without Kafka running (dry-run mode):
+```bash
+make simulator-dry-run
+```
+
+### 4. Submit PySpark Streaming Jobs
+Submit the Server Health Monitor:
+```bash
+make spark-submit JOB=server_health
+```
+Submit the Cheat Detection Pipeline:
+```bash
+make spark-submit JOB=cheat_detection
+```
+
+### 5. Launch FastAPI Backend
+```bash
+make api-run
+```
+Interactive Swagger docs available at [http://localhost:8000/docs](http://localhost:8000/docs).
 
 ---
 
