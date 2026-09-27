@@ -153,6 +153,23 @@ services:
       timeout: 3s
       retries: 5
 
+  # ─── FastAPI Backend ────────────────────────────────────────────────────
+  api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    container_name: gaming-api
+    ports:
+      - "8000:8000"
+    environment:
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - gaming-net
+
 networks:
   gaming-net:
     driver: bridge

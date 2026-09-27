@@ -1,4 +1,4 @@
-.PHONY: up down restart logs ps clean kafka-topics kafka-console-consumer simulator-build simulator-run simulator-dry-run spark-submit api-run help
+.PHONY: up down restart logs ps clean kafka-topics kafka-console-consumer simulator-build simulator-run simulator-dry-run spark-submit api-up api-run help
 
 # ─── Docker Infrastructure ────────────────────────────────────────────────
 up:
@@ -47,6 +47,9 @@ spark-submit:
 		/opt/spark-apps/src/jobs/$(JOB).py
 
 # ─── API Service ──────────────────────────────────────────────────────────
+api-up:
+	docker compose up -d --build api
+
 api-run:
 	uvicorn api.main:app --reload --host 0.0.0.0 --port 8000
 
@@ -68,5 +71,6 @@ help:
 	@echo "  make simulator-run          Execute Go simulator against Kafka"
 	@echo "  make simulator-dry-run      Execute Go simulator in dry-run mode (no Kafka)"
 	@echo "  make spark-submit JOB=<job> Submit a PySpark streaming job (server_health, cheat_detection)"
-	@echo "  make api-run                Start FastAPI backend on port 8000"
+	@echo "  make api-up                 Start FastAPI backend in Docker on port 8000"
+	@echo "  make api-run                Start FastAPI backend on host (needs local Python deps)"
 	@echo "  make clean                  Clean temp caches and binaries"
