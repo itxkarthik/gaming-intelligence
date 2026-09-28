@@ -580,13 +580,13 @@ Pipeline:
 
 ### Deliverables
 
-- [ ] Server health streaming job with tumbling windows
-- [ ] Cheat detection job with sliding windows + anomaly scoring
-- [ ] Match quality job with session windows
-- [ ] Watermark handling demonstrated (inject late events from simulator)
-- [ ] Redis sink for real-time state
-- [ ] Parquet sink for historical data
-- [ ] Unit tests for feature computation logic
+- [x] Server health streaming job with tumbling windows
+- [x] Cheat detection job with sliding windows + anomaly scoring
+- [x] Match quality job with session windows
+- [x] Watermark handling demonstrated (inject late events from simulator)
+- [x] Redis sink for real-time state
+- [x] Parquet sink for historical data
+- [x] Unit tests for feature computation logic
 
 ---
 

@@ -223,7 +223,7 @@ func initialPlayerEvents(players []*Player, matches []*Match, start time.Time) [
 				PlayerID:  p.ID,
 				EventType: "MATCH_JOIN",
 				MatchID:   &m.ID,
-				Metadata:  map[string]string{"team_id": p.TeamID},
+				Metadata:  map[string]string{"team_id": p.TeamID, "skill_tier": p.Profile.SkillTier},
 				EventTime: base + 400,
 				ServerID:  serverID,
 			})

@@ -1,7 +1,8 @@
 """Server Health Monitor Streaming Pipeline.
 
 Ingests server metrics from Kafka, computes rolling health scores across
-tumbling windows, and updates real-time server health in Redis.
+tumbling windows, updates real-time server health in Redis, and archives
+scored batches as Parquet for historical analysis.
 """
 
 import sys
@@ -14,7 +15,6 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
-from pyspark.sql.types import DoubleType
 
 from src.common.config import (
     KAFKA_BOOTSTRAP_SERVERS,
@@ -24,83 +24,17 @@ from src.common.config import (
     CHECKPOINT_DIR
 )
 from src.common.schemas import parse_server_metric_stream
+from src.common.alerts import should_emit_alert
+from src.common.sinks import safe_parquet_archive
 
 
-def write_to_redis_batch(batch_df, batch_id):
-    """ForeachBatch writer to persist server health status and alerts into Redis."""
-    if batch_df.isEmpty():
-        return
+def build_health_pipeline(parsed):
+    """Server metrics -> windowed health scores + status labels.
 
-    import redis
-
-    try:
-        r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=0, decode_responses=True)
-        rows = batch_df.collect()
-
-        for row in rows:
-            server_id = row["server_id"]
-            health_score = round(float(row["health_score"]), 2)
-            status = row["status"]
-
-            server_data = {
-                "server_id": server_id,
-                "region": str(row["region"]),
-                "health_score": str(health_score),
-                "status": status,
-                "avg_cpu": f"{float(row['avg_cpu']):.1f}",
-                "avg_ram": f"{float(row['avg_ram']):.1f}",
-                "avg_latency": f"{float(row['avg_latency']):.1f}",
-                "avg_packet_loss": f"{float(row['avg_packet_loss']):.1f}",
-                "peak_players": str(row["peak_players"]),
-                "window_end": str(row["window"]["end"]),
-                "updated_at": str(int(time.time()))
-            }
-
-            # Update live server state
-            r.hset(f"server:{server_id}", mapping=server_data)
-            r.sadd("servers:active", server_id)
-
-            # Emit alert if degraded or critical
-            if health_score < 50.0:
-                alert_payload = {
-                    "alert_id": f"srv_{server_id}_{int(time.time())}",
-                    "alert_type": "SERVER_DEGRADED",
-                    "severity": "CRITICAL" if health_score < 30.0 else "WARNING",
-                    "entity_type": "SERVER",
-                    "entity_id": server_id,
-                    "message": f"Server {server_id} degraded (Health Score: {health_score})",
-                    "details": server_data,
-                    "timestamp": int(time.time() * 1000)
-                }
-                r.lpush("alerts:recent", json.dumps(alert_payload))
-                r.ltrim("alerts:recent", 0, 99)  # Keep latest 100 alerts
-    except Exception as e:
-        print(f"[WARN] Error writing batch {batch_id} to Redis: {e}", file=sys.stderr)
-
-
-def main():
-    spark = SparkSession.builder \
-        .appName("Gaming-ServerHealthMonitor") \
-        .config("spark.sql.shuffle.partitions", "4") \
-        .getOrCreate()
-
-    spark.sparkContext.setLogLevel("WARN")
-
-    print(f"Connecting to Kafka at: {KAFKA_BOOTSTRAP_SERVERS}")
-    print(f"Subscribing to topic: {KAFKA_TOPICS['server']}")
-
-    raw_stream = spark.readStream \
-        .format("kafka") \
-        .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP_SERVERS) \
-        .option("subscribe", KAFKA_TOPICS["server"]) \
-        .option("startingOffsets", "latest") \
-        .option("failOnDataLoss", "false") \
-        .load()
-
-    parsed = parse_server_metric_stream(raw_stream)
-
-    # Calculate tick penalty: penalize if tick rate drops significantly below 64 or 128
-    # If tick_rate >= 120 -> 128-tick server; if >= 60 -> 64-tick server
+    Pure transformation (no session, no sinks) so it is unit-testable.
+    """
+    # Tick penalty: servers are provisioned as 128-tick (>=100) or 64-tick;
+    # penalize deviation from the provisioned rate.
     tick_penalty = F.when(
         F.col("tick_rate") >= 100,
         F.greatest(F.lit(0.0), (F.lit(128.0) - F.col("tick_rate")) * 2.0)
@@ -111,7 +45,7 @@ def main():
     with_penalty = parsed.withColumn("tick_penalty", tick_penalty)
 
     # Aggregate in 10-second tumbling window with 10-second watermark
-    health_scores = with_penalty \
+    return with_penalty \
         .withWatermark("metric_timestamp", "10 seconds") \
         .groupBy(
             F.window("metric_timestamp", "10 seconds"),
@@ -147,6 +81,83 @@ def main():
              .when(F.col("health_score") >= 50.0, "DEGRADED")
              .otherwise("CRITICAL")
         )
+
+
+def write_to_redis_batch(batch_df, batch_id):
+    """ForeachBatch writer: Redis live state + deduped alerts + Parquet archive."""
+    if batch_df.isEmpty():
+        return
+
+    import redis
+
+    try:
+        r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=0, decode_responses=True)
+        rows = batch_df.collect()
+
+        for row in rows:
+            server_id = row["server_id"]
+            health_score = round(float(row["health_score"]), 2)
+            status = row["status"]
+
+            server_data = {
+                "server_id": server_id,
+                "region": str(row["region"]),
+                "health_score": str(health_score),
+                "status": status,
+                "avg_cpu": f"{float(row['avg_cpu']):.1f}",
+                "avg_ram": f"{float(row['avg_ram']):.1f}",
+                "avg_latency": f"{float(row['avg_latency']):.1f}",
+                "avg_packet_loss": f"{float(row['avg_packet_loss']):.1f}",
+                "peak_players": str(row["peak_players"]),
+                "window_end": str(row["window"]["end"]),
+                "updated_at": str(int(time.time()))
+            }
+
+            # Update live server state
+            r.hset(f"server:{server_id}", mapping=server_data)
+            r.sadd("servers:active", server_id)
+
+            # Alert on degraded/critical servers, at most once per TTL window
+            if health_score < 50.0 and should_emit_alert(r, "SERVER_DEGRADED", server_id):
+                alert_payload = {
+                    "alert_id": f"srv_{server_id}_{int(time.time())}",
+                    "alert_type": "SERVER_DEGRADED",
+                    "severity": "CRITICAL" if health_score < 30.0 else "WARNING",
+                    "entity_type": "SERVER",
+                    "entity_id": server_id,
+                    "message": f"Server {server_id} degraded (Health Score: {health_score})",
+                    "details": server_data,
+                    "timestamp": int(time.time() * 1000)
+                }
+                r.lpush("alerts:recent", json.dumps(alert_payload))
+                r.ltrim("alerts:recent", 0, 99)  # Keep latest 100 alerts
+    except Exception as e:
+        print(f"[WARN] Error writing batch {batch_id} to Redis: {e}", file=sys.stderr)
+
+    safe_parquet_archive(batch_df, "server_health", batch_id)
+
+
+def main():
+    spark = SparkSession.builder \
+        .appName("Gaming-ServerHealthMonitor") \
+        .config("spark.sql.shuffle.partitions", "4") \
+        .getOrCreate()
+
+    spark.sparkContext.setLogLevel("WARN")
+
+    print(f"Connecting to Kafka at: {KAFKA_BOOTSTRAP_SERVERS}")
+    print(f"Subscribing to topic: {KAFKA_TOPICS['server']}")
+
+    raw_stream = spark.readStream \
+        .format("kafka") \
+        .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP_SERVERS) \
+        .option("subscribe", KAFKA_TOPICS["server"]) \
+        .option("startingOffsets", "latest") \
+        .option("failOnDataLoss", "false") \
+        .load()
+
+    parsed = parse_server_metric_stream(raw_stream)
+    health_scores = build_health_pipeline(parsed)
 
     # Console output for monitoring
     console_query = health_scores.writeStream \

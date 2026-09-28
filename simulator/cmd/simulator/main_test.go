@@ -96,6 +96,7 @@ func TestInitialPlayerEvents(t *testing.T) {
 			ID:        fmt.Sprintf("player_%04d", i+1),
 			Archetype: "normal_gold",
 			ServerID:  fmt.Sprintf("server-%02d", i%2+1),
+			Profile:   PlayerProfile{SkillTier: "gold"},
 		}
 	}
 
@@ -138,6 +139,9 @@ func TestInitialPlayerEvents(t *testing.T) {
 			}
 			if ev.Metadata["team_id"] == "" {
 				t.Errorf("MATCH_JOIN missing team_id metadata: %+v", ev)
+			}
+			if ev.Metadata["skill_tier"] == "" {
+				t.Errorf("MATCH_JOIN missing skill_tier metadata: %+v", ev)
 			}
 		case "MATCHMAKING_START", "MATCHMAKING_FOUND":
 			// Queue events precede match assignment; match_id stays unset.

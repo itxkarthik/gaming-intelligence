@@ -23,6 +23,8 @@ from src.common.config import (
     CHECKPOINT_DIR
 )
 from src.common.schemas import parse_gameplay_stream
+from src.common.alerts import should_emit_alert
+from src.common.sinks import safe_parquet_archive
 
 
 def build_suspicion_pipeline(parsed):
@@ -128,23 +130,26 @@ def write_player_scores_to_redis(batch_df, batch_id):
 
             r.hset(f"player:{player_id}", mapping=profile_data)
 
-            # Emit alert if high confidence anomaly
+            # Emit alert if high confidence anomaly (deduped per TTL window)
             if suspicion >= 0.70 and total_shots >= 4:
                 r.sadd("players:flagged", player_id)
-                alert_payload = {
-                    "alert_id": f"cheat_{player_id}_{int(time.time())}",
-                    "alert_type": "CHEAT_DETECTED",
-                    "severity": "CRITICAL" if suspicion >= 0.85 else "WARNING",
-                    "entity_type": "PLAYER",
-                    "entity_id": player_id,
-                    "message": f"High cheat probability ({suspicion*100:.1f}%) for player {player_id} in match {match_id}",
-                    "details": profile_data,
-                    "timestamp": int(time.time() * 1000)
-                }
-                r.lpush("alerts:recent", json.dumps(alert_payload))
-                r.ltrim("alerts:recent", 0, 99)
+                if should_emit_alert(r, "CHEAT_DETECTED", player_id):
+                    alert_payload = {
+                        "alert_id": f"cheat_{player_id}_{int(time.time())}",
+                        "alert_type": "CHEAT_DETECTED",
+                        "severity": "CRITICAL" if suspicion >= 0.85 else "WARNING",
+                        "entity_type": "PLAYER",
+                        "entity_id": player_id,
+                        "message": f"High cheat probability ({suspicion*100:.1f}%) for player {player_id} in match {match_id}",
+                        "details": profile_data,
+                        "timestamp": int(time.time() * 1000)
+                    }
+                    r.lpush("alerts:recent", json.dumps(alert_payload))
+                    r.ltrim("alerts:recent", 0, 99)
     except Exception as e:
         print(f"[WARN] Error in cheat detection batch {batch_id}: {e}", file=sys.stderr)
+
+    safe_parquet_archive(batch_df, "cheat_detection", batch_id)
 
 
 def main():

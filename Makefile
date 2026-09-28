@@ -39,7 +39,7 @@ simulator-dry-run: simulator-build
 # ─── Spark Jobs ───────────────────────────────────────────────────────────
 spark-submit:
 	@if [ -z "$(JOB)" ]; then \
-		echo "Usage: make spark-submit JOB=server_health (or cheat_detection)"; \
+		echo "Usage: make spark-submit JOB=server_health (or cheat_detection, match_quality)"; \
 		exit 1; \
 	fi
 	docker exec gaming-spark-master /opt/spark/bin/spark-submit \
@@ -77,7 +77,7 @@ help:
 	@echo "  make simulator-build        Compile the Go simulator binary"
 	@echo "  make simulator-run          Execute Go simulator against Kafka"
 	@echo "  make simulator-dry-run      Execute Go simulator in dry-run mode (no Kafka)"
-	@echo "  make spark-submit JOB=<job> Submit a PySpark streaming job (server_health, cheat_detection)"
+	@echo "  make spark-submit JOB=<job> Submit a PySpark streaming job (server_health, cheat_detection, match_quality)"
 	@echo "  make api-up                 Start FastAPI backend in Docker on port 8000"
 	@echo "  make api-run                Start FastAPI backend on host (needs local Python deps)"
 	@echo "  make test-go                Run Go simulator unit tests"

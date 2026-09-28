@@ -112,8 +112,8 @@ gaming-intelligence-platform/
 
 - [x] **Phase 0: Foundation & Environment Setup** (Docker Compose, schemas, behavior profiles, boilerplate)
 - [x] **Phase 1: Game Event Simulator** (Go-based concurrent event generation engine with goroutines & Kafka producer)
-- [x] **Phase 2: Core Streaming Pipeline** (Server Health Monitor & Cheat Detection with PySpark & Redis)
-- [ ] **Phase 3: Advanced Analytics & Smurf Detection** (Match Quality, CUSUM behavioral shift)
+- [x] **Phase 2: Core Streaming Pipeline** (Server Health, Cheat Detection & Match Quality jobs with PySpark, Redis sink + Parquet archive, 13 unit tests)
+- [ ] **Phase 3: Advanced Analytics & Smurf Detection** (Smurf Detection, CUSUM behavioral shift, Isolation Forest)
 - [ ] **Phase 4: API & Alert Layer** (FastAPI backend + Redis integration + WebSockets)
 - [ ] **Phase 5: Dashboard & Visualization** (React UI with live event streams & charts)
 - [ ] **Phase 6: Benchmarking & Historical Analysis** (Throughput vs. Latency evaluation)
