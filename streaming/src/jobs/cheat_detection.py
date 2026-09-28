@@ -25,6 +25,73 @@ from src.common.config import (
 from src.common.schemas import parse_gameplay_stream
 
 
+def build_suspicion_pipeline(parsed):
+    """Combat-event aggregation + suspicion scoring.
+
+    Pure transformation (no SparkSession creation, no sinks) so the scoring
+    logic is unit-testable against synthetic DataFrames.
+
+    Headshots are counted ONLY on KILL rows: DAMAGE and KILL rows both carry
+    the is_headshot flag for the same shot, so counting them together while
+    dividing by kill count produced ratios > 1.0 — a metric that cannot exist.
+    """
+    # Filter for combat events
+    combat_events = parsed.filter(
+        F.col("event_type").isin("KILL", "SHOT_FIRED", "HEADSHOT", "DAMAGE")
+    )
+
+    # 30-second window with 10-second watermark
+    aggregated = combat_events \
+        .withWatermark("event_timestamp", "10 seconds") \
+        .groupBy(
+            F.window("event_timestamp", "30 seconds", "15 seconds"),
+            "player_id",
+            "match_id"
+        ) \
+        .agg(
+            F.sum(F.when(F.col("event_type") == "SHOT_FIRED", 1).otherwise(0)).alias("total_shots"),
+            F.sum(F.when(F.col("event_type") == "KILL", 1).otherwise(0)).alias("total_kills"),
+            F.sum(
+                F.when((F.col("event_type") == "KILL") & (F.col("is_headshot") == True), 1)
+                 .otherwise(0)
+            ).alias("headshots"),
+            F.avg("accuracy").alias("avg_accuracy"),
+            F.avg("reaction_time_ms").alias("avg_reaction_time")
+        ) \
+        .withColumn(
+            "headshot_ratio",
+            F.when(F.col("total_kills") > 0, F.col("headshots") / F.col("total_kills")).otherwise(0.0)
+        )
+
+    # Suspicion Scoring Heuristics
+    # Accuracy anomaly: Normal <= 0.40; Suspicious > 0.70
+    acc_score = F.when(
+        F.col("avg_accuracy") > 0.70,
+        F.least(F.lit(1.0), (F.col("avg_accuracy") - 0.50) / 0.45)
+    ).otherwise(0.0)
+
+    # Headshot ratio anomaly: Normal <= 0.30; Suspicious > 0.65
+    hs_score = F.when(
+        F.col("headshot_ratio") > 0.65,
+        F.least(F.lit(1.0), (F.col("headshot_ratio") - 0.35) / 0.55)
+    ).otherwise(0.0)
+
+    # Inhuman reaction time anomaly: Normal >= 200ms; Inhuman < 120ms
+    rxn_score = F.when(
+        (F.col("avg_reaction_time") > 0) & (F.col("avg_reaction_time") < 140),
+        F.least(F.lit(1.0), (F.lit(140.0) - F.col("avg_reaction_time")) / 100.0)
+    ).otherwise(0.0)
+
+    return aggregated \
+        .withColumn("acc_score", acc_score) \
+        .withColumn("hs_score", hs_score) \
+        .withColumn("rxn_score", rxn_score) \
+        .withColumn(
+            "suspicion_score",
+            F.least(F.lit(1.0), (F.col("acc_score") * 0.45) + (F.col("hs_score") * 0.40) + (F.col("rxn_score") * 0.15))
+        )
+
+
 def write_player_scores_to_redis(batch_df, batch_id):
     """ForeachBatch sink to update player suspicion profiles and trigger alerts."""
     if batch_df.isEmpty():
@@ -100,59 +167,7 @@ def main():
         .load()
 
     parsed = parse_gameplay_stream(raw_stream)
-
-    # Filter for combat events
-    combat_events = parsed.filter(
-        F.col("event_type").isin("KILL", "SHOT_FIRED", "HEADSHOT", "DAMAGE")
-    )
-
-    # 30-second window with 10-second watermark
-    aggregated = combat_events \
-        .withWatermark("event_timestamp", "10 seconds") \
-        .groupBy(
-            F.window("event_timestamp", "30 seconds", "15 seconds"),
-            "player_id",
-            "match_id"
-        ) \
-        .agg(
-            F.sum(F.when(F.col("event_type") == "SHOT_FIRED", 1).otherwise(0)).alias("total_shots"),
-            F.sum(F.when(F.col("event_type") == "KILL", 1).otherwise(0)).alias("total_kills"),
-            F.sum(F.when(F.col("is_headshot") == True, 1).otherwise(0)).alias("headshots"),
-            F.avg("accuracy").alias("avg_accuracy"),
-            F.avg("reaction_time_ms").alias("avg_reaction_time")
-        ) \
-        .withColumn(
-            "headshot_ratio",
-            F.when(F.col("total_kills") > 0, F.col("headshots") / F.col("total_kills")).otherwise(0.0)
-        )
-
-    # Suspicion Scoring Heuristics
-    # Accuracy anomaly: Normal <= 0.40; Suspicious > 0.70
-    acc_score = F.when(
-        F.col("avg_accuracy") > 0.70,
-        F.least(F.lit(1.0), (F.col("avg_accuracy") - 0.50) / 0.45)
-    ).otherwise(0.0)
-
-    # Headshot ratio anomaly: Normal <= 0.30; Suspicious > 0.65
-    hs_score = F.when(
-        F.col("headshot_ratio") > 0.65,
-        F.least(F.lit(1.0), (F.col("headshot_ratio") - 0.35) / 0.55)
-    ).otherwise(0.0)
-
-    # Inhuman reaction time anomaly: Normal >= 200ms; Inhuman < 120ms
-    rxn_score = F.when(
-        (F.col("avg_reaction_time") > 0) & (F.col("avg_reaction_time") < 140),
-        F.least(F.lit(1.0), (F.lit(140.0) - F.col("avg_reaction_time")) / 100.0)
-    ).otherwise(0.0)
-
-    with_suspicion = aggregated \
-        .withColumn("acc_score", acc_score) \
-        .withColumn("hs_score", hs_score) \
-        .withColumn("rxn_score", rxn_score) \
-        .withColumn(
-            "suspicion_score",
-            F.least(F.lit(1.0), (F.col("acc_score") * 0.45) + (F.col("hs_score") * 0.40) + (F.col("rxn_score") * 0.15))
-        )
+    with_suspicion = build_suspicion_pipeline(parsed)
 
     # Console display for flagged players
     console_query = with_suspicion \

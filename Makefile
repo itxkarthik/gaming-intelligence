@@ -1,4 +1,4 @@
-.PHONY: up down restart logs ps clean kafka-topics kafka-console-consumer simulator-build simulator-run simulator-dry-run spark-submit api-up api-run help
+.PHONY: up down restart logs ps clean kafka-topics kafka-console-consumer simulator-build simulator-run simulator-dry-run spark-submit api-up api-run test-go test-streaming help
 
 # ─── Docker Infrastructure ────────────────────────────────────────────────
 up:
@@ -53,6 +53,13 @@ api-up:
 api-run:
 	uvicorn api.main:app --reload --host 0.0.0.0 --port 8000
 
+# ─── Tests ────────────────────────────────────────────────────────────────
+test-go:
+	cd simulator && go test ./... -count=1
+
+test-streaming:
+	docker exec -w /opt/spark-apps -e PYTHONPATH=/opt/spark/python:/opt/spark/python/lib/py4j-0.10.9.7-src.zip gaming-spark-master python3 -m pytest tests -q -p no:cacheprovider
+
 # ─── Cleanup ──────────────────────────────────────────────────────────────
 clean:
 	rm -rf /tmp/spark-checkpoints/*
@@ -73,4 +80,6 @@ help:
 	@echo "  make spark-submit JOB=<job> Submit a PySpark streaming job (server_health, cheat_detection)"
 	@echo "  make api-up                 Start FastAPI backend in Docker on port 8000"
 	@echo "  make api-run                Start FastAPI backend on host (needs local Python deps)"
+	@echo "  make test-go                Run Go simulator unit tests"
+	@echo "  make test-streaming         Run PySpark pipeline tests in the Spark container"
 	@echo "  make clean                  Clean temp caches and binaries"
