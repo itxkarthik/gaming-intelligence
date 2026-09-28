@@ -21,6 +21,24 @@ func TestSampleNormalClampsToRange(t *testing.T) {
 	}
 }
 
+func TestValidatePoolSize(t *testing.T) {
+	t.Run("rejects pool smaller than matches need", func(t *testing.T) {
+		if err := validatePoolSize(100, 20); err == nil {
+			t.Fatal("expected error for 100 players with 20 matches (needs 200)")
+		}
+	})
+	t.Run("accepts exact fit", func(t *testing.T) {
+		if err := validatePoolSize(200, 20); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+	t.Run("accepts larger pool", func(t *testing.T) {
+		if err := validatePoolSize(500, 20); err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+	})
+}
+
 func TestChooseArchetype(t *testing.T) {
 	const cheater, smurf, toxic = 0.05, 0.05, 0.05
 

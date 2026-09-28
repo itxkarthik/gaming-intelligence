@@ -42,7 +42,17 @@ spark-submit:
 		echo "Usage: make spark-submit JOB=server_health (or cheat_detection, match_quality)"; \
 		exit 1; \
 	fi
-	docker exec gaming-spark-master /opt/spark/bin/spark-submit \
+	# JAVA_TOOL_OPTIONS: host has broken IPv6 — without preferring IPv4 the Ivy
+	# --packages resolution hangs on dead IPv6 routes and reports "not found".
+	# Resource caps: each job gets exactly 1 core / 768MB so all 3 streaming
+	# jobs coexist on the 2-worker (4 cores / 4G) cluster — without them the
+	# first app claims every core and the rest wait forever.
+	docker exec -e JAVA_TOOL_OPTIONS=-Djava.net.preferIPv4Stack=true gaming-spark-master /opt/spark/bin/spark-submit \
+		--master spark://spark-master:7077 \
+		--conf spark.cores.max=1 \
+		--conf spark.executor.cores=1 \
+		--conf spark.executor.memory=512m \
+		--conf spark.executor.memoryOverhead=256m \
 		--packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1 \
 		/opt/spark-apps/src/jobs/$(JOB).py
 

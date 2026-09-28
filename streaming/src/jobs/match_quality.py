@@ -98,6 +98,12 @@ def build_match_quality_pipeline(gameplay_parsed, player_parsed):
         )
 
     # ── Stream-stream join: same match, overlapping session windows ──
+    # KNOWN SPARK LIMITATION: StreamingJoinHelper cannot extract a state
+    # watermark from SESSION window attributes (with or without interval
+    # constants — verified empirically on 3.5.1), so the join state store is
+    # not watermark-trimmed and logs a WARN per batch. State grows with
+    # distinct matches seen; acceptable at this scale. Fixing properly needs
+    # transformWithState or a staged foreachBatch join — Phase 3 candidate.
     joined = combat_stats.alias("c").join(
         player_stats.alias("p"),
         (F.col("c.match_id") == F.col("p.match_id"))

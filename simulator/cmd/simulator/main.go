@@ -151,6 +151,19 @@ func chooseArchetype(roll, rankRoll, cheaterRatio, smurfRatio, toxicRatio float6
 	}
 }
 
+// validatePoolSize rejects configurations that would corrupt event semantics.
+// Players are assigned to matches in place (player.MatchID / player.TeamID are
+// overwritten per match), so a pool smaller than matches*10 would put the same
+// player in two matches simultaneously and corrupt team attribution.
+func validatePoolSize(players, matchesConcurrent int) error {
+	if matchesConcurrent > 0 && players < matchesConcurrent*10 {
+		return fmt.Errorf("--players (%d) must be at least --matches-concurrent*10 (%d); "+
+			"the player pool is assigned to matches in place",
+			players, matchesConcurrent*10)
+	}
+	return nil
+}
+
 func loadProfiles(dir string) (map[string]PlayerProfile, error) {
 	profiles := make(map[string]PlayerProfile)
 	files, err := os.ReadDir(dir)
@@ -256,6 +269,11 @@ func main() {
 	flag.BoolVar(&cfg.DryRun, "dry-run", false, "Simulate without sending to Kafka (prints stats to console)")
 
 	flag.Parse()
+
+	if err := validatePoolSize(cfg.Players, cfg.MatchesConcurrent); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		os.Exit(1)
+	}
 
 	fmt.Println("=================================================================")
 	fmt.Println("🎮 Gaming Intelligence Platform - Real-Time Event Simulator")

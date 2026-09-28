@@ -72,6 +72,8 @@ services:
       - POSTGRES_PORT=5432
     volumes:
       - ./streaming:/opt/spark-apps
+      - ./data/checkpoints:/tmp/spark-checkpoints
+      - ./data/parquet:/tmp/gaming-data/parquet
     networks:
       - gaming-net
 
@@ -93,6 +95,8 @@ services:
       - POSTGRES_PORT=5432
     volumes:
       - ./streaming:/opt/spark-apps
+      - ./data/checkpoints:/tmp/spark-checkpoints
+      - ./data/parquet:/tmp/gaming-data/parquet
     networks:
       - gaming-net
 
@@ -114,6 +118,8 @@ services:
       - POSTGRES_PORT=5432
     volumes:
       - ./streaming:/opt/spark-apps
+      - ./data/checkpoints:/tmp/spark-checkpoints
+      - ./data/parquet:/tmp/gaming-data/parquet
     networks:
       - gaming-net
 
