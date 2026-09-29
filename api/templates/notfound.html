@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block title %}Not found{% endblock %}
+{% block content %}
+<section class="panel">
+  <h2>404 — {{ what }} not found</h2>
+  <p class="legend"><code>{{ ident }}</code> doesn't exist (or its window has expired).
+  Head back to the <a href="/">overview</a>.</p>
+</section>
+{% endblock %}

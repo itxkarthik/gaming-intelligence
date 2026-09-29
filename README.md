@@ -40,7 +40,7 @@ A high-throughput, distributed streaming platform designed to monitor game serve
                         FastAPI + WS       Alert Engine (Go)
                             │                   │
                             ▼                   ▼
-                      React Dashboard      Postgres / Alerts
+                      Datastar Dashboard   Postgres / Alerts
                                                 
                                       +
                                       
@@ -63,7 +63,7 @@ A high-throughput, distributed streaming platform designed to monitor game serve
 | **Persistent Storage** | PostgreSQL 16 + Parquet on HDFS / Local disk |
 | **Alert Engine** | Go 1.22 |
 | **Backend API** | Python FastAPI + WebSockets |
-| **Frontend** | React + TypeScript + Recharts |
+| **Frontend** | Datastar v1.0.4 + Jinja2 SSR (SSE patches, zero build step) |
 
 ---
 
@@ -99,9 +99,13 @@ gaming-intelligence-platform/
 │       │   └── schemas.py
 │       ├── jobs/                   # Streaming analytics jobs
 │       └── ml/                     # ML & Anomaly detection
-├── api/                            # FastAPI REST & WebSocket Backend
+├── api/                            # FastAPI REST, WebSocket & Dashboard
 │   ├── requirements.txt
-│   └── main.py
+│   ├── main.py                     # REST + WS endpoints
+│   ├── state.py                    # Shared feed / sampler / PG pool
+│   ├── dashboard.py                # SSR views + Datastar SSE streams
+│   ├── templates/                  # Jinja2 (7 tabs + drill-downs)
+│   └── static/                     # dashboard.css
 └── docs/
     └── ROADMAP.md                  # Comprehensive implementation roadmap
 ```
@@ -115,7 +119,7 @@ gaming-intelligence-platform/
 - [x] **Phase 2: Core Streaming Pipeline** (Server Health, Cheat Detection & Match Quality jobs with PySpark, Redis sink + Parquet archive, 13 unit tests)
 - [x] **Phase 3: Advanced Analytics & Smurf Detection** (Smurf Detection with 100% live precision, CUSUM behavior-shift detection with cross-job boost into cheat scoring, Economy analytics, offline-trained Isolation Forest inference, 31 unit tests)
 - [x] **Phase 4: API & Alert Layer** (Go alert engine consuming Kafka alerts with dedup/rate-limiting + PostgreSQL history, 12 REST endpoints incl. match/economy/player drill-downs, WebSocket event & alert feeds, throughput stats)
-- [ ] **Phase 5: Dashboard & Visualization** (React UI with live event streams & charts)
+- [x] **Phase 5: Dashboard & Visualization** (Datastar + Jinja2 server-rendered dashboard: 7 tabs, live event stream, quality histogram, player/match drill-downs, filterable alert history — all served from the API at `:8000`, zero build step)
 - [ ] **Phase 6: Benchmarking & Historical Analysis** (Throughput vs. Latency evaluation)
 - [ ] **Phase 7: Polish & Documentation** (Final reporting, BTP submission assets)
 
@@ -169,6 +173,9 @@ make spark-submit JOB=cheat_detection
 make api-run
 ```
 Interactive Swagger docs available at [http://localhost:8000/docs](http://localhost:8000/docs).
+
+The live dashboard is served from the same server at [http://localhost:8000/](http://localhost:8000/) —
+server-rendered HTML with Datastar SSE patches (no build step, no separate frontend container).
 
 ---
 

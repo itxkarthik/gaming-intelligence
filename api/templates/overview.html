@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% block title %}Overview{% endblock %}
+{% block content %}
+<div class="kpis" id="kpis">{{ kpis|safe }}</div>
+
+<div class="grid-2">
+  <section class="panel span2">
+    <h2>Live Event Stream</h2>
+    <div class="table-wrap scroll-y max-h-420">
+      <table>
+        <thead>
+          <tr><th>Time</th><th>Type</th><th>Event</th><th>Detail</th><th>Match</th></tr>
+        </thead>
+        <tbody id="event-rows">
+          <tr class="empty"><td colspan="5">Waiting for events — start the simulator (<code>make simulator-run</code>)…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>🚨 Recent Alerts</h2>
+    <ul class="alerts" id="recent-alerts">{{ alerts|safe }}</ul>
+  </section>
+
+  <section class="panel">
+    <h2>Flagged Players</h2>
+    <ul class="flagged" id="flagged-mini">{{ flagged|safe }}</ul>
+  </section>
+</div>
+{% endblock %}

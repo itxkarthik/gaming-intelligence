@@ -11,7 +11,7 @@ Before diving into phases, here's the language breakdown per component:
 | **Game Event Simulator**         | **Go**                           | High-throughput, lightweight goroutines for simulating thousands of concurrent players. Compiles to a single binary. Native Kafka producer libraries (`confluent-kafka-go`/`segmentio/kafka-go`) are excellent. |
 | **Spark Streaming Pipelines**    | **Python (PySpark)**             | First-class Spark support. Faster iteration. MLlib integration for anomaly detection. Your BTP evaluators read Python. Scala is the only real alternative here — but Python wins for prototyping speed.         |
 | **Dashboard / API**              | **Python (FastAPI + WebSocket)** | FastAPI for REST, WebSocket for live push. Integrates directly with your Spark output (Parquet, Redis, Postgres).                                                                                               |
-| **Frontend Dashboard**           | **React + TypeScript**           | Real-time charts via Recharts/D3. WebSocket integration. Looks impressive in demos.                                                                                                                             |
+| **Frontend Dashboard**           | **Datastar + Jinja2 (SSR)**      | Server-rendered HTML + SSE hypermedia patches. Zero build step, no node/npm, same FastAPI process — one backend, no CORS.                                                                                                                             |
 | **Alert Engine**                 | **Go**                           | Lightweight consumer that reads Kafka alert topics and fires webhooks/notifications. Go's concurrency model is perfect for this.                                                                                |
 | **Benchmarking / Load Testing**  | **Go**                           | You need raw throughput control. Go lets you dial events/sec precisely with rate limiters.                                                                                                                      |
 | **Historical Batch Analysis**    | **Python (PySpark)**             | Same PySpark codebase, just batch mode on HDFS/Hive.                                                                                                                                                            |
@@ -255,9 +255,8 @@ gaming-intelligence-platform/
 │   ├── main.py
 │   ├── routers/
 │   └── ws/                           # WebSocket handlers
-├── dashboard/                        # React + TypeScript
-│   ├── package.json
-│   └── src/
+├── api/templates/                    # Jinja2 SSR views (Datastar)
+├── api/static/                       # dashboard.css
 ├── batch/                            # PySpark batch jobs
 │   └── historical_analysis.py
 ├── benchmarks/                       # Go
@@ -751,8 +750,8 @@ GET  /api/v1/stats/throughput           # Pipeline throughput metrics
 
 ### Goals
 
-- Build a React dashboard with real-time updates
-- Multiple views: overview, server health, anti-cheat, match quality, tournament
+- Build a Datastar dashboard: complete HTML rendered server-side (works without JS), live updates merged in by one 12 KB script — no bundler, no node/npm
+- Multiple views: overview, server health, anti-cheat, match quality, player behavior, tournament, alerts
 
 ### Dashboard Screens
 
@@ -786,19 +785,20 @@ GET  /api/v1/stats/throughput           # Pipeline throughput metrics
 
 ### Key Libraries
 
-- **Recharts** or **Tremor** — Charts
-- **TanStack Table** — Data tables
-- **React Query** — API data fetching
-- **Socket.io-client** or native WebSocket — Real-time updates
+- **Datastar v1.0.4** (pinned CDN) — hypermedia core: one `<script>` tag, SSE patches (`datastar-patch-elements`) merged into the DOM
+- **datastar-py** (official Python SDK) — `DatastarResponse` + `ServerSentEventGenerator` on FastAPI
+- **Jinja2** — server-side rendering of every view
+- **Native WebSocket** (`/ws/live`, `/ws/alerts`) kept for external clients; the dashboard itself rides SSE streams
+- Charts are pure HTML/CSS (quality histogram bars, score bars) — no chart library, no build step
 
 ### Deliverables
 
-- [ ] Overview dashboard with key metrics
-- [ ] Server health map with live indicators
-- [ ] Anti-cheat view with flagged players + suspicion scores
-- [ ] Match quality histogram + individual match drill-down
-- [ ] Live event stream display
-- [ ] Alert feed
+- [x] Overview dashboard with key metrics
+- [x] Server health map with live indicators
+- [x] Anti-cheat view with flagged players + suspicion scores
+- [x] Match quality histogram + individual match drill-down
+- [x] Live event stream display
+- [x] Alert feed
 
 ---
 

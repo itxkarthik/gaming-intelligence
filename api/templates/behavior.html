@@ -1,0 +1,53 @@
+{% extends "base.html" %}
+{% block title %}Player Behavior{% endblock %}
+{% block content %}
+<div class="grid-2">
+  <section class="panel">
+    <h2>🚨 CUSUM Behavior Anomalies</h2>
+    <div class="table-wrap scroll-y max-h-420">
+      <table>
+        <thead><tr><th>Player</th><th class="num">Last acc</th><th class="num">Baseline</th>
+          <th class="num">Z</th><th class="num">Anomalies</th></tr></thead>
+        <tbody>
+          {% for a in anomalies %}
+          <tr>
+            <td><a class="mono" href="/players/{{ a.player_id }}">{{ a.player_id }}</a></td>
+            <td class="num">{{ a.get('last_batch_mean', '—') }}</td>
+            <td class="num">{{ a.get('baseline_mean', '—') }} (n={{ a.get('baseline_n', '0') }})</td>
+            <td class="num warn">{{ a.get('last_z', '—') }}</td>
+            <td class="num">{{ a.get('anomalies', '0') }}</td>
+          </tr>
+          {% else %}
+          <tr class="empty"><td colspan="5">No behavior shifts detected yet (run two simulator runs — CUSUM needs a baseline).</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>🕵️ Smurf Candidates</h2>
+    <div class="table-wrap scroll-y max-h-420">
+      <table>
+        <thead><tr><th>Player</th><th class="w-20">Prob</th><th class="num">Age</th>
+          <th class="num">Games</th><th>Archetype</th></tr></thead>
+        <tbody>
+          {% for s in smurfs %}
+          <tr>
+            <td><a class="mono" href="/players/{{ s.player_id }}">{{ s.player_id }}</a></td>
+            <td class="bar-cell"><div class="bar"><div class="bar-fill warn"
+                 style="width:{{ [s.get('probability')|float * 100, 100]|min }}%"></div></div>
+                 <span class="bar-num warn">{{ s.get('probability', '—') }}</span></td>
+            <td class="num">{{ s.get('account_age_days', '—') }}d</td>
+            <td class="num">{{ s.get('games_played', '—') }}</td>
+            <td class="mono">{{ s.get('archetype', '—') }}</td>
+          </tr>
+          {% else %}
+          <tr class="empty"><td colspan="5">No smurfs flagged (needs two runs: combat history first).</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </section>
+</div>
+{% endblock %}

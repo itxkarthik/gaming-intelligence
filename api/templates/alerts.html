@@ -1,0 +1,58 @@
+{% extends "base.html" %}
+{% block title %}Alerts{% endblock %}
+{% block content %}
+<div class="grid-2">
+  <section class="panel">
+    <h2>🚨 Live Alert Feed <span class="hint">pushed by the Go alert engine</span></h2>
+    <ul class="alerts" id="alert-rows">{{ live|safe }}</ul>
+  </section>
+
+  <section class="panel span2">
+    <h2>PostgreSQL History <span class="hint">alert_history · engine-persisted</span></h2>
+
+    <div class="filters">
+      <a class="chip {{ 'sel' if not alert_type and not severity }}"
+         href="{{ qs(alert_type=None, severity=None) }}">All</a>
+      {% for t in ['SERVER_DEGRADED', 'CHEAT_DETECTED', 'MATCH_QUALITY_LOW', 'SMURF_DETECTED', 'BEHAVIOR_ANOMALY'] %}
+      <a class="chip {{ 'sel' if alert_type == t }}"
+         href="{{ qs(alert_type=t, severity=None, page=None) }}">{{ t }}</a>
+      {% endfor %}
+      <span class="sep"></span>
+      {% for s in ['CRITICAL', 'WARNING'] %}
+      <a class="chip {{ 'sel' if severity == s }}"
+         href="{{ qs(severity=s, alert_type=None, page=None) }}">{{ s }}</a>
+      {% endfor %}
+    </div>
+
+    {% if hist_error %}
+    <p class="error">PostgreSQL unavailable: {{ hist_error }}</p>
+    {% else %}
+    <div class="table-wrap scroll-y max-h-480">
+      <table>
+        <thead><tr><th>Time</th><th>Severity</th><th>Type</th><th>Entity</th><th>Message</th></tr></thead>
+        <tbody>
+          {% for a in history.alerts %}
+          <tr>
+            <td class="mono dim">{{ a.ts.strftime('%Y-%m-%d %H:%M:%S') if a.ts else '—' }}</td>
+            <td><span class="chip {{ 'bad' if a.severity == 'CRITICAL' else 'warn' }}">{{ a.severity }}</span></td>
+            <td class="mono">{{ a.alert_type }}</td>
+            <td class="mono dim">{{ a.entity_type }}/{{ a.entity_id }}</td>
+            <td>{{ a.message }}</td>
+          </tr>
+          {% else %}
+          <tr class="empty"><td colspan="5">No history yet.</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    <div class="pager">
+      <span class="dim">{{ history.total }} alerts total · page {{ page + 1 }} of {{ max_page + 1 }}</span>
+      <span>
+        {% if page > 0 %}<a class="chip" href="{{ qs(page=page - 1) }}">← Prev</a>{% endif %}
+        {% if page < max_page %}<a class="chip" href="{{ qs(page=page + 1) }}">Next →</a>{% endif %}
+      </span>
+    </div>
+    {% endif %}
+  </section>
+</div>
+{% endblock %}

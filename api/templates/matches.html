@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% block title %}Match Quality{% endblock %}
+{% block content %}
+<div class="stats-row" id="matches-stats">{{ stats|safe }}</div>
+
+<div class="grid-2">
+  <section class="panel">
+    <h2>Quality Distribution</h2>
+    <div id="histogram" class="histogram">{{ histogram|safe }}</div>
+    <p class="legend">Score 0–100 · <span class="chip ok">BALANCED ≥70</span>
+      <span class="chip warn">UNBALANCED ≥40</span> <span class="chip bad">STOMPED &lt;40</span></p>
+  </section>
+
+  <section class="panel span2">
+    <h2>Matches <span class="hint">live · click a match to drill down</span></h2>
+    <div class="table-wrap scroll-y max-h-480">
+      <table>
+        <thead>
+          <tr>
+            <th>Match</th><th class="w-24">Quality</th><th>Status</th>
+            <th class="num">Kills</th><th class="num">Imbalance</th><th class="num">DC</th><th class="num">Duration</th>
+          </tr>
+        </thead>
+        <tbody id="match-rows">
+          <tr class="empty"><td colspan="7">No matches scored yet…</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+</div>
+{% endblock %}

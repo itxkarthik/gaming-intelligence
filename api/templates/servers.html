@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block title %}Server Health{% endblock %}
+{% block content %}
+<div class="stats-row" id="servers-stats">{{ stats|safe }}</div>
+
+<section class="panel">
+  <h2>Server Health Map <span class="hint">live · refreshed every 2s</span></h2>
+  <div class="table-wrap scroll-y max-h-560">
+    <table>
+      <thead>
+        <tr>
+          <th>Server</th><th>Region</th><th class="w-24">Health</th><th>Status</th>
+          <th class="num">CPU</th><th class="num">RAM</th><th class="num">Latency</th><th class="num">Players</th>
+        </tr>
+      </thead>
+      <tbody id="server-rows">
+        <tr class="empty"><td colspan="8">No server metrics yet — start the simulator…</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+{% endblock %}

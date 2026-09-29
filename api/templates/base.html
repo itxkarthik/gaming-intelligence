@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Dashboard{% endblock %} · Gaming Intelligence Platform</title>
+  <link rel="stylesheet" href="/static/dashboard.css">
+  <script type="module" src="https://cdn.jsdelivr.net/gh/starfederation/datastar@v1.0.4/bundles/datastar.js"></script>
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="/">🎮&nbsp;<span>Gaming Intelligence</span></a>
+  <nav>
+    {% for key, label, href in nav %}
+    <a href="{{ href }}" class="{{ 'active' if key == active else '' }}">{{ label }}</a>
+    {% endfor %}
+  </nav>
+  <div class="live-pill"><span class="dot live"></span>LIVE</div>
+</header>
+
+<main>
+{% block content %}{% endblock %}
+</main>
+
+<footer>Gaming Intelligence Platform — Kafka → PySpark → Redis/PostgreSQL · FastAPI + Datastar (no build step)</footer>
+
+{% if sse %}
+<script type="module">
+  /* Open this view's Datastar SSE stream. The element is appended AFTER
+     window load instead of being written into the HTML: on v1.0.4 the
+     initial attribute scan skips data-init, while the mutation-observer
+     path (element added post-boot) reliably fires. */
+  window.addEventListener("load", () => {
+    const d = document.createElement("div");
+    d.setAttribute("data-init", "@get('{{ sse }}', {openWhenHidden: true})");
+    document.body.appendChild(d);
+  });
+</script>
+{% endif %}
+</body>
+</html>
