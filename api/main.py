@@ -33,6 +33,17 @@ REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
 KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9094")
 FEED_TOPICS = ["gameplay_events", "player_events", "server_metrics"]
+
+# PostgreSQL: alert history written by the Go alert engine (Phase 4).
+# Defaults match the compose network; host-run needs POSTGRES_PORT=5433
+# (docker-compose maps 5433->5432 to avoid a host port collision).
+POSTGRES_HOST = os.getenv("POSTGRES_HOST", "localhost")
+POSTGRES_PORT = int(os.getenv("POSTGRES_PORT", "5432"))
+POSTGRES_USER = os.getenv("POSTGRES_USER", "gaming")
+POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "gaming_dev")
+POSTGRES_DB = os.getenv("POSTGRES_DB", "gaming_platform")
+PG_DSN = (f"postgresql://{POSTGRES_USER}:{POSTGRES_PASSWORD}"
+          f"@{POSTGRES_HOST}:{POSTGRES_PORT}/{POSTGRES_DB}")
 HEARTBEAT_SECONDS = 15
 
 
@@ -230,6 +241,69 @@ async def list_recent_alerts(limit: int = 20):
         return {"alerts": [], "error": str(e)}
 
 
+_pg_pool: Optional[Any] = None
+_pg_pool_lock = asyncio.Lock()
+
+
+async def _get_pg_pool():
+    """Lazily created asyncpg pool (min 1 / max 5 connections).
+
+    asyncpg.Pool has no is_closed() (that lives on Connection) — the pool
+    recovers per-acquire, so None-check is the whole guard.
+    """
+    global _pg_pool
+    if _pg_pool is None:
+        async with _pg_pool_lock:
+            if _pg_pool is None:
+                import asyncpg
+                _pg_pool = await asyncpg.create_pool(PG_DSN, min_size=1, max_size=5)
+    return _pg_pool
+
+
+@app.get("/api/v1/alerts/history")
+async def alert_history(limit: int = 50, offset: int = 0,
+                        alert_type: Optional[str] = None,
+                        severity: Optional[str] = None):
+    """Paginated alert history from PostgreSQL (written by the Go alert
+    engine) — complements /alerts/recent (Redis, latest 100 only).
+    Filters: alert_type (SERVER_DEGRADED, CHEAT_DETECTED, ...) and
+    severity (WARNING, CRITICAL)."""
+    limit = max(1, min(limit, 200))
+    offset = max(0, offset)
+    def _as_dict(rec) -> Dict[str, Any]:
+        d = dict(rec)
+        if isinstance(d.get("details"), str):  # asyncpg leaves jsonb as str
+            try:
+                d["details"] = json.loads(d["details"])
+            except ValueError:
+                pass
+        return d
+
+    try:
+        pool = await _get_pg_pool()
+        filters = ("WHERE ($3::text IS NULL OR alert_type = $3) "
+                   "AND ($4::text IS NULL OR severity = $4)")
+        rows = await pool.fetch(
+            "SELECT id, alert_id, alert_type, severity, entity_type, "
+            "entity_id, message, details, ts, received_at "
+            f"FROM alert_history {filters} "
+            "ORDER BY id DESC LIMIT $1 OFFSET $2",
+            limit, offset, alert_type, severity)
+        total = await pool.fetchval(
+            "SELECT count(*) FROM alert_history "
+            "WHERE ($1::text IS NULL OR alert_type = $1) "
+            "AND ($2::text IS NULL OR severity = $2)",
+            alert_type, severity)
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"PostgreSQL unavailable: {e}")
+    return {
+        "alerts": [_as_dict(row) for row in rows],
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
+
+
 # ─── Tournament / aggregate stats ───────────────────────────────────────────
 
 @app.get("/api/v1/tournament/live")
@@ -267,13 +341,18 @@ def tournament_live():
 
 # ─── Pipeline throughput (Kafka log offsets) ────────────────────────────────
 
+# kafka-python's KafkaConsumer is NOT thread-safe: creation and every offset
+# query must happen under one lock. Only the background sampler queries
+# Kafka — request handlers read the samples it leaves behind.
 _throughput_lock = threading.Lock()
 _throughput_samples: List[Dict[str, Any]] = []
 _throughput_consumer = None
 _throughput_started = False
+_throughput_last: Dict[str, int] = {}
 
 
-def _get_throughput_consumer():
+def _get_throughput_consumer_locked():
+    """Caller must hold _throughput_lock."""
     global _throughput_consumer
     if _throughput_consumer is None:
         from kafka import KafkaConsumer
@@ -287,8 +366,10 @@ def _get_throughput_consumer():
 
 
 def _topic_counts() -> Dict[str, int]:
+    """Offset snapshot. Caller must hold _throughput_lock (single-threaded
+    access to the shared consumer)."""
     from kafka import TopicPartition
-    c = _get_throughput_consumer()
+    c = _get_throughput_consumer_locked()
     counts = {}
     for topic in sorted(t for t in c.topics() if not t.startswith("__")):
         parts = [TopicPartition(topic, p) for p in (c.partitions_for_topic(topic) or [])]
@@ -306,8 +387,10 @@ def _throughput_sampler():
     endpoint can compute a real events/sec rate over the last 60 s."""
     while True:
         try:
-            counts = _topic_counts()
             with _throughput_lock:
+                counts = _topic_counts()
+                _throughput_last.clear()
+                _throughput_last.update(counts)
                 _throughput_samples.append({"ts": time.time(), "totals": counts})
                 cutoff = time.time() - 120
                 while len(_throughput_samples) > 2 and _throughput_samples[0]["ts"] < cutoff:
@@ -330,14 +413,14 @@ def _start_throughput_sampler():
 def pipeline_throughput():
     """Returns per-topic event totals and the pipeline's observed
     events/sec rate over a sliding ~60 s window of Kafka log offsets."""
-    try:
-        current = _topic_counts()
-    except Exception as e:
-        raise HTTPException(status_code=503, detail=f"Kafka unavailable: {e}")
-
+    # Never query Kafka here: the sampler thread owns the consumer.
     with _throughput_lock:
         samples = [s for s in _throughput_samples if s["ts"] >= time.time() - 60]
-        samples = samples + [{"ts": time.time(), "totals": current}]
+        current = dict(_throughput_last)
+    if not samples:
+        raise HTTPException(status_code=503,
+                            detail="throughput sampler not ready (Kafka unreachable or API just started)")
+    samples = samples + [{"ts": time.time(), "totals": current}]
 
     rate = None
     window = 0.0

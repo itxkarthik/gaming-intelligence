@@ -134,6 +134,10 @@ This starts:
 - 2 Spark Workers (2 cores, 2GB memory each) with Python ML packages installed
 - Redis on port `6379`
 - PostgreSQL on host port `5433` (container port `5432`)
+  > Containers reach Postgres at `postgres:5432` on the compose network — the
+  > engine's and API's `POSTGRES_PORT=5432` defaults assume that. When running
+  > `alert-engine` or `api` directly on the **host**, export `POSTGRES_PORT=5433`
+  > (the published port), or the connection is refused.
 
 ### 2. Verify Kafka Topics
 ```bash

@@ -23,7 +23,7 @@ from src.common.config import (
     CHECKPOINT_DIR
 )
 from src.common.schemas import parse_gameplay_stream
-from src.common.alerts import emit_alert
+from src.common.alerts import emit_alert, flush_alerts_to_kafka
 from src.common.sinks import safe_parquet_archive
 from src.jobs.behavior_change import apply_behavior_boost
 
@@ -144,6 +144,7 @@ def write_player_scores_to_redis(batch_df, batch_id):
 
     try:
         r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=0, decode_responses=True)
+        pending_alerts = []
         rows = batch_df.collect()
         model = load_iforest()
         iforest_scores = score_iforest(model, rows)
@@ -201,7 +202,11 @@ def write_player_scores_to_redis(batch_df, batch_id):
                     "details": profile_data,
                     "timestamp": int(time.time() * 1000)
                 }
-                emit_alert(r, batch_df.sparkSession, alert_payload)
+                emitted = emit_alert(r, alert_payload)
+                if emitted:
+                    pending_alerts.append(emitted)
+
+        flush_alerts_to_kafka(batch_df.sparkSession, pending_alerts)
     except Exception as e:
         print(f"[WARN] Error in cheat detection batch {batch_id}: {e}", file=sys.stderr)
 

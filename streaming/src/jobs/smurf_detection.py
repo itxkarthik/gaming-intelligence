@@ -35,7 +35,7 @@ from src.common.config import (
     CHECKPOINT_DIR
 )
 from src.common.schemas import parse_player_stream
-from src.common.alerts import emit_alert
+from src.common.alerts import emit_alert, flush_alerts_to_kafka
 from src.common.sinks import safe_parquet_archive
 
 CANDIDATE_MAX_AGE_DAYS = 14
@@ -95,6 +95,7 @@ def write_smurf_batch(batch_df, batch_id):
 
     try:
         r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=0, decode_responses=True)
+        pending_alerts = []
 
         for row in batch_df.collect():
             md = row["metadata"] or {}
@@ -145,7 +146,11 @@ def write_smurf_batch(batch_df, batch_id):
                     "details": evaluation,
                     "timestamp": int(time.time() * 1000),
                 }
-                emit_alert(r, batch_df.sparkSession, alert_payload)
+                emitted = emit_alert(r, alert_payload)
+                if emitted:
+                    pending_alerts.append(emitted)
+
+        flush_alerts_to_kafka(batch_df.sparkSession, pending_alerts)
     except Exception as e:
         print(f"[WARN] smurf batch {batch_id}: {e}", file=sys.stderr)
 

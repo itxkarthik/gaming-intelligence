@@ -171,10 +171,17 @@ services:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_USER=gaming
+      - POSTGRES_PASSWORD=gaming_dev
+      - POSTGRES_DB=gaming_platform
     depends_on:
       redis:
         condition: service_healthy
       kafka:
+        condition: service_healthy
+      postgres:
         condition: service_healthy
     networks:
       - gaming-net

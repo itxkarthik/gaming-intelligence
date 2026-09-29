@@ -24,7 +24,7 @@ from src.common.config import (
     CHECKPOINT_DIR
 )
 from src.common.schemas import parse_server_metric_stream
-from src.common.alerts import emit_alert
+from src.common.alerts import emit_alert, flush_alerts_to_kafka
 from src.common.sinks import safe_parquet_archive
 
 
@@ -92,6 +92,7 @@ def write_to_redis_batch(batch_df, batch_id):
 
     try:
         r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=0, decode_responses=True)
+        pending_alerts = []
         rows = batch_df.collect()
 
         for row in rows:
@@ -118,7 +119,7 @@ def write_to_redis_batch(batch_df, batch_id):
             r.sadd("servers:active", server_id)
 
             # Alert on degraded/critical servers, at most once per TTL window;
-            # emit_alert fans out to Redis (API) + Kafka (alert engine)
+            # emit_alert returns the payload (or None if deduped) for the batch flush
             if health_score < 50.0:
                 alert_payload = {
                     "alert_id": f"srv_{server_id}_{int(time.time())}",
@@ -130,7 +131,11 @@ def write_to_redis_batch(batch_df, batch_id):
                     "details": server_data,
                     "timestamp": int(time.time() * 1000)
                 }
-                emit_alert(r, batch_df.sparkSession, alert_payload)
+                emitted = emit_alert(r, alert_payload)
+                if emitted:
+                    pending_alerts.append(emitted)
+
+        flush_alerts_to_kafka(batch_df.sparkSession, pending_alerts)
     except Exception as e:
         print(f"[WARN] Error writing batch {batch_id} to Redis: {e}", file=sys.stderr)
 
