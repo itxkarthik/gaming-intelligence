@@ -415,6 +415,22 @@ def _fmt_event(item: str) -> Optional[str]:
             f'<td class="mono dim">{match_id}</td></tr>')
 
 
+def initial_event_rows_html() -> str:
+    recent_raw = state.feed.recent_events()
+    recent = []
+    for raw in reversed(recent_raw):
+        row = _fmt_event(raw)
+        if row:
+            recent.append(row)
+        if len(recent) >= 12:
+            break
+    if recent:
+        return "".join(recent)
+    return ('<tr class="empty"><td colspan="5">'
+            'Waiting for streaming events — start the simulator (<code>make simulator-run</code>)…'
+            '</td></tr>')
+
+
 # ─── Pages ──────────────────────────────────────────────────────────────────
 
 @router.get("/")
@@ -423,6 +439,7 @@ async def view_overview(request: Request):
                   kpis=kpis_html(),
                   alerts=alerts_html(6),
                   flagged=flagged_html(6),
+                  event_rows=initial_event_rows_html(),
                   initial_timeline=json.dumps(state.throughput_timeline()))
 
 
@@ -565,7 +582,18 @@ def _stream(gen):
 async def sse_overview():
     async def gen():
         q = state.feed.register()
+        recent_raw = state.feed.recent_events()
         recent: List[str] = []
+        for raw in reversed(recent_raw):
+            row = _fmt_event(raw)
+            if row:
+                recent.append(row)
+            if len(recent) >= 12:
+                break
+        if recent:
+            yield SSE.patch_elements("".join(recent),
+                                     selector="#event-rows",
+                                     mode=PatchMode.INNER)
         tick = 0
         try:
             while True:

@@ -11,8 +11,9 @@ import os
 import sys
 import threading
 import time
+from collections import deque
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import redis
 
@@ -229,31 +230,41 @@ def throughput_timeline() -> List[Dict[str, Any]]:
 
 class EventFeed:
     """Single shared Kafka consumer broadcasting processed events to every
-    connected /ws/live and dashboard SSE client. Slow clients drop oldest
-    frames (backpressure by design — dashboards want freshness, not
-    completeness)."""
+    connected /ws/live and dashboard SSE client. Retains a rolling buffer
+    of the most recent events so new connections and initial page renders
+    are immediately populated."""
 
     def __init__(self):
         self._queues: set = set()
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._started = False
         self._lock = threading.Lock()
+        self._history: deque = deque(maxlen=40)
+
+    def start(self):
+        with self._lock:
+            if not self._started:
+                self._started = True
+                threading.Thread(target=self._run, daemon=True,
+                                 name="kafka-event-feed").start()
 
     def register(self) -> asyncio.Queue:
         loop = asyncio.get_running_loop()
         q: asyncio.Queue = asyncio.Queue(maxsize=256)
         with self._lock:
-            self._queues.add(q)
+            self._queues.add((q, loop))
             if not self._started:
                 self._started = True
-                self._loop = loop
                 threading.Thread(target=self._run, daemon=True,
                                  name="kafka-event-feed").start()
         return q
 
     def unregister(self, q: asyncio.Queue):
         with self._lock:
-            self._queues.discard(q)
+            self._queues = {pair for pair in self._queues if pair[0] is not q}
+
+    def recent_events(self) -> List[str]:
+        with self._lock:
+            return list(self._history)
 
     @staticmethod
     def _drop_put(q: asyncio.Queue, text: str):
@@ -265,15 +276,48 @@ class EventFeed:
         q.put_nowait(text)
 
     def _run(self):
-        from kafka import KafkaConsumer
+        from kafka import KafkaConsumer, TopicPartition
         while True:
             try:
                 consumer = KafkaConsumer(
                     bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
                     group_id=None,
                     enable_auto_commit=False,
-                    auto_offset_reset="latest",
                 )
+                # Seed latest recent records on startup so table is never blank
+                try:
+                    tps = []
+                    for t in FEED_TOPICS:
+                        parts = consumer.partitions_for_topic(t)
+                        if parts:
+                            for p in parts:
+                                tps.append(TopicPartition(t, p))
+                    if tps:
+                        consumer.assign(tps)
+                        end_offsets = consumer.end_offsets(tps)
+                        for tp in tps:
+                            consumer.seek(tp, max(0, end_offsets.get(tp, 0) - 25))
+                        initial_records = consumer.poll(timeout_ms=1000, max_records=60)
+                        all_recs = []
+                        for tp, rec_list in initial_records.items():
+                            all_recs.extend(rec_list)
+                        all_recs.sort(key=lambda r: (r.timestamp or 0, r.offset))
+                        for r in all_recs:
+                            try:
+                                ev = json.loads(r.value)
+                            except (ValueError, TypeError):
+                                ev = {"raw": r.value.decode("utf-8", errors="replace")}
+                            text = json.dumps({
+                                "type": "event",
+                                "topic": r.topic,
+                                "offset": r.offset,
+                                "event": ev,
+                            })
+                            with self._lock:
+                                self._history.append(text)
+                except Exception as seed_err:
+                    print(f"[DEBUG] kafka seed note: {seed_err}", file=sys.stderr, flush=True)
+
                 consumer.subscribe(FEED_TOPICS)
                 for msg in consumer:
                     try:
@@ -286,17 +330,19 @@ class EventFeed:
                         "offset": msg.offset,
                         "event": event,
                     })
-                    loop = self._loop
-                    if loop is None:
-                        continue
-                    for q in list(self._queues):
-                        loop.call_soon_threadsafe(self._drop_put, q, text)
+                    with self._lock:
+                        self._history.append(text)
+                        targets = list(self._queues)
+                    for q, loop in targets:
+                        if not loop.is_closed():
+                            loop.call_soon_threadsafe(self._drop_put, q, text)
             except Exception as e:
                 print(f"[WARN] kafka event feed: {e}", file=sys.stderr, flush=True)
                 time.sleep(3)
 
 
 feed = EventFeed()
+feed.start()
 
 
 # ─── Tournament aggregates (REST + dashboard share this) ────────────────────

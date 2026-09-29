@@ -37,7 +37,7 @@
           <tr><th>Time</th><th>Category</th><th>Event</th><th>Metadata</th><th>Match / Server</th></tr>
         </thead>
         <tbody id="event-rows">
-          <tr class="empty"><td colspan="5">Waiting for streaming events — start the simulator (<code>make simulator-run</code>)…</td></tr>
+          {{ event_rows|safe }}
         </tbody>
       </table>
     </div>
@@ -63,10 +63,10 @@
     return {
       line: isLight ? '#0284c7' : '#38bdf8',
       fill: isLight ? 'rgba(2, 132, 199, 0.08)' : 'rgba(56, 189, 248, 0.05)',
-      grid: isLight ? 'rgba(0, 0, 0, 0.05)' : 'rgba(255, 255, 255, 0.03)',
-      tick: isLight ? '#6b7280' : '#545462',
-      tooltipBg: isLight ? '#ffffff' : '#0a0a0d',
-      tooltipBorder: isLight ? '#cbd0d8' : '#1e1e24',
+      grid: isLight ? 'rgba(0, 0, 0, 0.06)' : 'rgba(255, 255, 255, 0.03)',
+      tick: isLight ? '#64748b' : '#545462',
+      tooltipBg: isLight ? '#f8fafc' : '#0a0a0d',
+      tooltipBorder: isLight ? '#bac2cf' : '#1e1e24',
       tooltipText: isLight ? '#09090b' : '#f0f0f3',
       tooltipBody: isLight ? '#0284c7' : '#38bdf8',
     };
