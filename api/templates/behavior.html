@@ -3,11 +3,13 @@
 {% block content %}
 <div class="grid-2">
   <section class="panel">
-    <h2>🚨 CUSUM Behavior Anomalies</h2>
+    <div class="panel-header">
+      <h2>// CUSUM BEHAVIOR ANOMALIES <span class="hint">Statistical Drift Detection</span></h2>
+    </div>
     <div class="table-wrap scroll-y max-h-420">
       <table>
-        <thead><tr><th>Player</th><th class="num">Last acc</th><th class="num">Baseline</th>
-          <th class="num">Z</th><th class="num">Anomalies</th></tr></thead>
+        <thead><tr><th>Player</th><th class="num">Last Acc</th><th class="num">Baseline</th>
+          <th class="num">Z-Score</th><th class="num">Anomalies</th></tr></thead>
         <tbody>
           {% for a in anomalies %}
           <tr>
@@ -18,7 +20,7 @@
             <td class="num">{{ a.get('anomalies', '0') }}</td>
           </tr>
           {% else %}
-          <tr class="empty"><td colspan="5">No behavior shifts detected yet (run two simulator runs — CUSUM needs a baseline).</td></tr>
+          <tr class="empty"><td colspan="5">No behavior shifts detected yet (requires historical baseline).</td></tr>
           {% endfor %}
         </tbody>
       </table>
@@ -26,7 +28,9 @@
   </section>
 
   <section class="panel">
-    <h2>🕵️ Smurf Candidates</h2>
+    <div class="panel-header">
+      <h2>// SMURF IDENTIFICATION <span class="hint">Historical Archetype Classification</span></h2>
+    </div>
     <div class="table-wrap scroll-y max-h-420">
       <table>
         <thead><tr><th>Player</th><th class="w-20">Prob</th><th class="num">Age</th>
@@ -43,7 +47,7 @@
             <td class="mono">{{ s.get('archetype', '—') }}</td>
           </tr>
           {% else %}
-          <tr class="empty"><td colspan="5">No smurfs flagged (needs two runs: combat history first).</td></tr>
+          <tr class="empty"><td colspan="5">No smurfs flagged (requires combat history).</td></tr>
           {% endfor %}
         </tbody>
       </table>

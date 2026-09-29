@@ -4,32 +4,41 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{% block title %}Dashboard{% endblock %} · Gaming Intelligence Platform</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Geist:wght@300;400;500;600;700&family=Geist+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/static/dashboard.css">
   <script type="module" src="https://cdn.jsdelivr.net/gh/starfederation/datastar@v1.0.4/bundles/datastar.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.2/dist/chart.umd.min.js"></script>
 </head>
 <body>
 <header class="topbar">
-  <a class="brand" href="/">🎮&nbsp;<span>Gaming Intelligence</span></a>
+  <a class="brand" href="/">
+    <div class="brand-mark">
+      <svg width="14" height="14" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <path d="M8 1V15M1 8H15M8 4C5.79 4 4 5.79 4 8C4 10.21 5.79 12 8 12C10.21 12 12 10.21 12 8C12 5.79 10.21 4 8 4Z" stroke="currentColor" stroke-width="1.2" stroke-linecap="square"/>
+      </svg>
+    </div>
+    <span>Gaming Intelligence</span>
+    <span class="badge-sub">v1.4</span>
+  </a>
   <nav>
     {% for key, label, href in nav %}
     <a href="{{ href }}" class="{{ 'active' if key == active else '' }}">{{ label }}</a>
     {% endfor %}
   </nav>
-  <div class="live-pill"><span class="dot live"></span>LIVE</div>
+  <div class="telemetry-badge" id="live-indicator"><span class="status-marker live"></span>STREAM ACTIVE</div>
 </header>
 
 <main>
 {% block content %}{% endblock %}
 </main>
 
-<footer>Gaming Intelligence Platform — Kafka → PySpark → Redis/PostgreSQL · FastAPI + Datastar (no build step)</footer>
+<footer>Gaming Intelligence Platform — Kafka KRaft → PySpark → Redis/Postgres → Go Alert Engine · Datastar SSE</footer>
 
 {% if sse %}
 <script type="module">
-  /* Open this view's Datastar SSE stream. The element is appended AFTER
-     window load instead of being written into the HTML: on v1.0.4 the
-     initial attribute scan skips data-init, while the mutation-observer
-     path (element added post-boot) reliably fires. */
+  /* Open this view's Datastar SSE stream on load */
   window.addEventListener("load", () => {
     const d = document.createElement("div");
     d.setAttribute("data-init", "@get('{{ sse }}', {openWhenHidden: true})");
@@ -37,5 +46,7 @@
   });
 </script>
 {% endif %}
+
+{% block scripts %}{% endblock %}
 </body>
 </html>

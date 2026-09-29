@@ -11,6 +11,7 @@ KAFKA_TOPICS = {
     "server": os.getenv("TOPIC_SERVER", "server_metrics"),
     "alerts": os.getenv("TOPIC_ALERTS", "alerts")
 }
+KAFKA_STARTING_OFFSETS = os.getenv("KAFKA_STARTING_OFFSETS", "earliest")
 
 # Redis Configuration (Real-time state sink)
 # Defaults to container hostname 'redis'. When testing on host outside Docker, set REDIS_HOST=localhost.

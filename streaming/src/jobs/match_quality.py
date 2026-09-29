@@ -27,6 +27,7 @@ from pyspark.sql import functions as F
 from src.common.config import (
     KAFKA_BOOTSTRAP_SERVERS,
     KAFKA_TOPICS,
+    KAFKA_STARTING_OFFSETS,
     REDIS_HOST,
     REDIS_PORT,
     CHECKPOINT_DIR
@@ -241,7 +242,7 @@ def main():
         .format("kafka") \
         .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP_SERVERS) \
         .option("subscribe", KAFKA_TOPICS["gameplay"]) \
-        .option("startingOffsets", "latest") \
+        .option("startingOffsets", KAFKA_STARTING_OFFSETS) \
         .option("failOnDataLoss", "false") \
         .load()
 
@@ -249,7 +250,7 @@ def main():
         .format("kafka") \
         .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP_SERVERS) \
         .option("subscribe", KAFKA_TOPICS["player"]) \
-        .option("startingOffsets", "latest") \
+        .option("startingOffsets", KAFKA_STARTING_OFFSETS) \
         .option("failOnDataLoss", "false") \
         .load()
 

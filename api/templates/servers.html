@@ -4,17 +4,20 @@
 <div class="stats-row" id="servers-stats">{{ stats|safe }}</div>
 
 <section class="panel">
-  <h2>Server Health Map <span class="hint">live · refreshed every 2s</span></h2>
+  <div class="panel-header">
+    <h2>// SERVER INFRASTRUCTURE TELEMETRY <span class="hint">10s Tumbling Windows · Live PySpark</span></h2>
+    <span class="hint">Poll interval 2s</span>
+  </div>
   <div class="table-wrap scroll-y max-h-560">
     <table>
       <thead>
         <tr>
-          <th>Server</th><th>Region</th><th class="w-24">Health</th><th>Status</th>
-          <th class="num">CPU</th><th class="num">RAM</th><th class="num">Latency</th><th class="num">Players</th>
+          <th>Server</th><th>Region</th><th class="w-24">Health Score</th><th>Status</th>
+          <th class="num">Avg CPU</th><th class="num">Avg RAM</th><th class="num">Avg Latency</th><th class="num">Peak Players</th>
         </tr>
       </thead>
       <tbody id="server-rows">
-        <tr class="empty"><td colspan="8">No server metrics yet — start the simulator…</td></tr>
+        {{ rows|safe }}
       </tbody>
     </table>
   </div>

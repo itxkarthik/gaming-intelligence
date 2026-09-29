@@ -260,6 +260,11 @@ def _start_throughput_sampler():
     state.start_throughput_sampler()
 
 
+@app.on_event("shutdown")
+async def _shutdown():
+    await state.close_pg_pool()
+
+
 @app.get("/api/v1/stats/throughput")
 def pipeline_throughput():
     """Returns per-topic event totals and the pipeline's observed

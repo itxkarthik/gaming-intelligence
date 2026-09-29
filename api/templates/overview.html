@@ -3,29 +3,174 @@
 {% block content %}
 <div class="kpis" id="kpis">{{ kpis|safe }}</div>
 
-<div class="grid-2">
-  <section class="panel span2">
-    <h2>Live Event Stream</h2>
+<div class="grid-bento">
+  <section class="panel">
+    <div class="panel-header">
+      <h2>// INGESTION VELOCITY <span class="hint">Kafka Log Offsets · sliding 60s window</span></h2>
+      <div class="chart-header-actions">
+        <span class="badge-rate" id="chart-eps-badge">Live Rate</span>
+      </div>
+    </div>
+    <div class="chart-container">
+      <canvas id="throughputChart"></canvas>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-header">
+      <h2>// ACTIVE INCIDENTS <span class="hint">Go Alert Engine · real-time</span></h2>
+      <a href="/alerts" class="hint">All alerts →</a>
+    </div>
+    <ul class="alerts" id="recent-alerts">{{ alerts|safe }}</ul>
+  </section>
+</div>
+
+<div class="grid-bento">
+  <section class="panel">
+    <div class="panel-header">
+      <h2>// TELEMETRY STREAM <span class="hint">Gameplay · Player Events · Server Metrics</span></h2>
+      <span class="hint" id="stream-rate-hint">Streaming live</span>
+    </div>
     <div class="table-wrap scroll-y max-h-420">
       <table>
         <thead>
-          <tr><th>Time</th><th>Type</th><th>Event</th><th>Detail</th><th>Match</th></tr>
+          <tr><th>Time</th><th>Category</th><th>Event</th><th>Metadata</th><th>Match / Server</th></tr>
         </thead>
         <tbody id="event-rows">
-          <tr class="empty"><td colspan="5">Waiting for events — start the simulator (<code>make simulator-run</code>)…</td></tr>
+          <tr class="empty"><td colspan="5">Waiting for streaming events — start the simulator (<code>make simulator-run</code>)…</td></tr>
         </tbody>
       </table>
     </div>
   </section>
 
   <section class="panel">
-    <h2>🚨 Recent Alerts</h2>
-    <ul class="alerts" id="recent-alerts">{{ alerts|safe }}</ul>
-  </section>
-
-  <section class="panel">
-    <h2>Flagged Players</h2>
+    <div class="panel-header">
+      <h2>// FLAGGED ENTITIES <span class="hint">Isolation Forest + Anomaly Scoring</span></h2>
+      <a href="/anticheat" class="hint">Anti-Cheat →</a>
+    </div>
     <ul class="flagged" id="flagged-mini">{{ flagged|safe }}</ul>
   </section>
 </div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+  const rawTimeline = {{ initial_timeline|safe or '[]' }};
+  const ctx = document.getElementById('throughputChart').getContext('2d');
+
+  const labels = [];
+  const data = [];
+  
+  if (rawTimeline.length > 0) {
+    rawTimeline.forEach(pt => {
+      labels.push(pt.time || '');
+      data.push(pt.eps || 0);
+    });
+  } else {
+    const now = new Date();
+    for (let i = 10; i >= 0; i--) {
+      const t = new Date(now.getTime() - i * 5000);
+      labels.push(t.toTimeString().split(' ')[0]);
+      data.push(0);
+    }
+  }
+
+  const throughputChart = new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: labels,
+      datasets: [{
+        label: 'Events / sec',
+        data: data,
+        borderColor: '#38bdf8',
+        borderWidth: 1.5,
+        backgroundColor: 'rgba(56, 189, 248, 0.05)',
+        fill: true,
+        tension: 0.15,
+        pointRadius: 0,
+        pointHoverRadius: 4,
+        pointHoverBackgroundColor: '#38bdf8',
+        pointHoverBorderColor: '#ffffff',
+        pointHoverBorderWidth: 1,
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: { duration: 250 },
+      interaction: { intersect: false, mode: 'index' },
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          backgroundColor: '#0e1117',
+          titleColor: '#8b95a5',
+          titleFont: { family: 'Geist Mono', size: 10.5 },
+          bodyColor: '#38bdf8',
+          bodyFont: { family: 'Geist Mono', size: 12, weight: 'bold' },
+          borderColor: '#1e2430',
+          borderWidth: 1,
+          padding: 8,
+          cornerRadius: 0,
+          displayColors: false,
+          callbacks: {
+            label: (ctx) => `${ctx.parsed.y.toLocaleString()} events/sec`
+          }
+        }
+      },
+      scales: {
+        x: {
+          grid: { color: 'rgba(255, 255, 255, 0.02)', drawBorder: false },
+          ticks: {
+            color: '#545e6d',
+            font: { family: 'Geist Mono', size: 10 },
+            maxRotation: 0,
+            maxTicksLimit: 7
+          }
+        },
+        y: {
+          beginAtZero: true,
+          grid: { color: 'rgba(255, 255, 255, 0.03)', drawBorder: false },
+          ticks: {
+            color: '#545e6d',
+            font: { family: 'Geist Mono', size: 10 },
+            maxTicksLimit: 5,
+            callback: (val) => val >= 1000 ? `${(val / 1000).toFixed(1)}k` : val
+          }
+        }
+      }
+    }
+  });
+
+  function pushThroughputPoint(eps, timeStr) {
+    if (eps === undefined || eps === null || isNaN(eps)) return;
+    const badge = document.getElementById('chart-eps-badge');
+    if (badge) {
+      badge.textContent = `${Math.round(eps).toLocaleString()} EPS`;
+    }
+    throughputChart.data.labels.push(timeStr);
+    throughputChart.data.datasets[0].data.push(eps);
+    if (throughputChart.data.labels.length > 25) {
+      throughputChart.data.labels.shift();
+      throughputChart.data.datasets[0].data.shift();
+    }
+    throughputChart.update();
+  }
+
+  const kpisContainer = document.getElementById('kpis');
+  if (kpisContainer) {
+    let lastHandledTime = '';
+    const observer = new MutationObserver(() => {
+      const carrier = document.getElementById('telemetry-carrier');
+      if (carrier) {
+        const eps = parseFloat(carrier.getAttribute('data-eps') || '0');
+        const timeStr = carrier.getAttribute('data-time') || '';
+        if (timeStr && timeStr !== lastHandledTime) {
+          lastHandledTime = timeStr;
+          pushThroughputPoint(eps, timeStr);
+        }
+      }
+    });
+    observer.observe(kpisContainer, { childList: true, subtree: true, attributes: true });
+  }
+</script>
 {% endblock %}

@@ -2,8 +2,10 @@
 {% block title %}Not found{% endblock %}
 {% block content %}
 <section class="panel">
-  <h2>404 — {{ what }} not found</h2>
-  <p class="legend"><code>{{ ident }}</code> doesn't exist (or its window has expired).
-  Head back to the <a href="/">overview</a>.</p>
+  <div class="panel-header">
+    <h2>// 404 — {{ what }} NOT FOUND</h2>
+  </div>
+  <p class="legend"><code>{{ ident }}</code> does not exist (or its retention window has expired).
+  Return to <a href="/">OVERVIEW</a>.</p>
 </section>
 {% endblock %}

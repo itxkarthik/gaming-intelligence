@@ -2,23 +2,26 @@
 {% block title %}Anti-Cheat{% endblock %}
 {% block content %}
 <section class="panel">
-  <h2>Flagged Players <span class="hint">live · refreshed every 2s</span></h2>
+  <div class="panel-header">
+    <h2>// ANTI-CHEAT DETECTION MATRIX <span class="hint">Sliding Windows · Isolation Forest · CUSUM Boost</span></h2>
+    <span class="hint">Poll interval 2s</span>
+  </div>
   <p class="legend">
-    Score = <b>suspicion_effective</b> (base suspicion + behavior boost + IsolationForest).
-    <span class="chip bad">≥0.85 critical</span>
-    <span class="chip warn">≥0.70 flagged</span>
-    <span class="chip warn">IF = IsolationForest hit</span>
+    <span>EVALUATION:</span>
+    <span class="chip bad">≥0.85 CRITICAL</span>
+    <span class="chip warn">≥0.70 FLAGGED</span>
+    <span class="chip warn">IF = Isolation Forest Model</span>
   </p>
   <div class="table-wrap scroll-y max-h-560">
     <table>
       <thead>
         <tr>
-          <th>Player</th><th class="w-24">Effective score</th><th class="num">Base</th>
-          <th class="num">Behavior boost</th><th class="num">IF score</th><th>IF</th><th class="num">Shots</th>
+          <th>Player ID</th><th class="w-24">Effective Score</th><th class="num">Base</th>
+          <th class="num">Behavior Boost</th><th class="num">IF Score</th><th>ML Flag</th><th class="num">Shots Fired</th>
         </tr>
       </thead>
       <tbody id="cheat-rows">
-        <tr class="empty"><td colspan="7">No flagged players — detections appear within seconds of a suspicious match.</td></tr>
+        {{ rows|safe }}
       </tbody>
     </table>
   </div>

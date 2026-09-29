@@ -3,29 +3,131 @@
 {% block content %}
 <div class="stats-row" id="matches-stats">{{ stats|safe }}</div>
 
-<div class="grid-2">
+<div class="grid-bento">
   <section class="panel">
-    <h2>Quality Distribution</h2>
-    <div id="histogram" class="histogram">{{ histogram|safe }}</div>
-    <p class="legend">Score 0–100 · <span class="chip ok">BALANCED ≥70</span>
-      <span class="chip warn">UNBALANCED ≥40</span> <span class="chip bad">STOMPED &lt;40</span></p>
+    <div class="panel-header">
+      <h2>// MATCH QUALITY DISTRIBUTION <span class="hint">Session-Window Scoring (0–100)</span></h2>
+      <div id="histogram">{{ histogram|safe }}</div>
+    </div>
+    <div class="chart-container" style="height: 190px;">
+      <canvas id="matchQualityChart"></canvas>
+    </div>
+    <p class="legend">
+      <span>TIERS:</span>
+      <span class="chip bad">STOMPED &lt;40</span>
+      <span class="chip warn">UNBALANCED 40–69</span>
+      <span class="chip ok">BALANCED ≥70</span>
+    </p>
   </section>
 
-  <section class="panel span2">
-    <h2>Matches <span class="hint">live · click a match to drill down</span></h2>
-    <div class="table-wrap scroll-y max-h-480">
+  <section class="panel">
+    <div class="panel-header">
+      <h2>// ACTIVE SESSIONS <span class="hint">Streaming Session Windows</span></h2>
+      <span class="hint">Select match for breakdown</span>
+    </div>
+    <div class="table-wrap scroll-y max-h-360">
       <table>
         <thead>
           <tr>
-            <th>Match</th><th class="w-24">Quality</th><th>Status</th>
-            <th class="num">Kills</th><th class="num">Imbalance</th><th class="num">DC</th><th class="num">Duration</th>
+            <th>Match</th><th class="w-20">Quality</th><th>Status</th>
+            <th class="num">Kills</th><th class="num">Imbal</th><th class="num">DC</th><th class="num">Time</th>
           </tr>
         </thead>
         <tbody id="match-rows">
-          <tr class="empty"><td colspan="7">No matches scored yet…</td></tr>
+          {{ rows|safe }}
         </tbody>
       </table>
     </div>
   </section>
 </div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+  const initialBuckets = {{ initial_buckets|safe or '[0,0,0,0,0,0,0,0,0,0]' }};
+  const bucketLabels = ['0-9', '10-19', '20-29', '30-39', '40-49', '50-59', '60-69', '70-79', '80-89', '90-100'];
+  
+  function getBarColors(data) {
+    return data.map((_, idx) => {
+      if (idx < 4) return '#ef4444';   // Stomped (<40)
+      if (idx < 7) return '#f59e0b';  // Unbalanced (40-69)
+      return '#10b981';              // Balanced (>=70)
+    });
+  }
+
+  const mqCtx = document.getElementById('matchQualityChart').getContext('2d');
+  const mqChart = new Chart(mqCtx, {
+    type: 'bar',
+    data: {
+      labels: bucketLabels,
+      datasets: [{
+        label: 'Matches',
+        data: initialBuckets,
+        backgroundColor: getBarColors(initialBuckets),
+        borderRadius: 0,
+        borderSkipped: false,
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: { duration: 250 },
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          backgroundColor: '#0e1117',
+          titleColor: '#8b95a5',
+          titleFont: { family: 'Geist Mono', size: 10.5 },
+          bodyColor: '#eaedf2',
+          bodyFont: { family: 'Geist Mono', size: 12, weight: 'bold' },
+          borderColor: '#1e2430',
+          borderWidth: 1,
+          padding: 8,
+          cornerRadius: 0,
+          displayColors: false,
+          callbacks: {
+            title: (items) => `Decile Range: ${items[0].label}`,
+            label: (item) => `${item.parsed.y} matches`
+          }
+        }
+      },
+      scales: {
+        x: {
+          grid: { display: false },
+          ticks: {
+            color: '#545e6d',
+            font: { family: 'Geist Mono', size: 10 }
+          }
+        },
+        y: {
+          beginAtZero: true,
+          grid: { color: 'rgba(255, 255, 255, 0.03)', drawBorder: false },
+          ticks: {
+            color: '#545e6d',
+            font: { family: 'Geist Mono', size: 10 },
+            precision: 0
+          }
+        }
+      }
+    }
+  });
+
+  const histContainer = document.getElementById('histogram');
+  if (histContainer) {
+    const observer = new MutationObserver(() => {
+      const carrier = document.getElementById('hist-carrier');
+      if (carrier) {
+        try {
+          const buckets = JSON.parse(carrier.getAttribute('data-buckets') || '[]');
+          if (buckets.length === 10) {
+            mqChart.data.datasets[0].data = buckets;
+            mqChart.data.datasets[0].backgroundColor = getBarColors(buckets);
+            mqChart.update();
+          }
+        } catch(e) {}
+      }
+    });
+    observer.observe(histContainer, { childList: true, subtree: true, attributes: true });
+  }
+</script>
 {% endblock %}

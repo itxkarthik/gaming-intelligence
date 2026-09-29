@@ -4,11 +4,13 @@
 <div class="kpis" id="tournament-cards">{{ cards|safe }}</div>
 
 <section class="panel">
-  <h2>About this view</h2>
-  <p class="legend">Aggregates across the whole platform — server fleet health, match
-  quality standings, player flags, and alert volume — refreshed every 3 seconds.
-  Drill into details from <a href="/servers">Servers</a>,
-  <a href="/matches">Match Quality</a>, <a href="/anticheat">Anti-Cheat</a> or the
-  <a href="/alerts">alert feed</a>.</p>
+  <div class="panel-header">
+    <h2>// PLATFORM AGGREGATES <span class="hint">Global System Overview</span></h2>
+  </div>
+  <p class="legend">Aggregates across the entire fleet — server health, match
+  quality standings, player anomaly scoring, and alert volume — refreshed every 3 seconds.
+  Detailed telemetry available via <a href="/servers">SERVERS</a>,
+  <a href="/matches">MATCH QUALITY</a>, <a href="/anticheat">ANTI-CHEAT</a>, or the
+  <a href="/alerts">ALERT FEED</a>.</p>
 </section>
 {% endblock %}

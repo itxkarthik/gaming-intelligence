@@ -34,8 +34,21 @@ PG_DSN = (f"postgresql://{POSTGRES_USER}:{POSTGRES_PASSWORD}"
 HEARTBEAT_SECONDS = 15
 
 
+_redis_client = None
+
+
 def get_redis_client():
-    return redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=0, decode_responses=True)
+    global _redis_client
+    if _redis_client is None:
+        _redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=0, decode_responses=True)
+    return _redis_client
+
+
+async def close_pg_pool():
+    global _pg_pool
+    if _pg_pool is not None:
+        await _pg_pool.close()
+        _pg_pool = None
 
 
 def _float(value: Any, default: float = 0.0) -> float:
@@ -195,6 +208,23 @@ def throughput_snapshot() -> Dict[str, Any]:
     }
 
 
+def throughput_timeline() -> List[Dict[str, Any]]:
+    """Returns sliding 60s timeline of {time: 'HH:MM:SS', eps: float} points for charts."""
+    with _throughput_lock:
+        samples = list(_throughput_samples)
+    out: List[Dict[str, Any]] = []
+    for i in range(1, len(samples)):
+        s0, s1 = samples[i-1], samples[i]
+        dt = s1["ts"] - s0["ts"]
+        if dt >= 1.0:
+            delta = sum(s1["totals"].get(t, 0) - s0["totals"].get(t, 0)
+                        for t in set(s1["totals"]) | set(s0["totals"]))
+            rate = round(max(0.0, delta) / dt, 1)
+            time_str = time.strftime("%H:%M:%S", time.localtime(s1["ts"]))
+            out.append({"time": time_str, "eps": rate})
+    return out
+
+
 # ─── Kafka → fan-out live event feed (WS + Datastar SSE) ────────────────────
 
 class EventFeed:
@@ -273,15 +303,30 @@ feed = EventFeed()
 
 def tournament_snapshot() -> Dict[str, Any]:
     """Live aggregates: server health, match quality, flag counts, alerts."""
-    r = get_redis_client()
-    servers = []
-    for s_id in r.smembers("servers:active"):
-        data = r.hgetall(f"server:{s_id}")
-        if data:
-            servers.append(data)
-    health_scores = [_float(s.get("health_score")) for s in servers]
+    servers: List[Dict[str, Any]] = []
+    health_scores: List[float] = []
+    worst = []
+    scored_total = 0
+    cheat_flagged = 0
+    smurf = 0
+    behavior_anomalies = 0
+    recent_alerts = 0
+    try:
+        r = get_redis_client()
+        for s_id in r.smembers("servers:active"):
+            data = r.hgetall(f"server:{s_id}")
+            if data:
+                servers.append(data)
+        health_scores = [_float(s.get("health_score")) for s in servers]
+        worst = r.zrange("matches:quality", 0, 0, withscores=True)
+        scored_total = r.zcard("matches:quality")
+        cheat_flagged = r.scard("players:flagged")
+        smurf = r.scard("players:smurf")
+        behavior_anomalies = r.scard("behavior:anomalies")
+        recent_alerts = r.llen("alerts:recent")
+    except Exception:
+        pass
 
-    worst = r.zrange("matches:quality", 0, 0, withscores=True)
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "servers": {
@@ -290,13 +335,13 @@ def tournament_snapshot() -> Dict[str, Any]:
             "degraded": sum(1 for h in health_scores if h < 50.0),
         },
         "matches": {
-            "scored_total": r.zcard("matches:quality"),
+            "scored_total": scored_total,
             "worst": {"match_id": worst[0][0], "score": worst[0][1]} if worst else None,
         },
         "players": {
-            "cheat_flagged": r.scard("players:flagged"),
-            "smurf": r.scard("players:smurf"),
-            "behavior_anomalies": r.scard("behavior:anomalies"),
+            "cheat_flagged": cheat_flagged,
+            "smurf": smurf,
+            "behavior_anomalies": behavior_anomalies,
         },
-        "alerts": {"recent_count": r.llen("alerts:recent")},
+        "alerts": {"recent_count": recent_alerts},
     }

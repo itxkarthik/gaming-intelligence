@@ -13,6 +13,7 @@ PostgreSQL for alert history.
 import asyncio
 import html
 import json
+import logging
 import os
 import time
 from typing import Any, Dict, List, Optional
@@ -27,6 +28,8 @@ from datastar_py.fastapi import DatastarResponse
 
 import state
 from state import _float, get_redis_client
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 templates = Jinja2Templates(
@@ -55,79 +58,106 @@ def _page(request: Request, name: str, active: str,
 # ─── Data readers (sync Redis — tiny keys, run inside the event loop) ───────
 
 def _servers() -> List[Dict[str, str]]:
-    r = get_redis_client()
-    rows = []
-    for s_id in r.smembers("servers:active"):
-        data = r.hgetall(f"server:{s_id}")
-        if data:
-            rows.append(data)
-    rows.sort(key=lambda s: _float(s.get("health_score"), 101.0))
-    return rows
+    try:
+        r = get_redis_client()
+        rows = []
+        for s_id in r.smembers("servers:active"):
+            data = r.hgetall(f"server:{s_id}")
+            if data:
+                rows.append(data)
+        rows.sort(key=lambda s: _float(s.get("health_score"), 101.0))
+        return rows
+    except Exception:
+        return []
 
 
 def _flagged() -> List[Dict[str, str]]:
-    r = get_redis_client()
-    rows = []
-    for p_id in r.smembers("players:flagged"):
-        data = r.hgetall(f"player:{p_id}")
-        if data:
-            rows.append(data)
-    rows.sort(key=lambda p: _float(p.get("suspicion_effective"),
-                                   _float(p.get("suspicion_score"))), reverse=True)
-    return rows
+    try:
+        r = get_redis_client()
+        rows = []
+        for p_id in r.smembers("players:flagged"):
+            data = r.hgetall(f"player:{p_id}")
+            if data:
+                rows.append(data)
+        rows.sort(key=lambda p: _float(p.get("suspicion_effective"),
+                                       _float(p.get("suspicion_score"))), reverse=True)
+        return rows
+    except Exception:
+        return []
 
 
 def _matches() -> List[Dict[str, Any]]:
-    r = get_redis_client()
-    now_ms = int(time.time() * 1000)
-    rows = []
-    for key in r.scan_iter("match:*"):
-        if ":" in key[len("match:"):]:
-            continue
-        data = r.hgetall(key)
-        if not data:
-            continue
-        updated_ms = int(_float(data.get("updated_at"), 0)) * 1000
-        data["active"] = 0 <= (now_ms - updated_ms) <= 90_000
-        data["quality_score"] = _float(data.get("quality_score"))
-        rows.append(data)
-    rows.sort(key=lambda m: str(m.get("updated_at", "")), reverse=True)
-    return rows
+    try:
+        r = get_redis_client()
+        now_ms = int(time.time() * 1000)
+        rows = []
+        for key in r.scan_iter("match:*"):
+            if ":" in key[len("match:"):]:
+                continue
+            data = r.hgetall(key)
+            if not data:
+                continue
+            updated_ms = int(_float(data.get("updated_at"), 0)) * 1000
+            data["active"] = 0 <= (now_ms - updated_ms) <= 90_000
+            data["quality_score"] = _float(data.get("quality_score"))
+            rows.append(data)
+        rows.sort(key=lambda m: str(m.get("updated_at", "")), reverse=True)
+        return rows
+    except Exception:
+        return []
 
 
 def _recent_alerts(n: int = 10) -> List[Dict[str, Any]]:
-    r = get_redis_client()
-    out = []
-    for raw in r.lrange("alerts:recent", 0, n - 1):
-        try:
-            out.append(json.loads(raw))
-        except ValueError:
-            continue
-    return out
+    try:
+        r = get_redis_client()
+        out = []
+        for raw in r.lrange("alerts:recent", 0, n - 1):
+            try:
+                out.append(json.loads(raw))
+            except ValueError:
+                continue
+        return out
+    except Exception:
+        return []
 
 
 def _kpi_dict() -> Dict[str, Any]:
     snap = state.throughput_snapshot()
-    r = get_redis_client()
     matches = _matches()
+    flagged = 0
+    smurf = 0
+    anomalies = 0
+    alerts_recent = 0
+    try:
+        r = get_redis_client()
+        flagged = r.scard("players:flagged")
+        smurf = r.scard("players:smurf")
+        anomalies = r.scard("behavior:anomalies")
+        alerts_recent = r.llen("alerts:recent")
+    except Exception:
+        pass
+
     return {
         "eps": snap["events_per_sec"],
         "totals": snap["per_topic_total"],
         "total_events": sum(snap["per_topic_total"].values()),
         "matches_tracked": len(matches),
         "matches_active": sum(1 for m in matches if m["active"]),
-        "flagged": r.scard("players:flagged"),
-        "smurf": r.scard("players:smurf"),
-        "anomalies": r.scard("behavior:anomalies"),
-        "alerts_recent": r.llen("alerts:recent"),
+        "flagged": flagged,
+        "smurf": smurf,
+        "anomalies": anomalies,
+        "alerts_recent": alerts_recent,
     }
 
 
 def _histogram_buckets() -> List[int]:
-    r = get_redis_client()
     buckets = [0] * 10
-    for _, score in r.zrange("matches:quality", 0, -1, withscores=True):
-        buckets[min(9, max(0, int(score // 10)))] += 1
+    try:
+        r = get_redis_client()
+        for _, score in r.zrange("matches:quality", 0, -1, withscores=True):
+            buckets[min(9, max(0, int(score // 10)))] += 1
+    except Exception:
+        pass
     return buckets
 
 
@@ -136,19 +166,26 @@ def _histogram_buckets() -> List[int]:
 def kpis_html() -> str:
     k = _kpi_dict()
     eps = f"{k['eps']:.0f}" if k["eps"] is not None else "—"
+    raw_eps = k["eps"] if k["eps"] is not None else 0.0
+    now_str = time.strftime("%H:%M:%S")
     cards = [
-        ("Events / sec", eps, "kpi-live"),
-        ("Total events", f"{k['total_events']:,}", ""),
-        ("Matches", f"{k['matches_active']} live / {k['matches_tracked']}", ""),
-        ("Cheat flagged", str(k["flagged"]), "kpi-warn" if k["flagged"] else ""),
-        ("Smurfs", str(k["smurf"]), "kpi-warn" if k["smurf"] else ""),
-        ("Behavior shifts", str(k["anomalies"]), "kpi-warn" if k["anomalies"] else ""),
-        ("Alerts (recent)", str(k["alerts_recent"]), ""),
+        ("Events / sec", eps, "kpi-live", "Velocity"),
+        ("Total Ingested", f"{k['total_events']:,}", "", "Kafka Events"),
+        ("Active Matches", f"{k['matches_active']} / {k['matches_tracked']}", "kpi-live" if k["matches_active"] else "", "Sessions"),
+        ("Cheat Flagged", str(k["flagged"]), "kpi-bad" if k["flagged"] else "", "Anti-Cheat"),
+        ("Smurf Accounts", str(k["smurf"]), "kpi-warn" if k["smurf"] else "", "Evaluated"),
+        ("Behavior Shifts", str(k["anomalies"]), "kpi-warn" if k["anomalies"] else "", "CUSUM Drift"),
+        ("Recent Alerts", str(k["alerts_recent"]), "kpi-warn" if k["alerts_recent"] else "", "Last 100"),
     ]
-    return "".join(
-        f'<div class="kpi {cls}"><div class="kpi-label">{E(label)}</div>'
-        f'<div class="kpi-value">{E(value)}</div></div>'
-        for label, value, cls in cards)
+    card_html = "".join(
+        f'<div class="kpi {cls}">'
+        f'<div class="kpi-tag">{E(tag)}</div>'
+        f'<div class="kpi-value">{E(value)}</div>'
+        f'<div class="kpi-label">{E(label)}</div></div>'
+        for label, value, cls, tag in cards)
+    carrier = (f'<div id="telemetry-carrier" data-eps="{raw_eps}" data-time="{now_str}" '
+               f'data-total="{k["total_events"]}" style="display:none"></div>')
+    return card_html + carrier
 
 
 def alerts_html(n: int = 10) -> str:
@@ -183,8 +220,9 @@ def flagged_html(n: int = 8) -> str:
     return "".join(out)
 
 
-def server_rows_html() -> str:
-    rows = _servers()
+def server_rows_html(rows: Optional[List[Dict[str, str]]] = None) -> str:
+    if rows is None:
+        rows = _servers()
     if not rows:
         return '<tr class="empty"><td colspan="8">No server metrics yet.</td></tr>'
     out = []
@@ -208,8 +246,9 @@ def server_rows_html() -> str:
     return "".join(out)
 
 
-def servers_stats_html() -> str:
-    rows = _servers()
+def servers_stats_html(rows: Optional[List[Dict[str, str]]] = None) -> str:
+    if rows is None:
+        rows = _servers()
     scores = [_float(s.get("health_score")) for s in rows]
     avg = sum(scores) / len(scores) if scores else 0.0
     degraded = sum(1 for h in scores if h < 50.0)
@@ -248,8 +287,9 @@ def cheat_rows_html() -> str:
     return "".join(out)
 
 
-def match_rows_html() -> str:
-    rows = _matches()
+def match_rows_html(rows: Optional[List[Dict[str, Any]]] = None) -> str:
+    if rows is None:
+        rows = _matches()
     if not rows:
         return '<tr class="empty"><td colspan="7">No matches scored yet.</td></tr>'
     out = []
@@ -258,7 +298,7 @@ def match_rows_html() -> str:
         score = m["quality_score"]
         status = str(m.get("status", "?"))
         cls = "bad" if status == "STOMPED" else "warn" if status == "UNBALANCED" else "ok"
-        live = '<span class="dot live" title="live"></span>' if m["active"] else ""
+        live = '<span class="dot live" title="live"></span> ' if m["active"] else ""
         out.append(
             f'<tr>'
             f'<td><a class="mono" href="/matches/{E(mid)}">{live}{E(mid)}</a></td>'
@@ -276,22 +316,15 @@ def match_rows_html() -> str:
 
 def histogram_html() -> str:
     buckets = _histogram_buckets()
-    mx = max(buckets) or 1
     total = sum(buckets)
-    out = [f'<div class="hist-total">{total} scored matches</div>',
-           '<div class="hist-bars">']
-    for i, c in enumerate(buckets):
-        h = max(3, round(c / mx * 100)) if c else 3
-        out.append(
-            f'<div class="hbar-wrap"><div class="hbar {"filled" if c else ""}" '
-            f'style="height:{h}%">{c if c else ""}</div>'
-            f'<span>{i * 10}</span></div>')
-    out.append("</div>")
-    return "".join(out)
+    carrier = f'<div id="hist-carrier" data-buckets=\'{json.dumps(buckets)}\' data-total="{total}" style="display:none"></div>'
+    summary = f'<span class="hint" style="font-family:var(--mono)">Total Scored: <b style="color:var(--text)">{total}</b> matches</span>'
+    return carrier + summary
 
 
-def matches_stats_html() -> str:
-    rows = _matches()
+def matches_stats_html(rows: Optional[List[Dict[str, Any]]] = None) -> str:
+    if rows is None:
+        rows = _matches()
     balanced = sum(1 for m in rows if str(m.get("status")) == "BALANCED")
     unbal = sum(1 for m in rows if str(m.get("status")) == "UNBALANCED")
     stomped = sum(1 for m in rows if str(m.get("status")) == "STOMPED")
@@ -389,13 +422,15 @@ async def view_overview(request: Request):
     return _page(request, "overview.html", "overview", sse="/sse/overview",
                   kpis=kpis_html(),
                   alerts=alerts_html(6),
-                  flagged=flagged_html(6))
+                  flagged=flagged_html(6),
+                  initial_timeline=json.dumps(state.throughput_timeline()))
 
 
 @router.get("/servers")
 async def view_servers(request: Request):
+    rows = _servers()
     return _page(request, "servers.html", "servers", sse="/sse/servers",
-                  stats=servers_stats_html(), rows=server_rows_html())
+                  stats=servers_stats_html(rows), rows=server_rows_html(rows))
 
 
 @router.get("/anticheat")
@@ -406,19 +441,26 @@ async def view_anticheat(request: Request):
 
 @router.get("/matches")
 async def view_matches(request: Request):
+    rows = _matches()
     return _page(request, "matches.html", "matches", sse="/sse/matches",
-                  stats=matches_stats_html(), rows=match_rows_html(),
-                  histogram=histogram_html())
+                  stats=matches_stats_html(rows), rows=match_rows_html(rows),
+                  histogram=histogram_html(),
+                  initial_buckets=json.dumps(_histogram_buckets()))
 
 
 @router.get("/matches/{match_id}")
 async def view_match_detail(request: Request, match_id: str):
     r = get_redis_client()
-    data = r.hgetall(f"match:{match_id}")
-    if not data:
+    try:
+        data = r.hgetall(f"match:{match_id}")
+        if not data:
+            return _page(request, "notfound.html", "matches",
+                          what="match", ident=match_id)
+        score = _float(data.get("quality_score"), _float(r.zscore("matches:quality", match_id)))
+    except Exception as e:
+        logger.warning(f"Error reading match detail {match_id}: {e}")
         return _page(request, "notfound.html", "matches",
                       what="match", ident=match_id)
-    score = _float(data.get("quality_score"), _float(r.zscore("matches:quality", match_id)))
     return _page(request, "match_detail.html", "matches",
                   m=data, match_id=match_id, score=score)
 
@@ -426,19 +468,24 @@ async def view_match_detail(request: Request, match_id: str):
 @router.get("/players/{player_id}")
 async def view_player_detail(request: Request, player_id: str):
     r = get_redis_client()
-    profile = r.hgetall(f"player:{player_id}")
-    smurf = r.hgetall(f"player:smurf:{player_id}")
-    behavior = r.hgetall(f"player:behavior:{player_id}")
-    if not profile and not smurf and not behavior:
+    try:
+        profile = r.hgetall(f"player:{player_id}")
+        smurf = r.hgetall(f"player:smurf:{player_id}")
+        behavior = r.hgetall(f"player:behavior:{player_id}")
+        if not profile and not smurf and not behavior:
+            return _page(request, "notfound.html", "anticheat",
+                          what="player", ident=player_id)
+        flags = {
+            "cheat": r.sismember("players:flagged", player_id),
+            "smurf": r.sismember("players:smurf", player_id),
+            "behavior": r.sismember("behavior:anomalies", player_id),
+        }
+        base = _float(profile.get("suspicion_score"))
+        eff = _float(profile.get("suspicion_effective"), base)
+    except Exception as e:
+        logger.warning(f"Error reading player detail {player_id}: {e}")
         return _page(request, "notfound.html", "anticheat",
                       what="player", ident=player_id)
-    flags = {
-        "cheat": r.sismember("players:flagged", player_id),
-        "smurf": r.sismember("players:smurf", player_id),
-        "behavior": r.sismember("behavior:anomalies", player_id),
-    }
-    base = _float(profile.get("suspicion_score"))
-    eff = _float(profile.get("suspicion_effective"), base)
     return _page(request, "player_detail.html", "anticheat",
                   player_id=player_id, profile=profile, smurf=smurf,
                   behavior=behavior, flags=flags, base=base, eff=eff)
@@ -448,18 +495,21 @@ async def view_player_detail(request: Request, player_id: str):
 async def view_behavior(request: Request):
     r = get_redis_client()
     anomalies = []
-    for pid in sorted(r.smembers("behavior:anomalies")):
-        data = r.hgetall(f"player:behavior:{pid}")
-        if data:
-            data["player_id"] = pid
-            anomalies.append(data)
     smurfs = []
-    for pid in sorted(r.smembers("players:smurf")):
-        data = r.hgetall(f"player:smurf:{pid}")
-        if data:
-            data["player_id"] = pid
-            smurfs.append(data)
-    smurfs.sort(key=lambda s: _float(s.get("probability")), reverse=True)
+    try:
+        for pid in sorted(r.smembers("behavior:anomalies")):
+            data = r.hgetall(f"player:behavior:{pid}")
+            if data:
+                data["player_id"] = pid
+                anomalies.append(data)
+        for pid in sorted(r.smembers("players:smurf")):
+            data = r.hgetall(f"player:smurf:{pid}")
+            if data:
+                data["player_id"] = pid
+                smurfs.append(data)
+        smurfs.sort(key=lambda s: _float(s.get("probability")), reverse=True)
+    except Exception as e:
+        logger.warning(f"Error reading behavior data: {e}")
     return _page(request, "behavior.html", "behavior",
                   anomalies=anomalies, smurfs=smurfs)
 
@@ -558,10 +608,11 @@ async def sse_overview():
 async def sse_servers():
     async def gen():
         while True:
-            yield SSE.patch_elements(server_rows_html(),
+            rows = _servers()
+            yield SSE.patch_elements(server_rows_html(rows),
                                      selector="#server-rows",
                                      mode=PatchMode.INNER)
-            yield SSE.patch_elements(servers_stats_html(),
+            yield SSE.patch_elements(servers_stats_html(rows),
                                      selector="#servers-stats",
                                      mode=PatchMode.INNER)
             await asyncio.sleep(2)
@@ -583,13 +634,14 @@ async def sse_anticheat():
 async def sse_matches():
     async def gen():
         while True:
-            yield SSE.patch_elements(match_rows_html(),
+            rows = _matches()
+            yield SSE.patch_elements(match_rows_html(rows),
                                      selector="#match-rows",
                                      mode=PatchMode.INNER)
             yield SSE.patch_elements(histogram_html(),
                                      selector="#histogram",
                                      mode=PatchMode.INNER)
-            yield SSE.patch_elements(matches_stats_html(),
+            yield SSE.patch_elements(matches_stats_html(rows),
                                      selector="#matches-stats",
                                      mode=PatchMode.INNER)
             await asyncio.sleep(2)
