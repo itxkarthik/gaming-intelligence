@@ -24,7 +24,7 @@ from src.common.config import (
     CHECKPOINT_DIR
 )
 from src.common.schemas import parse_server_metric_stream
-from src.common.alerts import should_emit_alert
+from src.common.alerts import emit_alert
 from src.common.sinks import safe_parquet_archive
 
 
@@ -117,8 +117,9 @@ def write_to_redis_batch(batch_df, batch_id):
             r.hset(f"server:{server_id}", mapping=server_data)
             r.sadd("servers:active", server_id)
 
-            # Alert on degraded/critical servers, at most once per TTL window
-            if health_score < 50.0 and should_emit_alert(r, "SERVER_DEGRADED", server_id):
+            # Alert on degraded/critical servers, at most once per TTL window;
+            # emit_alert fans out to Redis (API) + Kafka (alert engine)
+            if health_score < 50.0:
                 alert_payload = {
                     "alert_id": f"srv_{server_id}_{int(time.time())}",
                     "alert_type": "SERVER_DEGRADED",
@@ -129,8 +130,7 @@ def write_to_redis_batch(batch_df, batch_id):
                     "details": server_data,
                     "timestamp": int(time.time() * 1000)
                 }
-                r.lpush("alerts:recent", json.dumps(alert_payload))
-                r.ltrim("alerts:recent", 0, 99)  # Keep latest 100 alerts
+                emit_alert(r, batch_df.sparkSession, alert_payload)
     except Exception as e:
         print(f"[WARN] Error writing batch {batch_id} to Redis: {e}", file=sys.stderr)
 

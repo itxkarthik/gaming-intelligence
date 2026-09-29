@@ -28,7 +28,7 @@ from src.common.config import (
     CHECKPOINT_DIR
 )
 from src.common.schemas import parse_gameplay_stream
-from src.common.alerts import should_emit_alert
+from src.common.alerts import emit_alert
 from src.common.sinks import safe_parquet_archive
 
 CUSUM_K = 0.5     # slack allowance per step (in sigmas)
@@ -142,20 +142,18 @@ def write_behavior_batch(batch_df, batch_id):
                 }
                 r.hset(f"player:behavior:{player_id}", mapping=info)
                 r.sadd("behavior:anomalies", player_id)
-                if should_emit_alert(r, "BEHAVIOR_ANOMALY", player_id):
-                    alert_payload = {
-                        "alert_id": f"behavior_{player_id}_{int(time.time())}",
-                        "alert_type": "BEHAVIOR_ANOMALY",
-                        "severity": "WARNING",
-                        "entity_type": "PLAYER",
-                        "entity_id": player_id,
-                        "message": (f"CUSUM detected sustained accuracy shift for "
-                                    f"{player_id} (z={z:.1f}, batch acc {batch_mean:.2f})"),
-                        "details": info,
-                        "timestamp": int(time.time() * 1000),
-                    }
-                    r.lpush("alerts:recent", json.dumps(alert_payload))
-                    r.ltrim("alerts:recent", 0, 99)
+                alert_payload = {
+                    "alert_id": f"behavior_{player_id}_{int(time.time())}",
+                    "alert_type": "BEHAVIOR_ANOMALY",
+                    "severity": "WARNING",
+                    "entity_type": "PLAYER",
+                    "entity_id": player_id,
+                    "message": (f"CUSUM detected sustained accuracy shift for "
+                                f"{player_id} (z={z:.1f}, batch acc {batch_mean:.2f})"),
+                    "details": info,
+                    "timestamp": int(time.time() * 1000),
+                }
+                emit_alert(r, batch_df.sparkSession, alert_payload)
     except Exception as e:
         print(f"[WARN] behavior batch {batch_id}: {e}", file=sys.stderr)
 

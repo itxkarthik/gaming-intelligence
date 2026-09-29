@@ -23,7 +23,7 @@ from src.common.config import (
     CHECKPOINT_DIR
 )
 from src.common.schemas import parse_gameplay_stream
-from src.common.alerts import should_emit_alert
+from src.common.alerts import emit_alert
 from src.common.sinks import safe_parquet_archive
 from src.jobs.behavior_change import apply_behavior_boost
 
@@ -184,25 +184,24 @@ def write_player_scores_to_redis(batch_df, batch_id):
 
             r.hset(f"player:{player_id}", mapping=profile_data)
 
-            # Emit alert if high confidence anomaly (deduped per TTL window)
+            # Emit alert if high confidence anomaly (deduped per TTL window;
+            # emit_alert fans out to Redis + Kafka for the alert engine)
             if flagged:
                 r.sadd("players:flagged", player_id)
-                if should_emit_alert(r, "CHEAT_DETECTED", player_id):
-                    alert_payload = {
-                        "alert_id": f"cheat_{player_id}_{int(time.time())}",
-                        "alert_type": "CHEAT_DETECTED",
-                        "severity": "CRITICAL" if max(suspicion_eff, 1.0 if iforest_flag else 0.0) >= 0.85 else "WARNING",
-                        "entity_type": "PLAYER",
-                        "entity_id": player_id,
-                        "message": (f"Cheat anomaly for {player_id} in {match_id}: "
-                                    f"suspicion {suspicion_eff*100:.1f}%"
-                                    f"{' + CUSUM behavior' if behavior_anomaly else ''}"
-                                    f"{' + IsolationForest' if iforest_flag else ''}"),
-                        "details": profile_data,
-                        "timestamp": int(time.time() * 1000)
-                    }
-                    r.lpush("alerts:recent", json.dumps(alert_payload))
-                    r.ltrim("alerts:recent", 0, 99)
+                alert_payload = {
+                    "alert_id": f"cheat_{player_id}_{int(time.time())}",
+                    "alert_type": "CHEAT_DETECTED",
+                    "severity": "CRITICAL" if max(suspicion_eff, 1.0 if iforest_flag else 0.0) >= 0.85 else "WARNING",
+                    "entity_type": "PLAYER",
+                    "entity_id": player_id,
+                    "message": (f"Cheat anomaly for {player_id} in {match_id}: "
+                                f"suspicion {suspicion_eff*100:.1f}%"
+                                f"{' + CUSUM behavior' if behavior_anomaly else ''}"
+                                f"{' + IsolationForest' if iforest_flag else ''}"),
+                    "details": profile_data,
+                    "timestamp": int(time.time() * 1000)
+                }
+                emit_alert(r, batch_df.sparkSession, alert_payload)
     except Exception as e:
         print(f"[WARN] Error in cheat detection batch {batch_id}: {e}", file=sys.stderr)
 

@@ -170,11 +170,41 @@ services:
     environment:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
     depends_on:
       redis:
         condition: service_healthy
+      kafka:
+        condition: service_healthy
     networks:
       - gaming-net
+
+  # ─── Go Alert Engine (Phase 4) ──────────────────────────────────────────
+  alert-engine:
+    build:
+      context: ./alert-engine
+      dockerfile: Dockerfile
+    container_name: gaming-alert-engine
+    environment:
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_USER=gaming
+      - POSTGRES_PASSWORD=gaming_dev
+      - POSTGRES_DB=gaming_platform
+      - ALERT_WEBHOOK_URL=${ALERT_WEBHOOK_URL:-}
+    depends_on:
+      kafka:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    networks:
+      - gaming-net
+    restart: unless-stopped
 
 networks:
   gaming-net:

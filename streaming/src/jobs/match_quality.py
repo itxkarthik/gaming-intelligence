@@ -32,7 +32,7 @@ from src.common.config import (
     CHECKPOINT_DIR
 )
 from src.common.schemas import parse_gameplay_stream, parse_player_stream
-from src.common.alerts import should_emit_alert
+from src.common.alerts import emit_alert
 from src.common.sinks import safe_parquet_archive
 
 SESSION_GAP = "2 minutes"
@@ -203,10 +203,10 @@ def write_matches_to_redis(batch_df, batch_id):
             r.hset(f"match:{match_id}", mapping=match_data)
             r.zadd("matches:quality", {match_id: score})
 
-            if status == "STOMPED" and should_emit_alert(r, "MATCH_STOMPED", match_id):
+            if status == "STOMPED":
                 alert_payload = {
                     "alert_id": f"match_{match_id}_{int(time.time())}",
-                    "alert_type": "MATCH_STOMPED",
+                    "alert_type": "MATCH_QUALITY_LOW",  # matches schemas/alert.avsc enum
                     "severity": "WARNING",
                     "entity_type": "MATCH",
                     "entity_id": match_id,
@@ -214,8 +214,7 @@ def write_matches_to_redis(batch_df, batch_id):
                     "details": match_data,
                     "timestamp": int(time.time() * 1000)
                 }
-                r.lpush("alerts:recent", json.dumps(alert_payload))
-                r.ltrim("alerts:recent", 0, 99)
+                emit_alert(r, batch_df.sparkSession, alert_payload)
     except Exception as e:
         print(f"[WARN] Error writing match batch {batch_id} to Redis: {e}", file=sys.stderr)
 

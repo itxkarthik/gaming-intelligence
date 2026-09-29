@@ -35,7 +35,7 @@ from src.common.config import (
     CHECKPOINT_DIR
 )
 from src.common.schemas import parse_player_stream
-from src.common.alerts import should_emit_alert
+from src.common.alerts import emit_alert
 from src.common.sinks import safe_parquet_archive
 
 CANDIDATE_MAX_AGE_DAYS = 14
@@ -133,21 +133,19 @@ def write_smurf_batch(batch_df, batch_id):
 
             if prob >= SMURF_PROB_THRESHOLD:
                 r.sadd("players:smurf", player_id)
-                if should_emit_alert(r, "SMURF_DETECTED", player_id):
-                    alert_payload = {
-                        "alert_id": f"smurf_{player_id}_{int(time.time())}",
-                        "alert_type": "SMURF_DETECTED",
-                        "severity": "WARNING",
-                        "entity_type": "PLAYER",
-                        "entity_id": player_id,
-                        "message": (f"New account ({account['age_days']}d, "
-                                    f"{account['games_played']} games) performs at "
-                                    f"{prob*100:.0f}% smurf probability — {reason}"),
-                        "details": evaluation,
-                        "timestamp": int(time.time() * 1000),
-                    }
-                    r.lpush("alerts:recent", json.dumps(alert_payload))
-                    r.ltrim("alerts:recent", 0, 99)
+                alert_payload = {
+                    "alert_id": f"smurf_{player_id}_{int(time.time())}",
+                    "alert_type": "SMURF_DETECTED",
+                    "severity": "WARNING",
+                    "entity_type": "PLAYER",
+                    "entity_id": player_id,
+                    "message": (f"New account ({account['age_days']}d, "
+                                f"{account['games_played']} games) performs at "
+                                f"{prob*100:.0f}% smurf probability — {reason}"),
+                    "details": evaluation,
+                    "timestamp": int(time.time() * 1000),
+                }
+                emit_alert(r, batch_df.sparkSession, alert_payload)
     except Exception as e:
         print(f"[WARN] smurf batch {batch_id}: {e}", file=sys.stderr)
 
