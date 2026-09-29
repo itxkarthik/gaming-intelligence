@@ -55,6 +55,20 @@
     });
   }
 
+  function getMqThemeColors(theme) {
+    const isLight = theme === 'light';
+    return {
+      grid: isLight ? 'rgba(0, 0, 0, 0.05)' : 'rgba(255, 255, 255, 0.03)',
+      tick: isLight ? '#6b7280' : '#545462',
+      tooltipBg: isLight ? '#ffffff' : '#0a0a0d',
+      tooltipBorder: isLight ? '#cbd0d8' : '#1e1e24',
+      tooltipText: isLight ? '#09090b' : '#eaedf2',
+    };
+  }
+
+  const initialMqTheme = document.documentElement.getAttribute('data-theme') || 'dark';
+  const mqC = getMqThemeColors(initialMqTheme);
+
   const mqCtx = document.getElementById('matchQualityChart').getContext('2d');
   const mqChart = new Chart(mqCtx, {
     type: 'bar',
@@ -75,12 +89,12 @@
       plugins: {
         legend: { display: false },
         tooltip: {
-          backgroundColor: '#0e1117',
-          titleColor: '#8b95a5',
+          backgroundColor: mqC.tooltipBg,
+          titleColor: mqC.tick,
           titleFont: { family: 'Geist Mono', size: 10.5 },
-          bodyColor: '#eaedf2',
+          bodyColor: mqC.tooltipText,
           bodyFont: { family: 'Geist Mono', size: 12, weight: 'bold' },
-          borderColor: '#1e2430',
+          borderColor: mqC.tooltipBorder,
           borderWidth: 1,
           padding: 8,
           cornerRadius: 0,
@@ -95,21 +109,37 @@
         x: {
           grid: { display: false },
           ticks: {
-            color: '#545e6d',
+            color: mqC.tick,
             font: { family: 'Geist Mono', size: 10 }
           }
         },
         y: {
           beginAtZero: true,
-          grid: { color: 'rgba(255, 255, 255, 0.03)', drawBorder: false },
+          grid: { color: mqC.grid, drawBorder: false },
           ticks: {
-            color: '#545e6d',
+            color: mqC.tick,
             font: { family: 'Geist Mono', size: 10 },
             precision: 0
           }
         }
       }
     }
+  });
+
+  function applyMqChartTheme(theme) {
+    const colors = getMqThemeColors(theme);
+    mqChart.options.scales.y.grid.color = colors.grid;
+    mqChart.options.scales.x.ticks.color = colors.tick;
+    mqChart.options.scales.y.ticks.color = colors.tick;
+    mqChart.options.plugins.tooltip.backgroundColor = colors.tooltipBg;
+    mqChart.options.plugins.tooltip.borderColor = colors.tooltipBorder;
+    mqChart.options.plugins.tooltip.titleColor = colors.tick;
+    mqChart.options.plugins.tooltip.bodyColor = colors.tooltipText;
+    mqChart.update();
+  }
+
+  window.addEventListener('theme-changed', (e) => {
+    applyMqChartTheme(e.detail.theme);
   });
 
   const histContainer = document.getElementById('histogram');

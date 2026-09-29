@@ -1,47 +1,130 @@
 /* ═══════════════════════════════════════════════════════════════════════════
    GAMING INTELLIGENCE PLATFORM — TECHNICAL TELEMETRY DASHBOARD
-   Design System: Industrial Telemetry / Tactical Brutalism (Zero-Slop)
+   Design System: Tactical Telemetry / Industrial Brutalism (Zero-Slop)
+   Theme Modes: Pure Black (Dark) & Crisp White (Light)
    ═══════════════════════════════════════════════════════════════════════════ */
 
 @import url('https://fonts.googleapis.com/css2?family=Geist:wght@300;400;500;600;700&family=Geist+Mono:wght@400;500;600;700&display=swap');
 
 :root {
-  /* Matte Obsidian Substrate — No glowing gradient meshes */
-  --bg: #090a0d;
-  --bg-subtle: #0d0f14;
-  --panel: #11141b;
-  --panel-solid: #11141b;
-  --panel-subtle: #161a23;
-  --panel-hover: #1b202c;
-
-  /* Structural Hairlines */
-  --border: #1e2430;
-  --border-subtle: #171c26;
-  --border-strong: #2c3547;
-  --border-focus: #38bdf8;
-
-  /* High-Contrast Typographic Hierarchy */
-  --text: #eaedf2;
-  --text-muted: #8b95a5;
-  --text-dim: #545e6d;
-
-  /* Tactical Status Semantics (Functional & Muted, No Neon Radioactive Glow) */
-  --accent: #38bdf8;
-  --accent-muted: rgba(56, 189, 248, 0.12);
-  --ok: #10b981;
-  --ok-muted: rgba(16, 185, 129, 0.12);
-  --warn: #f59e0b;
-  --warn-muted: rgba(245, 158, 11, 0.12);
-  --bad: #ef4444;
-  --bad-muted: rgba(239, 68, 68, 0.12);
-
-  /* Fonts */
+  /* Typography & Geometry Foundations */
   --sans: 'Geist', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   --mono: 'Geist Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
-
-  /* Sharp Geometry: Absolute rejection of bubbly corners & pills */
   --radius-none: 0px;
   --radius-sm: 2px;
+}
+
+/* ─── Black (Dark Mode) — Default or [data-theme="dark"] ────────────────── */
+:root,
+html[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #000000;              /* Pure OLED Black */
+  --bg-subtle: #060608;       /* Header and deeper layers */
+  --panel: #0a0a0d;           /* Precision modular panels */
+  --panel-solid: #0a0a0d;
+  --panel-subtle: #121216;     /* Table header & inner surfaces */
+  --panel-hover: #181820;
+
+  --border: #1e1e24;          /* Hairline grid borders */
+  --border-subtle: #131317;
+  --border-strong: #2c2c36;
+  --border-focus: #38bdf8;
+
+  --text: #f0f0f3;            /* High-contrast crisp white */
+  --text-muted: #8c8c9a;      /* Legible technical gray */
+  --text-dim: #545462;        /* Dark slate metadata */
+
+  --accent: #38bdf8;          /* Steel cyan */
+  --accent-muted: rgba(56, 189, 248, 0.12);
+  --ok: #10b981;              /* Terminal emerald */
+  --ok-muted: rgba(16, 185, 129, 0.12);
+  --warn: #f59e0b;            /* Tactical amber */
+  --warn-muted: rgba(245, 158, 11, 0.12);
+  --bad: #ef4444;             /* Hazard red */
+  --bad-muted: rgba(239, 68, 68, 0.12);
+
+  --chart-grid: rgba(255, 255, 255, 0.03);
+  --chart-tick: #545462;
+  --chart-tooltip-bg: #0a0a0d;
+  --chart-tooltip-border: #1e1e24;
+  --chart-tooltip-text: #f0f0f3;
+  --chart-line: #38bdf8;
+  --chart-fill: rgba(56, 189, 248, 0.05);
+}
+
+/* ─── White (Light Mode) — [data-theme="light"] ─────────────────────────── */
+html[data-theme="light"] {
+  color-scheme: light;
+  --bg: #ffffff;              /* Pure White substrate */
+  --bg-subtle: #f8f9fa;       /* Header and deeper layers */
+  --panel: #ffffff;           /* Crisp white panels */
+  --panel-solid: #ffffff;
+  --panel-subtle: #f4f5f7;     /* Table header & inner surfaces */
+  --panel-hover: #eaecee;
+
+  --border: #e2e5e9;          /* Hairline slate borders */
+  --border-subtle: #edf0f3;
+  --border-strong: #cbd0d8;
+  --border-focus: #0284c7;
+
+  --text: #09090b;            /* Carbon ink black */
+  --text-muted: #4b5563;      /* High-readability technical slate */
+  --text-dim: #6b7280;        /* Muted metadata */
+
+  --accent: #0284c7;          /* Precision deep cyan/blue */
+  --accent-muted: rgba(2, 132, 199, 0.10);
+  --ok: #059669;              /* Deep pine emerald */
+  --ok-muted: rgba(5, 150, 105, 0.10);
+  --warn: #d97706;            /* Deep amber/ochre */
+  --warn-muted: rgba(217, 119, 6, 0.10);
+  --bad: #dc2626;             /* Crisp hazard crimson */
+  --bad-muted: rgba(220, 38, 38, 0.10);
+
+  --chart-grid: rgba(0, 0, 0, 0.05);
+  --chart-tick: #6b7280;
+  --chart-tooltip-bg: #ffffff;
+  --chart-tooltip-border: #cbd0d8;
+  --chart-tooltip-text: #09090b;
+  --chart-line: #0284c7;
+  --chart-fill: rgba(2, 132, 199, 0.06);
+}
+
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    color-scheme: light;
+    --bg: #ffffff;
+    --bg-subtle: #f8f9fa;
+    --panel: #ffffff;
+    --panel-solid: #ffffff;
+    --panel-subtle: #f4f5f7;
+    --panel-hover: #eaecee;
+
+    --border: #e2e5e9;
+    --border-subtle: #edf0f3;
+    --border-strong: #cbd0d8;
+    --border-focus: #0284c7;
+
+    --text: #09090b;
+    --text-muted: #4b5563;
+    --text-dim: #6b7280;
+
+    --accent: #0284c7;
+    --accent-muted: rgba(2, 132, 199, 0.10);
+    --ok: #059669;
+    --ok-muted: rgba(5, 150, 105, 0.10);
+    --warn: #d97706;
+    --warn-muted: rgba(217, 119, 6, 0.10);
+    --bad: #dc2626;
+    --bad-muted: rgba(220, 38, 38, 0.10);
+
+    --chart-grid: rgba(0, 0, 0, 0.05);
+    --chart-tick: #6b7280;
+    --chart-tooltip-bg: #ffffff;
+    --chart-tooltip-border: #cbd0d8;
+    --chart-tooltip-text: #09090b;
+    --chart-line: #0284c7;
+    --chart-fill: rgba(2, 132, 199, 0.06);
+  }
 }
 
 * {
@@ -53,7 +136,7 @@ body {
   min-height: 100vh;
   background-color: var(--bg);
   color: var(--text);
-  font: 13.5px/1.5 var(--sans);
+  font: 13px/1.5 var(--sans);
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
@@ -80,7 +163,7 @@ code {
 .dim { color: var(--text-dim); }
 .muted { color: var(--text-muted); }
 .num { text-align: right; font-variant-numeric: tabular-nums; font-family: var(--mono); }
-.hint { font-size: 11.5px; font-weight: 400; color: var(--text-dim); }
+.hint { font-size: 11px; font-weight: 400; color: var(--text-dim); }
 .error { color: var(--bad); }
 
 /* ── Topbar: Precision Engineering Header ──────────────────────────────── */
@@ -90,7 +173,7 @@ code {
   justify-content: space-between;
   gap: 16px;
   padding: 0 20px;
-  height: 50px;
+  height: 48px;
   background: var(--bg-subtle);
   border-bottom: 1px solid var(--border);
   position: sticky;
@@ -103,7 +186,7 @@ code {
   align-items: center;
   gap: 10px;
   font-family: var(--mono);
-  font-size: 13px;
+  font-size: 12.5px;
   font-weight: 700;
   letter-spacing: 0.04em;
   color: var(--text);
@@ -144,9 +227,9 @@ code {
   display: flex;
   align-items: center;
   color: var(--text-muted);
-  padding: 0 14px;
+  padding: 0 13px;
   font-family: var(--mono);
-  font-size: 11.5px;
+  font-size: 11px;
   font-weight: 500;
   letter-spacing: 0.05em;
   text-transform: uppercase;
@@ -157,15 +240,44 @@ code {
 .topbar nav a:hover {
   color: var(--text);
   text-decoration: none;
-  background: rgba(255, 255, 255, 0.02);
+  background: rgba(128, 128, 128, 0.05);
 }
 .topbar nav a.active {
   color: var(--text);
   border-bottom-color: var(--accent);
-  background: rgba(56, 189, 248, 0.04);
+  background: var(--accent-muted);
 }
 
-/* Sharp Technical Status Tag (Replaces pill badge) */
+.topbar-right {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+/* Theme Toggle Button */
+.theme-toggle {
+  background: var(--panel);
+  border: 1px solid var(--border-strong);
+  color: var(--text-muted);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 4px 9px;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  transition: all 0.15s ease;
+}
+.theme-toggle:hover {
+  color: var(--text);
+  border-color: var(--text-muted);
+  background: var(--panel-subtle);
+}
+
+/* Sharp Technical Status Tag */
 .telemetry-badge {
   display: flex;
   align-items: center;
@@ -195,7 +307,7 @@ code {
 
 /* ── Layout & Modular Grids ────────────────────────────────────────────── */
 main {
-  padding: 20px;
+  padding: 18px 20px;
   max-width: 1440px;
   margin: 0 auto;
 }
@@ -204,7 +316,7 @@ footer {
   padding: 24px 20px;
   text-align: center;
   color: var(--text-dim);
-  font-size: 11.5px;
+  font-size: 11px;
   font-family: var(--mono);
   border-top: 1px solid var(--border);
   letter-spacing: 0.03em;
@@ -251,7 +363,7 @@ footer {
 .panel h2 {
   margin: 0;
   font-family: var(--mono);
-  font-size: 12px;
+  font-size: 11.5px;
   font-weight: 600;
   letter-spacing: 0.06em;
   text-transform: uppercase;
@@ -282,13 +394,13 @@ footer {
 .crumbs {
   margin: 0 0 14px;
   font-family: var(--mono);
-  font-size: 11.5px;
+  font-size: 11px;
   letter-spacing: 0.03em;
 }
 
 .legend {
   color: var(--text-muted);
-  font-size: 11.5px;
+  font-size: 11px;
   font-family: var(--mono);
   margin: 10px 0 12px;
   display: flex;
@@ -300,7 +412,7 @@ footer {
 /* ── KPI Strip: Monolithic Metrics ─────────────────────────────────────── */
 .kpis {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
   gap: 12px;
   margin-bottom: 16px;
 }
@@ -318,7 +430,7 @@ footer {
 
 .kpi-tag {
   font-family: var(--mono);
-  font-size: 10px;
+  font-size: 9.5px;
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.08em;
@@ -328,7 +440,7 @@ footer {
 
 .kpi-value {
   font-family: var(--mono);
-  font-size: 22px;
+  font-size: 21px;
   font-weight: 700;
   color: var(--text);
   font-variant-numeric: tabular-nums;
@@ -337,7 +449,7 @@ footer {
 }
 
 .kpi-label {
-  font-size: 11.5px;
+  font-size: 11px;
   font-weight: 400;
   color: var(--text-muted);
   margin-top: 4px;
@@ -360,13 +472,13 @@ footer {
 }
 .stat {
   color: var(--text-muted);
-  font-size: 12px;
+  font-size: 11.5px;
   font-family: var(--mono);
   letter-spacing: 0.02em;
 }
 .stat b {
   color: var(--text);
-  font-size: 15px;
+  font-size: 14.5px;
   margin-right: 4px;
 }
 .stat.warn b { color: var(--warn); }
@@ -377,7 +489,7 @@ footer {
 .chart-container {
   position: relative;
   width: 100%;
-  height: 210px;
+  height: 200px;
   margin-top: 4px;
 }
 
@@ -389,7 +501,7 @@ footer {
 
 .badge-rate {
   font-family: var(--mono);
-  font-size: 11px;
+  font-size: 10.5px;
   font-weight: 600;
   color: var(--accent);
   background: var(--panel-subtle);
@@ -414,7 +526,7 @@ footer {
 table {
   width: 100%;
   border-collapse: collapse;
-  font-size: 12.5px;
+  font-size: 12px;
 }
 
 thead th {
@@ -424,7 +536,7 @@ thead th {
   text-align: left;
   padding: 8px 12px;
   font-family: var(--mono);
-  font-size: 10.5px;
+  font-size: 10px;
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.08em;
@@ -441,7 +553,7 @@ tbody td {
 }
 tbody tr:last-child td { border-bottom: 0; }
 tbody tr:hover td {
-  background: rgba(255, 255, 255, 0.02);
+  background: rgba(128, 128, 128, 0.05);
   color: var(--text);
 }
 tbody tr.empty td {
@@ -449,7 +561,7 @@ tbody tr.empty td {
   text-align: center;
   padding: 32px 12px;
   font-family: var(--mono);
-  font-size: 11.5px;
+  font-size: 11px;
 }
 
 .evt-desc {
@@ -458,7 +570,6 @@ tbody tr.empty td {
   color: var(--text);
 }
 
-/* Crisp left accent line for event categories */
 tbody tr.k-kill td { border-left: 2px solid var(--bad); }
 tbody tr.k-dmg td { border-left: 2px solid var(--warn); }
 tbody tr.k-player td { border-left: 2px solid var(--accent); }
@@ -471,7 +582,7 @@ tbody tr.k-server td { border-left: 2px solid var(--ok); }
   padding: 1px 6px;
   border-radius: var(--radius-none);
   font-family: var(--mono);
-  font-size: 10.5px;
+  font-size: 10px;
   font-weight: 600;
   letter-spacing: 0.05em;
   text-transform: uppercase;
@@ -484,17 +595,17 @@ tbody tr.k-server td { border-left: 2px solid var(--ok); }
 .chip.ok {
   color: var(--ok);
   background: var(--ok-muted);
-  border-color: rgba(16, 185, 129, 0.3);
+  border-color: rgba(16, 185, 129, 0.35);
 }
 .chip.warn {
   color: var(--warn);
   background: var(--warn-muted);
-  border-color: rgba(245, 158, 11, 0.3);
+  border-color: rgba(245, 158, 11, 0.35);
 }
 .chip.bad {
   color: var(--bad);
   background: var(--bad-muted);
-  border-color: rgba(239, 68, 68, 0.3);
+  border-color: rgba(239, 68, 68, 0.35);
 }
 .chip.sel {
   background: var(--text);
@@ -508,7 +619,7 @@ a.chip:hover {
   color: var(--text);
 }
 .chip.kind {
-  font-size: 9.5px;
+  font-size: 9px;
   padding: 0 4px;
 }
 
@@ -531,7 +642,7 @@ a.chip:hover {
   display: flex;
   align-items: center;
   gap: 8px;
-  min-width: 140px;
+  min-width: 130px;
 }
 .bar {
   flex: 1;
@@ -539,7 +650,7 @@ a.chip:hover {
   background: var(--panel-subtle);
   border-radius: var(--radius-none);
   overflow: hidden;
-  min-width: 50px;
+  min-width: 45px;
 }
 .bar.tall {
   height: 6px;
@@ -556,9 +667,9 @@ a.chip:hover {
 
 .bar-num {
   font-family: var(--mono);
-  font-size: 11.5px;
+  font-size: 11px;
   font-variant-numeric: tabular-nums;
-  min-width: 32px;
+  min-width: 30px;
   text-align: right;
 }
 .bar-num.ok { color: var(--ok); }
@@ -579,17 +690,17 @@ ul.alerts li {
   align-items: center;
   padding: 8px 6px;
   border-bottom: 1px solid var(--border-subtle);
-  font-size: 12px;
+  font-size: 11.5px;
 }
 ul.alerts li:hover {
-  background: rgba(255, 255, 255, 0.02);
+  background: rgba(128, 128, 128, 0.05);
 }
 ul.alerts li:last-child {
   border-bottom: 0;
 }
 .alert-type {
   font-family: var(--mono);
-  font-size: 11px;
+  font-size: 10.5px;
   color: var(--text);
   letter-spacing: 0.03em;
 }
@@ -602,7 +713,7 @@ ul.alerts li:last-child {
 ul.alerts time {
   color: var(--text-dim);
   font-family: var(--mono);
-  font-size: 10.5px;
+  font-size: 10px;
 }
 
 ul.flagged li {
@@ -611,10 +722,10 @@ ul.flagged li {
   align-items: center;
   padding: 8px 6px;
   border-bottom: 1px solid var(--border-subtle);
-  font-size: 12px;
+  font-size: 11.5px;
 }
 ul.flagged li:hover {
-  background: rgba(255, 255, 255, 0.02);
+  background: rgba(128, 128, 128, 0.05);
 }
 ul.flagged li:last-child {
   border-bottom: 0;
@@ -633,7 +744,7 @@ ul.flagged .score {
   margin-bottom: 8px;
 }
 .score-big {
-  font-size: 38px;
+  font-size: 36px;
   font-weight: 700;
   font-variant-numeric: tabular-nums;
   font-family: var(--mono);
@@ -655,12 +766,12 @@ dl.kv {
   grid-template-columns: 180px 1fr;
   gap: 6px 14px;
   margin: 12px 0 0;
-  font-size: 12.5px;
+  font-size: 12px;
 }
 dl.kv dt {
   color: var(--text-dim);
   font-family: var(--mono);
-  font-size: 11px;
+  font-size: 10.5px;
   text-transform: uppercase;
   letter-spacing: 0.04em;
 }
@@ -676,7 +787,7 @@ dl.kv dd {
   align-items: center;
   margin-top: 12px;
   font-family: var(--mono);
-  font-size: 11.5px;
+  font-size: 11px;
 }
 
 /* ── Minimalist Scrollbar ──────────────────────────────────────────────── */

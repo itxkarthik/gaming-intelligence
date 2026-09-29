@@ -58,6 +58,23 @@
   const rawTimeline = {{ initial_timeline|safe or '[]' }};
   const ctx = document.getElementById('throughputChart').getContext('2d');
 
+  function getThemeColors(theme) {
+    const isLight = theme === 'light';
+    return {
+      line: isLight ? '#0284c7' : '#38bdf8',
+      fill: isLight ? 'rgba(2, 132, 199, 0.08)' : 'rgba(56, 189, 248, 0.05)',
+      grid: isLight ? 'rgba(0, 0, 0, 0.05)' : 'rgba(255, 255, 255, 0.03)',
+      tick: isLight ? '#6b7280' : '#545462',
+      tooltipBg: isLight ? '#ffffff' : '#0a0a0d',
+      tooltipBorder: isLight ? '#cbd0d8' : '#1e1e24',
+      tooltipText: isLight ? '#09090b' : '#f0f0f3',
+      tooltipBody: isLight ? '#0284c7' : '#38bdf8',
+    };
+  }
+
+  const initialTheme = document.documentElement.getAttribute('data-theme') || 'dark';
+  const c = getThemeColors(initialTheme);
+
   const labels = [];
   const data = [];
   
@@ -82,14 +99,14 @@
       datasets: [{
         label: 'Events / sec',
         data: data,
-        borderColor: '#38bdf8',
+        borderColor: c.line,
         borderWidth: 1.5,
-        backgroundColor: 'rgba(56, 189, 248, 0.05)',
+        backgroundColor: c.fill,
         fill: true,
         tension: 0.15,
         pointRadius: 0,
         pointHoverRadius: 4,
-        pointHoverBackgroundColor: '#38bdf8',
+        pointHoverBackgroundColor: c.line,
         pointHoverBorderColor: '#ffffff',
         pointHoverBorderWidth: 1,
       }]
@@ -102,12 +119,12 @@
       plugins: {
         legend: { display: false },
         tooltip: {
-          backgroundColor: '#0e1117',
-          titleColor: '#8b95a5',
+          backgroundColor: c.tooltipBg,
+          titleColor: c.tick,
           titleFont: { family: 'Geist Mono', size: 10.5 },
-          bodyColor: '#38bdf8',
+          bodyColor: c.tooltipBody,
           bodyFont: { family: 'Geist Mono', size: 12, weight: 'bold' },
-          borderColor: '#1e2430',
+          borderColor: c.tooltipBorder,
           borderWidth: 1,
           padding: 8,
           cornerRadius: 0,
@@ -119,9 +136,9 @@
       },
       scales: {
         x: {
-          grid: { color: 'rgba(255, 255, 255, 0.02)', drawBorder: false },
+          grid: { color: c.grid, drawBorder: false },
           ticks: {
-            color: '#545e6d',
+            color: c.tick,
             font: { family: 'Geist Mono', size: 10 },
             maxRotation: 0,
             maxTicksLimit: 7
@@ -129,9 +146,9 @@
         },
         y: {
           beginAtZero: true,
-          grid: { color: 'rgba(255, 255, 255, 0.03)', drawBorder: false },
+          grid: { color: c.grid, drawBorder: false },
           ticks: {
-            color: '#545e6d',
+            color: c.tick,
             font: { family: 'Geist Mono', size: 10 },
             maxTicksLimit: 5,
             callback: (val) => val >= 1000 ? `${(val / 1000).toFixed(1)}k` : val
@@ -139,6 +156,26 @@
         }
       }
     }
+  });
+
+  function applyChartTheme(theme) {
+    const colors = getThemeColors(theme);
+    throughputChart.data.datasets[0].borderColor = colors.line;
+    throughputChart.data.datasets[0].backgroundColor = colors.fill;
+    throughputChart.data.datasets[0].pointHoverBackgroundColor = colors.line;
+    throughputChart.options.scales.x.grid.color = colors.grid;
+    throughputChart.options.scales.x.ticks.color = colors.tick;
+    throughputChart.options.scales.y.grid.color = colors.grid;
+    throughputChart.options.scales.y.ticks.color = colors.tick;
+    throughputChart.options.plugins.tooltip.backgroundColor = colors.tooltipBg;
+    throughputChart.options.plugins.tooltip.borderColor = colors.tooltipBorder;
+    throughputChart.options.plugins.tooltip.titleColor = colors.tick;
+    throughputChart.options.plugins.tooltip.bodyColor = colors.tooltipBody;
+    throughputChart.update();
+  }
+
+  window.addEventListener('theme-changed', (e) => {
+    applyChartTheme(e.detail.theme);
   });
 
   function pushThroughputPoint(eps, timeStr) {

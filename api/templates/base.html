@@ -4,6 +4,19 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{% block title %}Dashboard{% endblock %} · Gaming Intelligence Platform</title>
+  <script>
+    (function() {
+      try {
+        const saved = localStorage.getItem('theme');
+        if (saved === 'light' || saved === 'dark') {
+          document.documentElement.setAttribute('data-theme', saved);
+        } else {
+          const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+          document.documentElement.setAttribute('data-theme', prefersDark ? 'dark' : 'light');
+        }
+      } catch(e) {}
+    })();
+  </script>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Geist:wght@300;400;500;600;700&family=Geist+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -27,7 +40,12 @@
     <a href="{{ href }}" class="{{ 'active' if key == active else '' }}">{{ label }}</a>
     {% endfor %}
   </nav>
-  <div class="telemetry-badge" id="live-indicator"><span class="status-marker live"></span>STREAM ACTIVE</div>
+  <div class="topbar-right">
+    <button id="theme-toggle" class="theme-toggle" type="button" title="Toggle Black / White mode">
+      <span id="theme-label">MODE: BLACK</span>
+    </button>
+    <div class="telemetry-badge" id="live-indicator"><span class="status-marker live"></span>STREAM ACTIVE</div>
+  </div>
 </header>
 
 <main>
@@ -35,6 +53,27 @@
 </main>
 
 <footer>Gaming Intelligence Platform — Kafka KRaft → PySpark → Redis/Postgres → Go Alert Engine · Datastar SSE</footer>
+
+<script>
+  function syncThemeUI() {
+    const theme = document.documentElement.getAttribute('data-theme') || 'dark';
+    const label = document.getElementById('theme-label');
+    if (label) {
+      label.textContent = theme === 'dark' ? 'MODE: BLACK' : 'MODE: WHITE';
+    }
+  }
+
+  document.getElementById('theme-toggle')?.addEventListener('click', () => {
+    const current = document.documentElement.getAttribute('data-theme') || 'dark';
+    const next = current === 'dark' ? 'light' : 'dark';
+    document.documentElement.setAttribute('data-theme', next);
+    try { localStorage.setItem('theme', next); } catch(e) {}
+    syncThemeUI();
+    window.dispatchEvent(new CustomEvent('theme-changed', { detail: { theme: next } }));
+  });
+
+  syncThemeUI();
+</script>
 
 {% if sse %}
 <script type="module">
