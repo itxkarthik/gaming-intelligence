@@ -1,4 +1,6 @@
 name: "Normal Diamond Player"
+account_age_days: 900
+games_played: 3000
 skill_tier: "diamond"
 accuracy:
   mean: 0.42

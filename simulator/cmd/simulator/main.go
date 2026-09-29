@@ -5,10 +5,13 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"hash/fnv"
+	"io"
 	"math/rand"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -23,18 +26,19 @@ import (
 
 // Config holds command line simulation parameters.
 type Config struct {
-	Players           int
-	MatchesConcurrent int
-	EventsPerSec      int
-	CheaterRatio      float64
-	SmurfRatio        float64
-	ToxicRatio        float64
-	ServerCount       int
-	KafkaBrokers      string
-	Duration          time.Duration
-	LateEventRatio    float64
-	ProfilesDir       string
-	DryRun            bool
+	Players            int
+	MatchesConcurrent  int
+	EventsPerSec       int
+	BehaviorShiftRatio float64
+	CheaterRatio       float64
+	SmurfRatio         float64
+	ToxicRatio         float64
+	ServerCount        int
+	KafkaBrokers       string
+	Duration           time.Duration
+	LateEventRatio     float64
+	ProfilesDir        string
+	DryRun             bool
 }
 
 // PlayerProfile represents statistical parameters for a player archetype.
@@ -46,6 +50,8 @@ type ProfileDistribution struct {
 type PlayerProfile struct {
 	Name           string              `yaml:"name"`
 	SkillTier      string              `yaml:"skill_tier"`
+	AccountAgeDays int                 `yaml:"account_age_days"`
+	GamesPlayed    int                 `yaml:"games_played"`
 	Accuracy       ProfileDistribution `yaml:"accuracy"`
 	HeadshotRatio  ProfileDistribution `yaml:"headshot_ratio"`
 	ReactionTimeMs ProfileDistribution `yaml:"reaction_time_ms"`
@@ -114,6 +120,39 @@ type PlayerEvent struct {
 	ServerID  *string           `json:"server_id,omitempty"`
 }
 
+// Phase 3 behavior-shift injection: a share of players suddenly plays much
+// better at the run midpoint, giving behavior_change's CUSUM a real signal.
+var (
+	behaviorShifted map[string]bool
+	behaviorShiftAt time.Time
+)
+
+func selectShiftedPlayers(pool []*Player, ratio float64) map[string]bool {
+	shifted := make(map[string]bool)
+	if ratio <= 0 {
+		return shifted
+	}
+	for _, p := range pool {
+		if rand.Float64() < ratio {
+			shifted[p.ID] = true
+		}
+	}
+	return shifted
+}
+
+func applyBehaviorShift(playerID string, acc float32) float32 {
+	if behaviorShiftAt.IsZero() || time.Now().Before(behaviorShiftAt) {
+		return acc
+	}
+	if behaviorShifted[playerID] {
+		acc *= 1.7
+		if acc > 0.95 {
+			acc = 0.95
+		}
+	}
+	return acc
+}
+
 func sampleNormal(dist ProfileDistribution, minVal, maxVal float64) float64 {
 	val := rand.NormFloat64()*dist.Std + dist.Mean
 	if val < minVal {
@@ -128,6 +167,19 @@ func sampleNormal(dist ProfileDistribution, minVal, maxVal float64) float64 {
 // chooseArchetype maps sampling rolls to a profile key.
 // roll picks the archetype class (cheater / smurf / toxic / normal);
 // rankRoll disambiguates within a class (aimbot vs wallhack, rank tier).
+// archetypeSeeds derives deterministic random draws from a player ID so the
+// same account keeps the same archetype across runs. Identity stability matters:
+// the CUSUM behavior baseline and the smurf ground truth both persist in Redis
+// between runs, and a re-rolled archetype would look like a behavior shift.
+func archetypeSeeds(playerID string) (float64, float64) {
+	h1 := fnv.New64a()
+	io.WriteString(h1, playerID+"#archetype")
+	h2 := fnv.New64a()
+	io.WriteString(h2, playerID+"#rank")
+	return float64(h1.Sum64()%1_000_000_000) / 1e9,
+		float64(h2.Sum64()%1_000_000_000) / 1e9
+}
+
 func chooseArchetype(roll, rankRoll, cheaterRatio, smurfRatio, toxicRatio float64) string {
 	switch {
 	case roll < cheaterRatio:
@@ -179,12 +231,30 @@ func loadProfiles(dir string) (map[string]PlayerProfile, error) {
 			}
 			var p PlayerProfile
 			if err := yaml.Unmarshal(data, &p); err == nil {
+				// Established-account defaults when a profile omits the fields,
+				// so only profiles that explicitly declare fresh accounts
+				// (e.g. smurf: 3 days / 12 games) can trigger smurf detection.
+				if p.AccountAgeDays <= 0 {
+					p.AccountAgeDays = 400
+				}
+				if p.GamesPlayed <= 0 {
+					p.GamesPlayed = 800
+				}
 				key := strings.TrimSuffix(f.Name(), filepath.Ext(f.Name()))
 				profiles[key] = p
 			}
 		}
 	}
 	return profiles, nil
+}
+
+// weaponCatalog is the purchasable weapon pool with in-game costs; used by
+// ITEM_PURCHASE events for economy analytics (weapon popularity / buy patterns).
+var weaponCatalog = []struct {
+	ID   string
+	Cost int
+}{
+	{"ak47", 2700}, {"m4a4", 3100}, {"awp", 4750}, {"usp", 200}, {"deagle", 700},
 }
 
 // initialPlayerEvents emits the session lifecycle events produced once per
@@ -204,7 +274,12 @@ func initialPlayerEvents(players []*Player, matches []*Match, start time.Time) [
 				EventID:   uuid.New().String(),
 				PlayerID:  p.ID,
 				EventType: "LOGIN",
-				Metadata:  map[string]string{"archetype": p.Archetype},
+				Metadata: map[string]string{
+					"archetype":        p.Archetype,
+					"account_age_days": strconv.Itoa(p.Profile.AccountAgeDays),
+					"games_played":     strconv.Itoa(p.Profile.GamesPlayed),
+					"rank":             p.Profile.SkillTier,
+				},
 				EventTime: base,
 				ServerID:  serverID,
 			},
@@ -240,6 +315,16 @@ func initialPlayerEvents(players []*Player, matches []*Match, start time.Time) [
 				EventTime: base + 400,
 				ServerID:  serverID,
 			})
+			w := weaponCatalog[rand.Intn(len(weaponCatalog))]
+			events = append(events, PlayerEvent{
+				EventID:   uuid.New().String(),
+				PlayerID:  p.ID,
+				EventType: "ITEM_PURCHASE",
+				MatchID:   &m.ID,
+				Metadata:  map[string]string{"weapon_id": w.ID, "cost": strconv.Itoa(w.Cost)},
+				EventTime: base + 500,
+				ServerID:  serverID,
+			})
 		}
 		for _, p := range m.TeamA {
 			join(p)
@@ -260,6 +345,7 @@ func main() {
 	flag.Float64Var(&cfg.CheaterRatio, "cheater-ratio", 0.05, "Proportion of active players exhibiting cheater characteristics")
 	flag.Float64Var(&cfg.SmurfRatio, "smurf-ratio", 0.05, "Proportion of active players exhibiting smurf characteristics")
 	flag.Float64Var(&cfg.ToxicRatio, "toxic-ratio", 0.05, "Proportion of active players exhibiting toxic traits")
+	flag.Float64Var(&cfg.BehaviorShiftRatio, "behavior-shift", 0.05, "Fraction of players whose accuracy jumps at the run midpoint (0 disables; feeds CUSUM detection)")
 	flag.IntVar(&cfg.ServerCount, "server-count", 10, "Total number of virtual game server instances")
 	// Use localhost:9094 as default for external host access
 	flag.StringVar(&cfg.KafkaBrokers, "kafka-brokers", "localhost:9094", "Comma-separated list of Kafka broker addresses")
@@ -382,7 +468,9 @@ func main() {
 	// Build players
 	players := make([]*Player, cfg.Players)
 	for i := 0; i < cfg.Players; i++ {
-		archetype := chooseArchetype(rand.Float64(), rand.Float64(), cfg.CheaterRatio, cfg.SmurfRatio, cfg.ToxicRatio)
+		id := fmt.Sprintf("player_%04d", i+1)
+		roll, rankRoll := archetypeSeeds(id)
+		archetype := chooseArchetype(roll, rankRoll, cfg.CheaterRatio, cfg.SmurfRatio, cfg.ToxicRatio)
 
 		pProf, ok := profiles[archetype]
 		if !ok {
@@ -390,11 +478,20 @@ func main() {
 		}
 
 		players[i] = &Player{
-			ID:        fmt.Sprintf("player_%04d", i+1),
+			ID:        id,
 			Name:      fmt.Sprintf("Player_%d", i+1),
 			Archetype: archetype,
 			Profile:   pProf,
 		}
+	}
+
+	// Phase 3: choose behavior-shift victims and arm the midpoint trigger
+	behaviorShifted = selectShiftedPlayers(players, cfg.BehaviorShiftRatio)
+	behaviorShiftAt = time.Time{}
+	if len(behaviorShifted) > 0 {
+		behaviorShiftAt = time.Now().Add(cfg.Duration / 2)
+		fmt.Printf("Behavior shift: %d/%d players get +70%% accuracy after %s (CUSUM target)\n",
+			len(behaviorShifted), len(players), (cfg.Duration / 2).String())
 	}
 
 	// Build matches
@@ -554,7 +651,7 @@ func main() {
 				attacker := attackerTeam[rand.Intn(len(attackerTeam))]
 				defender := defenderTeam[rand.Intn(len(defenderTeam))]
 
-				accuracy := float32(sampleNormal(attacker.Profile.Accuracy, 0.05, 1.0))
+				accuracy := applyBehaviorShift(attacker.ID, float32(sampleNormal(attacker.Profile.Accuracy, 0.05, 1.0)))
 				hsChance := sampleNormal(attacker.Profile.HeadshotRatio, 0.02, 1.0)
 				rxnTime := int(sampleNormal(attacker.Profile.ReactionTimeMs, 50, 600))
 				weapon := weapons[rand.Intn(len(weapons))]
@@ -708,6 +805,13 @@ func main() {
 							"cause": []string{"network", "crash", "quit"}[rand.Intn(3)],
 						})
 						disconnected[p.ID] = p
+					case p.MatchID != "" && rand.Float64() < 0.10:
+						// Re-buy / utility purchase mid-match (economy analytics).
+						w := weaponCatalog[rand.Intn(len(weaponCatalog))]
+						emit(p, "ITEM_PURCHASE", map[string]string{
+							"weapon_id": w.ID,
+							"cost":      strconv.Itoa(w.Cost),
+						})
 					}
 				}
 			}

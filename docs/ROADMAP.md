@@ -684,11 +684,11 @@ def detect_anomalies(batch_df, batch_id):
 
 ### Deliverables
 
-- [ ] Smurf detection streaming job
-- [ ] Player behavior change detection (CUSUM or rolling z-score)
-- [ ] Economy analytics (weapon popularity, item purchase patterns)
-- [ ] Anomaly detection using Isolation Forest in `foreachBatch`
-- [ ] Cross-job data flow (behavior anomaly → feeds cheat detection)
+- [x] Smurf detection streaming job (`src/jobs/smurf_detection.py` — rank-baseline z-scores vs Redis combat history; live: 9/9 precision vs simulator archetype)
+- [x] Player behavior change detection (CUSUM over Welford baseline in `src/jobs/behavior_change.py`; per-step evidence clipped ±4σ so only sustained shifts fire; simulator injects a +70% accuracy shift at the run midpoint via `--behavior-shift`)
+- [x] Economy analytics (weapon popularity + purchase patterns, sliding 60s/30s windows in `src/jobs/economy_analytics.py`)
+- [x] Anomaly detection using Isolation Forest in `foreachBatch` (`train_isolation_forest.py` fits offline → `score_samples` online only; holdout: 0.5% false-flag / 100% recall)
+- [x] Cross-job data flow (behavior anomaly → feeds cheat detection: `apply_behavior_boost` raises `suspicion_effective` on `player:{id}`)
 
 ---
 

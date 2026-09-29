@@ -37,6 +37,8 @@ ENV/
 .pytest_cache/
 
 # Spark & Checkpoints
+# Trained ML artifacts (reproduce: src/ml/train_isolation_forest.py)
+streaming/models/*.joblib
 /tmp/spark-checkpoints/
 /tmp/gaming-data/
 metastore_db/

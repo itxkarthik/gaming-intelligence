@@ -1,4 +1,6 @@
 name: "Wallhack Cheater"
+account_age_days: 60
+games_played: 95
 skill_tier: "gold"
 accuracy:
   mean: 0.45

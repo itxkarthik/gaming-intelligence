@@ -1,4 +1,6 @@
 name: "Aimbot Cheater"
+account_age_days: 45
+games_played: 120
 skill_tier: "silver"  # Low apparent account rank
 accuracy:
   mean: 0.93

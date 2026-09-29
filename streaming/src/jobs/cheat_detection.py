@@ -25,6 +25,47 @@ from src.common.config import (
 from src.common.schemas import parse_gameplay_stream
 from src.common.alerts import should_emit_alert
 from src.common.sinks import safe_parquet_archive
+from src.jobs.behavior_change import apply_behavior_boost
+
+IFOREST_THRESHOLD = -0.6  # score_samples below this = anomaly (offline-calibrated)
+IFOREST_PATH = os.path.join(
+    os.path.dirname(__file__), "..", "..", "models", "anti_cheat_isolation_forest.joblib")
+
+_IFOREST = None
+_IFOREST_TRIED = False
+
+
+def load_iforest():
+    """Load the OFFLINE-trained model once per process (never fit online)."""
+    global _IFOREST, _IFOREST_TRIED
+    if not _IFOREST_TRIED:
+        _IFOREST_TRIED = True
+        try:
+            import joblib
+            if os.path.exists(IFOREST_PATH):
+                _IFOREST = joblib.load(IFOREST_PATH)
+                print(f"[ML] IsolationForest loaded: {IFOREST_PATH}")
+            else:
+                print(f"[ML] No IsolationForest artifact at {IFOREST_PATH} — "
+                      "run src/ml/train_isolation_forest.py to enable inference",
+                      file=sys.stderr)
+        except Exception as e:
+            print(f"[WARN] IsolationForest load failed: {e}", file=sys.stderr)
+    return _IFOREST
+
+
+def score_iforest(model, rows):
+    """Vectorized score_samples over batch rows; None entries when no model."""
+    if model is None or not rows:
+        return [None] * len(rows)
+    import numpy as np
+    X = np.array([
+        [float(r["avg_accuracy"] or 0.0),
+         float(r["headshot_ratio"] or 0.0),
+         float(r["avg_reaction_time"] or 0.0)]
+        for r in rows
+    ])
+    return [float(s) for s in model.score_samples(X)]
 
 
 def build_suspicion_pipeline(parsed):
@@ -104,8 +145,10 @@ def write_player_scores_to_redis(batch_df, batch_id):
     try:
         r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=0, decode_responses=True)
         rows = batch_df.collect()
+        model = load_iforest()
+        iforest_scores = score_iforest(model, rows)
 
-        for row in rows:
+        for row, iforest_score in zip(rows, iforest_scores):
             player_id = row["player_id"]
             match_id = row["match_id"]
             suspicion = round(float(row["suspicion_score"]), 3)
@@ -115,32 +158,46 @@ def write_player_scores_to_redis(batch_df, batch_id):
             avg_acc = round(float(row["avg_accuracy"] or 0.0), 2)
             avg_rxn = round(float(row["avg_reaction_time"] or 0.0), 1)
 
+            # Cross-job signal: behavior_change's CUSUM flag boosts suspicion
+            behavior_anomaly = r.hget(f"player:behavior:{player_id}", "anomaly") == "1"
+            suspicion_eff = apply_behavior_boost(suspicion, behavior_anomaly)
+            iforest_flag = (iforest_score is not None
+                            and iforest_score < IFOREST_THRESHOLD)
+            flagged = ((suspicion_eff >= 0.70 or iforest_flag) and total_shots >= 4)
+
             profile_data = {
                 "player_id": player_id,
                 "match_id": match_id,
                 "suspicion_score": str(suspicion),
+                "suspicion_effective": str(suspicion_eff),
+                "behavior_anomaly": "true" if behavior_anomaly else "false",
+                "iforest_score": "" if iforest_score is None else f"{iforest_score:.4f}",
+                "iforest_flag": "true" if iforest_flag else "false",
                 "total_shots": str(total_shots),
                 "total_kills": str(total_kills),
                 "headshot_ratio": str(hs_ratio),
                 "avg_accuracy": str(avg_acc),
                 "avg_reaction_time_ms": str(avg_rxn),
-                "flagged": "true" if suspicion >= 0.70 and total_shots >= 4 else "false",
+                "flagged": "true" if flagged else "false",
                 "updated_at": str(int(time.time()))
             }
 
             r.hset(f"player:{player_id}", mapping=profile_data)
 
             # Emit alert if high confidence anomaly (deduped per TTL window)
-            if suspicion >= 0.70 and total_shots >= 4:
+            if flagged:
                 r.sadd("players:flagged", player_id)
                 if should_emit_alert(r, "CHEAT_DETECTED", player_id):
                     alert_payload = {
                         "alert_id": f"cheat_{player_id}_{int(time.time())}",
                         "alert_type": "CHEAT_DETECTED",
-                        "severity": "CRITICAL" if suspicion >= 0.85 else "WARNING",
+                        "severity": "CRITICAL" if max(suspicion_eff, 1.0 if iforest_flag else 0.0) >= 0.85 else "WARNING",
                         "entity_type": "PLAYER",
                         "entity_id": player_id,
-                        "message": f"High cheat probability ({suspicion*100:.1f}%) for player {player_id} in match {match_id}",
+                        "message": (f"Cheat anomaly for {player_id} in {match_id}: "
+                                    f"suspicion {suspicion_eff*100:.1f}%"
+                                    f"{' + CUSUM behavior' if behavior_anomaly else ''}"
+                                    f"{' + IsolationForest' if iforest_flag else ''}"),
                         "details": profile_data,
                         "timestamp": int(time.time() * 1000)
                     }
