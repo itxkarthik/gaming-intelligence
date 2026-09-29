@@ -111,7 +111,7 @@ def write_purchase_windows(batch_df, batch_id):
             bucket["counts"][row["weapon_id"]] = bucket["counts"].get(row["weapon_id"], 0) + int(row["purchases"])
 
         for bucket in by_window.values():
-            spend = int(bucket["row"]["total_spend"])
+            spend = int(bucket["row"]["total_spend"] or 0)  # F.sum is NULL when all costs are null
             _store_window(r, "economy:purchases", bucket["row"],
                           bucket["counts"], {"kind": "purchase_count",
                                              "total_spend": str(spend)})

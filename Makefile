@@ -1,4 +1,4 @@
-.PHONY: up down restart logs ps clean kafka-topics kafka-console-consumer simulator-build simulator-run simulator-dry-run spark-submit api-up api-run test-go test-streaming help
+.PHONY: up down restart logs ps clean kafka-topics kafka-console-consumer simulator-build simulator-run simulator-dry-run spark-submit train-model api-up api-run test-go test-streaming help
 
 # ─── Docker Infrastructure ────────────────────────────────────────────────
 up:
@@ -56,6 +56,16 @@ spark-submit:
 		--packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1 \
 		/opt/spark-apps/src/jobs/$(JOB).py
 
+# ─── ML Model ─────────────────────────────────────────────────────────────
+# streaming/models/ is untracked, so a fresh clone has no directory for the
+# container (uid 185, the Spark user) to write the .joblib artifact into.
+# Recreate it world-writable here before training — otherwise the train script
+# dies with PermissionError on os.makedirs.
+train-model:
+	mkdir -p streaming/models
+	chmod 777 streaming/models
+	docker exec -w /opt/spark-apps gaming-spark-master python3 src/ml/train_isolation_forest.py
+
 # ─── API Service ──────────────────────────────────────────────────────────
 api-up:
 	docker compose up -d --build api
@@ -88,6 +98,7 @@ help:
 	@echo "  make simulator-run          Execute Go simulator against Kafka"
 	@echo "  make simulator-dry-run      Execute Go simulator in dry-run mode (no Kafka)"
 	@echo "  make spark-submit JOB=<job> Submit a PySpark streaming job (server_health, cheat_detection, match_quality, advanced_analytics)"
+	@echo "  make train-model            Train the IsolationForest artifact (creates streaming/models/)"
 	@echo "  make api-up                 Start FastAPI backend in Docker on port 8000"
 	@echo "  make api-run                Start FastAPI backend on host (needs local Python deps)"
 	@echo "  make test-go                Run Go simulator unit tests"
