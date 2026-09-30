@@ -80,6 +80,25 @@ test-go:
 test-streaming:
 	docker exec -w /opt/spark-apps -e PYTHONPATH=/opt/spark/python:/opt/spark/python/lib/py4j-0.10.9.7-src.zip gaming-spark-master python3 -m pytest tests -q -p no:cacheprovider
 
+# ─── Phase 6: Benchmark & Batch Analysis ─────────────────────────────────
+# Batch analysis runs in local mode on the master ON PURPOSE: the 4-core
+# cluster is fully subscribed by the streaming jobs (spark.cores.max=1 each),
+# so a cluster-mode batch job would queue forever.
+spark-batch:
+	@if [ -z "$(JOB)" ]; then \
+		echo "Usage: make spark-batch JOB=all (or skill, weapon, cheat, quality, servers, peak)"; \
+		exit 1; \
+	fi
+	docker exec -w /opt/spark-apps gaming-spark-master /opt/spark/bin/spark-submit \
+		--master 'local[1]' \
+		/opt/spark-apps/src/batch/historical_analysis.py --job $(JOB)
+
+benchmark:
+	bash benchmarks/run_benchmark.sh
+
+benchmark-plot:
+	uv run --with matplotlib python3 benchmarks/plot_results.py $$(ls -t benchmarks/results/*/tiers.jsonl 2>/dev/null | head -1)
+
 # ─── Cleanup ──────────────────────────────────────────────────────────────
 clean:
 	rm -rf /tmp/spark-checkpoints/*

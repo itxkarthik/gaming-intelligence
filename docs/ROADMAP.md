@@ -856,11 +856,11 @@ PySpark Batch Job
 
 ### Deliverables
 
-- [ ] Automated benchmark script (Go simulator + metrics collection)
-- [ ] Throughput vs. latency graph
-- [ ] Resource utilization report
-- [ ] Batch analysis jobs on historical Parquet data
-- [ ] Benchmark results in `docs/benchmarks.md`
+- [x] Automated benchmark script (Go simulator + metrics collection)
+- [x] Throughput vs. latency graph
+- [x] Resource utilization report
+- [x] Batch analysis jobs on historical Parquet data
+- [x] Benchmark results in `docs/benchmarks.md`
 
 ---
 

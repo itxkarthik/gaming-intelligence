@@ -64,3 +64,6 @@ data/
 *.swo
 *~
 .DS_Store
+
+# Benchmark raw output (distilled results live in docs/benchmarks.md)
+benchmarks/results/

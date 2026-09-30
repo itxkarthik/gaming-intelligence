@@ -106,6 +106,10 @@ gaming-intelligence-platform/
 │   ├── dashboard.py                # SSR views + Datastar SSE streams
 │   ├── templates/                  # Jinja2 (7 tabs + drill-downs)
 │   └── static/                     # dashboard.css
+├── benchmarks/                     # Phase 6: tiered load benchmark + collector
+│   ├── run_benchmark.sh
+│   ├── collect.py
+│   └── plot_results.py
 └── docs/
     └── ROADMAP.md                  # Comprehensive implementation roadmap
 ```
@@ -120,7 +124,7 @@ gaming-intelligence-platform/
 - [x] **Phase 3: Advanced Analytics & Smurf Detection** (Smurf Detection with 100% live precision, CUSUM behavior-shift detection with cross-job boost into cheat scoring, Economy analytics, offline-trained Isolation Forest inference, 31 unit tests)
 - [x] **Phase 4: API & Alert Layer** (Go alert engine consuming Kafka alerts with dedup/rate-limiting + PostgreSQL history, 12 REST endpoints incl. match/economy/player drill-downs, WebSocket event & alert feeds, throughput stats)
 - [x] **Phase 5: Dashboard & Visualization** (Datastar + Jinja2 server-rendered dashboard: 7 tabs, live event stream, quality histogram, player/match drill-downs, filterable alert history — all served from the API at `:8000`, zero build step)
-- [ ] **Phase 6: Benchmarking & Historical Analysis** (Throughput vs. Latency evaluation)
+- [x] **Phase 6: Benchmarking & Historical Analysis** (Automated 5-tier benchmark 1k→20k ev/s with throughput/lag/resource collection → `docs/benchmarks.md` + graph; 6 PySpark batch analyses — skill progression, weapon meta, cheat precision/recall vs archetype labels, quality histogram, server reliability, peak hours — over the Parquet archive)
 - [ ] **Phase 7: Polish & Documentation** (Final reporting, BTP submission assets)
 
 ---
