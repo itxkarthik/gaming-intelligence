@@ -10,7 +10,6 @@ its suspicion score (ROADMAP "Cross-job data flow").
 
 import sys
 import os
-import json
 import math
 import time
 from collections import defaultdict
@@ -18,7 +17,6 @@ from collections import defaultdict
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from pyspark.sql import SparkSession
-from pyspark.sql import functions as F
 
 from src.common.config import (
     KAFKA_BOOTSTRAP_SERVERS,

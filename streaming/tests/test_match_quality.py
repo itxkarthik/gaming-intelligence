@@ -11,7 +11,7 @@ from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 
 from src.common.schemas import GAMEPLAY_EVENT_SCHEMA, PLAYER_EVENT_SCHEMA
-from src.jobs.match_quality import build_match_quality_pipeline, SESSION_GAP_SECONDS
+from src.jobs.match_quality import build_match_quality_pipeline
 
 T0 = 1_700_000_000_000  # match start (ms)
 

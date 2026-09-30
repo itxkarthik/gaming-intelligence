@@ -18,7 +18,6 @@ a deliberate cross-job data flow instead of a third stream join.
 
 import sys
 import os
-import json
 import math
 import time
 

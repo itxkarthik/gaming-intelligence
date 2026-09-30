@@ -13,7 +13,6 @@ re-run this script to reproduce; random_state is fixed).
 """
 
 import os
-import sys
 
 import numpy as np
 from sklearn.ensemble import IsolationForest

@@ -10,7 +10,6 @@ idempotent, plus a Parquet archive for the Phase 6 batch analysis.
 
 import sys
 import os
-import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 

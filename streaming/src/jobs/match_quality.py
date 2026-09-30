@@ -16,7 +16,6 @@ Quality model (documented weights, Phase 2 deliverable):
 
 import sys
 import os
-import json
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -259,17 +258,7 @@ def main():
         parse_player_stream(player_stream),
     )
 
-    console_query = scored.select(
-        "match_id", "quality_score", "status", "kills_a", "kills_b",
-        "disconnects", "skill_imbalance", "duration_s"
-    ).writeStream \
-        .outputMode("append") \
-        .format("console") \
-        .option("truncate", "false") \
-        .trigger(processingTime="5 seconds") \
-        .start()
-
-    redis_query = scored.writeStream \
+    scored.writeStream \
         .outputMode("append") \
         .foreachBatch(write_matches_to_redis) \
         .option("checkpointLocation", os.path.join(CHECKPOINT_DIR, "match_quality")) \

@@ -7,7 +7,6 @@ and writes live flags and alerts to Redis and Kafka.
 
 import sys
 import os
-import json
 import time
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -236,18 +235,8 @@ def main():
     parsed = parse_gameplay_stream(raw_stream)
     with_suspicion = build_suspicion_pipeline(parsed)
 
-    # Console display for flagged players
-    console_query = with_suspicion \
-        .filter(F.col("suspicion_score") >= 0.50) \
-        .writeStream \
-        .outputMode("update") \
-        .format("console") \
-        .option("truncate", "false") \
-        .trigger(processingTime="5 seconds") \
-        .start()
-
     # Redis state sink
-    redis_query = with_suspicion \
+    with_suspicion \
         .writeStream \
         .outputMode("update") \
         .foreachBatch(write_player_scores_to_redis) \

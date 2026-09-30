@@ -7,7 +7,6 @@ scored batches as Parquet for historical analysis.
 
 import sys
 import os
-import json
 import time
 
 # Add src to path for container imports
@@ -165,16 +164,8 @@ def main():
     parsed = parse_server_metric_stream(raw_stream)
     health_scores = build_health_pipeline(parsed)
 
-    # Console output for monitoring
-    console_query = health_scores.writeStream \
-        .outputMode("update") \
-        .format("console") \
-        .option("truncate", "false") \
-        .trigger(processingTime="10 seconds") \
-        .start()
-
     # Redis real-time state sink
-    redis_query = health_scores.writeStream \
+    health_scores.writeStream \
         .outputMode("update") \
         .foreachBatch(write_to_redis_batch) \
         .option("checkpointLocation", os.path.join(CHECKPOINT_DIR, "server_health")) \

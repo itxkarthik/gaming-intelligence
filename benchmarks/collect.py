@@ -17,7 +17,6 @@ caller's group membership (run under `newgrp docker` or a docker group shell).
 
 import json
 import re
-import statistics
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -236,7 +235,7 @@ def main() -> None:
     elif sub == "tier":
         # tier RATE T0 T1 DRAIN_S SNAP0 SNAP1 FRESH STATS OUT
         (rate, t0, t1, drain, p0, p1, pf, ps, out) = sys.argv[2:11]
-        snap0, snap1 = json.load(open(p0)), json.load(open(p1))
+        snap1 = json.load(open(p1))
         lag = cmd_lag(p0, p1, float(t1) - float(t0))
         rec = {
             "target_rate": int(rate),

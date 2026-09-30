@@ -196,4 +196,7 @@ server-rendered HTML with Datastar SSE patches (no build step, no separate front
 ---
 
 ## 📄 License
-MIT License
+
+Released under the **MIT License** — see [LICENSE](LICENSE) for the full text.
+
+Copyright (c) 2026 Karthik Das P

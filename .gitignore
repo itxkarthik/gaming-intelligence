@@ -39,18 +39,11 @@ ENV/
 # Spark & Checkpoints
 # Trained ML artifacts (reproduce: src/ml/train_isolation_forest.py)
 streaming/models/*.joblib
-/tmp/spark-checkpoints/
-/tmp/gaming-data/
 metastore_db/
 derby.log
 spark-warehouse/
 
-# Node / React
-node_modules/
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
-.pnpm-debug.log*
+# Agent scratch dirs
 .agents/
 
 # Docker & Storage volumes

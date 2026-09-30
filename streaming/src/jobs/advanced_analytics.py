@@ -16,7 +16,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from pyspark.sql import SparkSession
 
-from src.common.config import KAFKA_BOOTSTRAP_SERVERS, KAFKA_TOPICS
+from src.common.config import KAFKA_BOOTSTRAP_SERVERS
 from src.jobs import smurf_detection, behavior_change, economy_analytics
 
 
