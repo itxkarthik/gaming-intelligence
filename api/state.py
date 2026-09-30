@@ -226,6 +226,70 @@ def throughput_timeline() -> List[Dict[str, Any]]:
     return out
 
 
+# ─── Shared SSE broadcast (one publisher task, N subscribers) ────────────────
+# The HTTP mirror of what Kafka already gives us: each frame is computed ONCE
+# per tick and the identical frame is fanned out to every connected window,
+# so two browser tabs always show the same numbers at the same second.
+# Subscribers receive the last frame of each kind immediately on connect
+# (instant paint), a slow client drops its oldest queued frame instead of
+# stalling the others, and the publisher task lives only while at least one
+# client is watching.
+
+class Broadcaster:
+    def __init__(self):
+        self._subs: Dict[asyncio.Queue, None] = {}   # dict used as ordered set
+        self._last: Dict[str, Any] = {}              # kind -> most recent frame
+        self._task: Optional[asyncio.Task] = None
+        self._factory: Optional[Any] = None
+
+    def attach(self, factory) -> "Broadcaster":
+        self._factory = factory
+        return self
+
+    def subscribe(self) -> asyncio.Queue:
+        q: asyncio.Queue = asyncio.Queue(maxsize=64)
+        self._subs[q] = None
+        if (self._task is None or self._task.done()) and self._factory is not None:
+            self._task = asyncio.create_task(self._factory(self))
+        return q
+
+    def unsubscribe(self, q: asyncio.Queue):
+        self._subs.pop(q, None)
+        if not self._subs and self._task is not None:
+            self._task.cancel()
+            self._task = None
+
+    def publish(self, kind: str, frame: Any):
+        self._last[kind] = frame
+        for q in list(self._subs):
+            try:
+                q.put_nowait(frame)
+            except asyncio.QueueFull:
+                try:
+                    q.get_nowait()               # drop oldest: never stall peers
+                except asyncio.QueueEmpty:
+                    pass
+                try:
+                    q.put_nowait(frame)
+                except asyncio.QueueFull:
+                    pass
+
+    def frames(self) -> List[Any]:
+        """Cached frames for instant initial paint of a new subscriber."""
+        return list(self._last.values())
+
+
+_sse_buses: Dict[str, Broadcaster] = {}
+
+
+def sse_bus(name: str, factory) -> Broadcaster:
+    """Registry: exactly one Broadcaster + publisher task per SSE endpoint."""
+    bus = _sse_buses.get(name)
+    if bus is None:
+        bus = _sse_buses[name] = Broadcaster()
+    return bus.attach(factory)
+
+
 # ─── Kafka → fan-out live event feed (WS + Datastar SSE) ────────────────────
 
 class EventFeed:
@@ -315,10 +379,14 @@ class EventFeed:
                             })
                             with self._lock:
                                 self._history.append(text)
+                    # Seed done on an ASSIGNED consumer: it stays at the tail and
+                    # keeps receiving new records from there. NEVER call
+                    # subscribe() on the same consumer — kafka-python 2.x raises
+                    # IllegalStateError (assign and subscribe are mutually
+                    # exclusive) and the feed loop would crash every 3 s.
                 except Exception as seed_err:
                     print(f"[DEBUG] kafka seed note: {seed_err}", file=sys.stderr, flush=True)
 
-                consumer.subscribe(FEED_TOPICS)
                 for msg in consumer:
                     try:
                         event = json.loads(msg.value)

@@ -110,8 +110,6 @@ gaming-intelligence-platform/
 │   ├── run_benchmark.sh
 │   ├── collect.py
 │   └── plot_results.py
-└── docs/
-    └── ROADMAP.md                  # Comprehensive implementation roadmap
 ```
 
 ---
@@ -140,21 +138,6 @@ simulator's deliberately-degraded node):
 PostgreSQL `alert_history`:
 
 ![Alerts](docs/screenshots/alerts.png)
-
-**🎬 Demo video:** [docs/demo.mp4](docs/demo.mp4)
-
----
-
-## 🚦 Roadmap Progress
-
-- [x] **Phase 0: Foundation & Environment Setup** (Docker Compose, schemas, behavior profiles, boilerplate)
-- [x] **Phase 1: Game Event Simulator** (Go-based concurrent event generation engine with goroutines & Kafka producer)
-- [x] **Phase 2: Core Streaming Pipeline** (Server Health, Cheat Detection & Match Quality jobs with PySpark, Redis sink + Parquet archive, 13 unit tests)
-- [x] **Phase 3: Advanced Analytics & Smurf Detection** (Smurf Detection with 100% live precision, CUSUM behavior-shift detection with cross-job boost into cheat scoring, Economy analytics, offline-trained Isolation Forest inference, 31 unit tests)
-- [x] **Phase 4: API & Alert Layer** (Go alert engine consuming Kafka alerts with dedup/rate-limiting + PostgreSQL history, 12 REST endpoints incl. match/economy/player drill-downs, WebSocket event & alert feeds, throughput stats)
-- [x] **Phase 5: Dashboard & Visualization** (Datastar + Jinja2 server-rendered dashboard: 7 tabs, live event stream, quality histogram, player/match drill-downs, filterable alert history — all served from the API at `:8000`, zero build step)
-- [x] **Phase 6: Benchmarking & Historical Analysis** (Automated 5-tier benchmark 1k→20k ev/s with throughput/lag/resource collection → `docs/benchmarks.md` + graph; 6 PySpark batch analyses — skill progression, weapon meta, cheat precision/recall vs archetype labels, quality histogram, server reliability, peak hours — over the Parquet archive)
-- [x] **Phase 7: Polish & Documentation** (Final reporting, BTP submission assets: README screenshots, `docs/BTP_REPORT.md` with all 7 sections, 5:29 narrated demo `docs/demo.mp4`)
 
 ---
 

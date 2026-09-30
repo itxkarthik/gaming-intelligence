@@ -578,144 +578,178 @@ def _stream(gen):
     return DatastarResponse(gen())
 
 
+def _sse(name: str, factory):
+    """Subscriber side of a shared broadcast: paint cached frames instantly,
+    then yield every frame the single publisher produces from now on."""
+    bus = state.sse_bus(name, factory)
+
+    async def gen():
+        q = bus.subscribe()
+        try:
+            for frame in bus.frames():
+                yield frame
+            while True:
+                yield await q.get()
+        finally:
+            bus.unsubscribe(q)
+
+    return _stream(gen)
+
+
+async def _pub_overview(bus: state.Broadcaster):
+    """ONE task for all windows: batches feed rows every 1 s and rebuilds the
+    KPI/alerts/flagged panels every 5 s — each frame computed once, then the
+    identical bytes go to every subscriber."""
+    q = state.feed.register()
+    recent: List[str] = []
+    for raw in reversed(state.feed.recent_events()):
+        row = _fmt_event(raw)
+        if row:
+            recent.append(row)
+        if len(recent) >= 12:
+            break
+    if recent:
+        bus.publish("rows", SSE.patch_elements("".join(recent),
+                                               selector="#event-rows",
+                                               mode=PatchMode.INNER))
+    tick = 0
+    try:
+        while True:
+            batch: List[str] = []
+            deadline = time.monotonic() + 1.0
+            while True:
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    break
+                try:
+                    item = await asyncio.wait_for(q.get(), timeout=left)
+                except asyncio.TimeoutError:
+                    break
+                row = _fmt_event(item)
+                if row:
+                    batch.append(row)
+            if batch:
+                recent = list(reversed(batch)) + recent
+                recent = recent[:12]
+                bus.publish("rows", SSE.patch_elements("".join(recent),
+                                                       selector="#event-rows",
+                                                       mode=PatchMode.INNER))
+            tick += 1
+            if tick % 5 == 0:
+                bus.publish("kpi", SSE.patch_elements(kpis_html(),
+                                                      selector="#kpis",
+                                                      mode=PatchMode.INNER))
+                bus.publish("alerts", SSE.patch_elements(alerts_html(6),
+                                                         selector="#recent-alerts",
+                                                         mode=PatchMode.INNER))
+                bus.publish("flagged", SSE.patch_elements(flagged_html(6),
+                                                          selector="#flagged-mini",
+                                                          mode=PatchMode.INNER))
+    finally:
+        state.feed.unregister(q)
+
+
 @router.get("/sse/overview")
 async def sse_overview():
-    async def gen():
-        q = state.feed.register()
-        recent_raw = state.feed.recent_events()
-        recent: List[str] = []
-        for raw in reversed(recent_raw):
-            row = _fmt_event(raw)
-            if row:
-                recent.append(row)
-            if len(recent) >= 12:
-                break
-        if recent:
-            yield SSE.patch_elements("".join(recent),
-                                     selector="#event-rows",
-                                     mode=PatchMode.INNER)
-        tick = 0
-        try:
-            while True:
-                batch: List[str] = []
-                deadline = time.monotonic() + 1.0
-                while True:
-                    left = deadline - time.monotonic()
-                    if left <= 0:
-                        break
-                    try:
-                        item = await asyncio.wait_for(q.get(), timeout=left)
-                    except asyncio.TimeoutError:
-                        break
-                    row = _fmt_event(item)
-                    if row:
-                        batch.append(row)
-                if batch:
-                    recent = list(reversed(batch)) + recent
-                    recent = recent[:12]
-                    yield SSE.patch_elements("".join(recent),
-                                             selector="#event-rows",
-                                             mode=PatchMode.INNER)
-                tick += 1
-                if tick % 5 == 0:
-                    yield SSE.patch_elements(kpis_html(),
-                                             selector="#kpis",
-                                             mode=PatchMode.INNER)
-                    yield SSE.patch_elements(alerts_html(6),
-                                             selector="#recent-alerts",
-                                             mode=PatchMode.INNER)
-                    yield SSE.patch_elements(flagged_html(6),
-                                             selector="#flagged-mini",
-                                             mode=PatchMode.INNER)
-        finally:
-            state.feed.unregister(q)
-    return _stream(gen)
+    return _sse("overview", _pub_overview)
+
+
+async def _pub_servers(bus: state.Broadcaster):
+    while True:
+        rows = _servers()
+        bus.publish("rows", SSE.patch_elements(server_rows_html(rows),
+                                               selector="#server-rows",
+                                               mode=PatchMode.INNER))
+        bus.publish("stats", SSE.patch_elements(servers_stats_html(rows),
+                                                selector="#servers-stats",
+                                                mode=PatchMode.INNER))
+        await asyncio.sleep(2)
 
 
 @router.get("/sse/servers")
 async def sse_servers():
-    async def gen():
-        while True:
-            rows = _servers()
-            yield SSE.patch_elements(server_rows_html(rows),
-                                     selector="#server-rows",
-                                     mode=PatchMode.INNER)
-            yield SSE.patch_elements(servers_stats_html(rows),
-                                     selector="#servers-stats",
-                                     mode=PatchMode.INNER)
-            await asyncio.sleep(2)
-    return _stream(gen)
+    return _sse("servers", _pub_servers)
+
+
+async def _pub_anticheat(bus: state.Broadcaster):
+    while True:
+        bus.publish("rows", SSE.patch_elements(cheat_rows_html(),
+                                               selector="#cheat-rows",
+                                               mode=PatchMode.INNER))
+        await asyncio.sleep(2)
 
 
 @router.get("/sse/anticheat")
 async def sse_anticheat():
-    async def gen():
-        while True:
-            yield SSE.patch_elements(cheat_rows_html(),
-                                     selector="#cheat-rows",
-                                     mode=PatchMode.INNER)
-            await asyncio.sleep(2)
-    return _stream(gen)
+    return _sse("anticheat", _pub_anticheat)
+
+
+async def _pub_matches(bus: state.Broadcaster):
+    while True:
+        rows = _matches()
+        bus.publish("rows", SSE.patch_elements(match_rows_html(rows),
+                                               selector="#match-rows",
+                                               mode=PatchMode.INNER))
+        bus.publish("hist", SSE.patch_elements(histogram_html(),
+                                               selector="#histogram",
+                                               mode=PatchMode.INNER))
+        bus.publish("stats", SSE.patch_elements(matches_stats_html(rows),
+                                                selector="#matches-stats",
+                                                mode=PatchMode.INNER))
+        await asyncio.sleep(2)
 
 
 @router.get("/sse/matches")
 async def sse_matches():
-    async def gen():
-        while True:
-            rows = _matches()
-            yield SSE.patch_elements(match_rows_html(rows),
-                                     selector="#match-rows",
-                                     mode=PatchMode.INNER)
-            yield SSE.patch_elements(histogram_html(),
-                                     selector="#histogram",
-                                     mode=PatchMode.INNER)
-            yield SSE.patch_elements(matches_stats_html(rows),
-                                     selector="#matches-stats",
-                                     mode=PatchMode.INNER)
-            await asyncio.sleep(2)
-    return _stream(gen)
+    return _sse("matches", _pub_matches)
+
+
+async def _pub_tournament(bus: state.Broadcaster):
+    while True:
+        bus.publish("cards", SSE.patch_elements(tournament_html(),
+                                                selector="#tournament-cards",
+                                                mode=PatchMode.INNER))
+        await asyncio.sleep(3)
 
 
 @router.get("/sse/tournament")
 async def sse_tournament():
-    async def gen():
+    return _sse("tournament", _pub_tournament)
+
+
+async def _pub_alerts(bus: state.Broadcaster):
+    """One Redis pubsub for all windows: every subscriber gets the same
+    alert-table frame the moment one arrives on `alerts:stream`."""
+    r = aioredis.Redis(host=state.REDIS_HOST, port=state.REDIS_PORT,
+                       decode_responses=True)
+    pubsub = r.pubsub()
+    await pubsub.subscribe("alerts:stream")
+    idle = 0
+    try:
         while True:
-            yield SSE.patch_elements(tournament_html(),
-                                     selector="#tournament-cards",
-                                     mode=PatchMode.INNER)
-            await asyncio.sleep(3)
-    return _stream(gen)
+            msg = await pubsub.get_message(ignore_subscribe_messages=True,
+                                            timeout=1.0)
+            if msg and msg.get("type") == "message":
+                idle = 0
+                bus.publish("rows", SSE.patch_elements(alerts_html(10),
+                                                       selector="#alert-rows",
+                                                       mode=PatchMode.INNER))
+            else:
+                idle += 1
+                if idle >= 15:        # keepalive re-patch
+                    idle = 0
+                    bus.publish("rows", SSE.patch_elements(alerts_html(10),
+                                                           selector="#alert-rows",
+                                                           mode=PatchMode.INNER))
+    finally:
+        try:
+            await pubsub.unsubscribe("alerts:stream")
+            await pubsub.aclose()
+            await r.aclose()
+        except Exception:
+            pass
 
 
 @router.get("/sse/alerts")
 async def sse_alerts():
-    async def gen():
-        r = aioredis.Redis(host=state.REDIS_HOST, port=state.REDIS_PORT,
-                           decode_responses=True)
-        pubsub = r.pubsub()
-        await pubsub.subscribe("alerts:stream")
-        idle = 0
-        try:
-            while True:
-                msg = await pubsub.get_message(ignore_subscribe_messages=True,
-                                               timeout=1.0)
-                if msg and msg.get("type") == "message":
-                    idle = 0
-                    yield SSE.patch_elements(alerts_html(10),
-                                             selector="#alert-rows",
-                                             mode=PatchMode.INNER)
-                else:
-                    idle += 1
-                    if idle >= 15:        # keepalive re-patch
-                        idle = 0
-                        yield SSE.patch_elements(alerts_html(10),
-                                                 selector="#alert-rows",
-                                                 mode=PatchMode.INNER)
-        finally:
-            try:
-                await pubsub.unsubscribe("alerts:stream")
-                await pubsub.aclose()
-                await r.aclose()
-            except Exception:
-                pass
-    return _stream(gen)
+    return _sse("alerts", _pub_alerts)
