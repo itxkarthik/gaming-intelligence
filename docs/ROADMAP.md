@@ -877,8 +877,8 @@ PySpark Batch Job
 
 ### Deliverables
 
-- [ ] README with architecture diagram, setup instructions, screenshots
-- [ ] BTP report with:
+- [x] README with architecture diagram, setup instructions, screenshots
+- [x] BTP report with:
   - Problem statement and motivation
   - System architecture and design decisions
   - Implementation details per component
@@ -886,8 +886,8 @@ PySpark Batch Job
   - Benchmark results and analysis
   - Anomaly detection methodology
   - Future work
-- [ ] Demo video (5-10 minutes)
-- [ ] Clean git history with meaningful commits
+- [x] Demo video (5-10 minutes) (`docs/demo.mp4` — 5:29, narrated)
+- [x] Clean git history with meaningful commits
 
 ---
 

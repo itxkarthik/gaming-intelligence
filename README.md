@@ -116,6 +116,35 @@ gaming-intelligence-platform/
 
 ---
 
+## 📸 Screenshots
+
+**Overview** — live KPIs, event stream, alerts, flagged players:
+
+![Overview dashboard](docs/screenshots/overview.png)
+
+**Server health map** — live health bars and status chips (server-02 is the
+simulator's deliberately-degraded node):
+
+![Server health](docs/screenshots/servers.png)
+
+**Match quality** — distribution histogram with per-match drill-down:
+
+![Match quality](docs/screenshots/matches.png)
+
+**Anti-cheat** — flagged players ranked by effective suspicion
+(base score + behavior boost + IsolationForest):
+
+![Anti-cheat](docs/screenshots/anticheat.png)
+
+**Alerts** — live feed pushed by the Go alert engine, plus the filterable
+PostgreSQL `alert_history`:
+
+![Alerts](docs/screenshots/alerts.png)
+
+**🎬 Demo video:** [docs/demo.mp4](docs/demo.mp4)
+
+---
+
 ## 🚦 Roadmap Progress
 
 - [x] **Phase 0: Foundation & Environment Setup** (Docker Compose, schemas, behavior profiles, boilerplate)
@@ -125,7 +154,7 @@ gaming-intelligence-platform/
 - [x] **Phase 4: API & Alert Layer** (Go alert engine consuming Kafka alerts with dedup/rate-limiting + PostgreSQL history, 12 REST endpoints incl. match/economy/player drill-downs, WebSocket event & alert feeds, throughput stats)
 - [x] **Phase 5: Dashboard & Visualization** (Datastar + Jinja2 server-rendered dashboard: 7 tabs, live event stream, quality histogram, player/match drill-downs, filterable alert history — all served from the API at `:8000`, zero build step)
 - [x] **Phase 6: Benchmarking & Historical Analysis** (Automated 5-tier benchmark 1k→20k ev/s with throughput/lag/resource collection → `docs/benchmarks.md` + graph; 6 PySpark batch analyses — skill progression, weapon meta, cheat precision/recall vs archetype labels, quality histogram, server reliability, peak hours — over the Parquet archive)
-- [ ] **Phase 7: Polish & Documentation** (Final reporting, BTP submission assets)
+- [x] **Phase 7: Polish & Documentation** (Final reporting, BTP submission assets: README screenshots, `docs/BTP_REPORT.md` with all 7 sections, 5:29 narrated demo `docs/demo.mp4`)
 
 ---
 
