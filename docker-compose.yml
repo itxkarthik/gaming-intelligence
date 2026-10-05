@@ -1,10 +1,30 @@
+# Shared definition of the three Spark containers (one image, same env and
+# mounts); each service below only adds its name, command and ports.
+x-spark: &spark
+  build:
+    context: ./streaming
+    dockerfile: Dockerfile
+  image: gaming-spark:3.5.1
+  environment:
+    - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+    - REDIS_HOST=redis
+    - REDIS_PORT=6379
+  volumes:
+    - ./streaming:/opt/spark-apps
+    - ./data/checkpoints:/tmp/spark-checkpoints
+    - ./data/parquet:/tmp/gaming-data/parquet
+  networks:
+    - gaming-net
+
 services:
   # ─── Kafka (KRaft mode - Official Apache Kafka) ─────────────────────────
   kafka:
     image: apache/kafka:3.7.0
     container_name: gaming-kafka
     ports:
-      - "9092:9092"
+      # Host clients (simulator, benchmarks) use EXTERNAL on 9094. PLAINTEXT
+      # 9092 advertises kafka:9092 — only reachable on the compose network —
+      # so it is not published.
       - "9094:9094"
     environment:
       KAFKA_NODE_ID: 1
@@ -18,8 +38,16 @@ services:
       KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
       KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
-      KAFKA_NUM_PARTITIONS: 3
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      # Topics come only from kafka-init, with their intended partition
+      # counts. With auto-create on, any client that merely asked for a
+      # topic first (e.g. a simulator started early) created it with the
+      # broker's default partition count, and kafka-init's --if-not-exists
+      # kept it so.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      # Keep the log on the kafka_data volume. Unset, the broker writes to
+      # /tmp/kafka-logs in the container layer and every recreate drops all
+      # topics and offsets.
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
     volumes:
       - kafka_data:/var/lib/kafka/data
     networks:
@@ -33,8 +61,11 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 30s
 
   # ─── Kafka Topic Initialization ─────────────────────────────────────────
+  # One-shot: exits 0 once every topic exists; api and alert-engine wait for
+  # that (service_completed_successfully). Any failed create exits non-zero.
   kafka-init:
     image: apache/kafka:3.7.0
     container_name: gaming-kafka-init
@@ -46,84 +77,40 @@ services:
     entrypoint: ["/bin/sh", "-c"]
     command:
       - |
-        echo 'Waiting for Kafka to be ready...'
+        set -e
         /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic gameplay_events --partitions 6 --replication-factor 1
         /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic player_events --partitions 3 --replication-factor 1
         /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic server_metrics --partitions 3 --replication-factor 1
         /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --create --if-not-exists --topic alerts --partitions 1 --replication-factor 1
-        echo 'Kafka topics created successfully.'
+        echo 'Kafka topics ready.'
 
   # ─── Spark Master ───────────────────────────────────────────────────────
+  # Jobs are submitted with `docker exec gaming-spark-master spark-submit`
+  # (make spark-submit), so the 7077 master port stays on the compose network.
   spark-master:
-    build:
-      context: ./streaming
-      dockerfile: Dockerfile
-    image: gaming-spark:3.5.1
+    <<: *spark
     container_name: gaming-spark-master
     command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master --host spark-master --port 7077 --webui-port 8080
     ports:
       - "8080:8080" # Spark Master Web UI
-      - "7077:7077" # Spark Master Port
-    environment:
-      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
-      - POSTGRES_HOST=postgres
-      - POSTGRES_PORT=5432
-    volumes:
-      - ./streaming:/opt/spark-apps
-      - ./data/checkpoints:/tmp/spark-checkpoints
-      - ./data/parquet:/tmp/gaming-data/parquet
-    networks:
-      - gaming-net
 
-  # ─── Spark Worker 1 ─────────────────────────────────────────────────────
+  # ─── Spark Workers ──────────────────────────────────────────────────────
   spark-worker-1:
-    build:
-      context: ./streaming
-      dockerfile: Dockerfile
-    image: gaming-spark:3.5.1
+    <<: *spark
     container_name: gaming-spark-worker-1
     depends_on:
       - spark-master
     command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077 --cores 2 --memory 2G
-    environment:
-      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
-      - POSTGRES_HOST=postgres
-      - POSTGRES_PORT=5432
-    volumes:
-      - ./streaming:/opt/spark-apps
-      - ./data/checkpoints:/tmp/spark-checkpoints
-      - ./data/parquet:/tmp/gaming-data/parquet
-    networks:
-      - gaming-net
 
-  # ─── Spark Worker 2 ─────────────────────────────────────────────────────
   spark-worker-2:
-    build:
-      context: ./streaming
-      dockerfile: Dockerfile
-    image: gaming-spark:3.5.1
+    <<: *spark
     container_name: gaming-spark-worker-2
     depends_on:
       - spark-master
     command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077 --cores 2 --memory 2G
-    environment:
-      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
-      - POSTGRES_HOST=postgres
-      - POSTGRES_PORT=5432
-    volumes:
-      - ./streaming:/opt/spark-apps
-      - ./data/checkpoints:/tmp/spark-checkpoints
-      - ./data/parquet:/tmp/gaming-data/parquet
-    networks:
-      - gaming-net
 
   # ─── Redis (Real-time State Store) ──────────────────────────────────────
+  # Redis >= 7 is required: the alert engine's gates use SET ... NX GET.
   redis:
     image: redis:7-alpine
     container_name: gaming-redis
@@ -181,12 +168,17 @@ services:
         condition: service_healthy
       kafka:
         condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
       postgres:
         condition: service_healthy
     networks:
       - gaming-net
+    restart: unless-stopped
 
   # ─── Go Alert Engine (Phase 4) ──────────────────────────────────────────
+  # Empty values select the engine's defaults (TTLs 5m, webhook disabled);
+  # see alert-engine/config.go and the README's Configuration section.
   alert-engine:
     build:
       context: ./alert-engine
@@ -202,9 +194,13 @@ services:
       - POSTGRES_PASSWORD=gaming_dev
       - POSTGRES_DB=gaming_platform
       - ALERT_WEBHOOK_URL=${ALERT_WEBHOOK_URL:-}
+      - ALERT_DEDUP_TTL=${ALERT_DEDUP_TTL:-}
+      - ALERT_RATE_LIMIT_TTL=${ALERT_RATE_LIMIT_TTL:-}
     depends_on:
       kafka:
         condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
       redis:
         condition: service_healthy
       postgres:
