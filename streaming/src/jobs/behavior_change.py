@@ -3,37 +3,45 @@
 Tracks each player's shot-accuracy baseline with Welford's online algorithm
 and a two-sided CUSUM on the z-score; sustained deviation beyond the decision
 threshold raises a BEHAVIOR_ANOMALY. The CUSUM state lives in Redis
-(`behavior:cusum:{id}`) so restarts don't lose cumulative history — and the
-flag written to `player:behavior:{id}` is read by cheat_detection to boost
-its suspicion score (ROADMAP "Cross-job data flow").
+(`behavior:cusum:{id}`) so restarts don't lose cumulative history.
+
+One micro-batch is one CUSUM step per player: the mean accuracy of that
+player's shots in the batch. A step needs MIN_STEP_SHOTS shots; smaller
+samples are too noisy to count as evidence and are skipped, not carried
+over. At ~1 shot/s per player and a 5 s trigger a step averages ~5 shots.
+
+The first WARMUP_STEPS steps only build the baseline (mean and spread): a
+detector judging against a two-sample spread trips on ordinary noise. h=8
+keeps false alarms rare across thousands of players (in-control ARL in the
+tens of thousands of steps at k=0.5) while a sustained 2-sigma shift is
+still caught within ~6 steps.
+
+A detection writes `player:behavior:{id}` (anomaly=1), which cheat_detection
+reads to boost its suspicion score (ROADMAP "Cross-job data flow"). The flag
+expires BEHAVIOR_FLAG_TTL_SECONDS after the latest detection (a persisting
+shift keeps re-tripping the detector and refreshing it); once it has
+expired, the player's next in-range step drops them from
+`behavior:anomalies`.
 """
 
-import sys
-import os
 import math
+import os
 import time
-from collections import defaultdict
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+from pyspark.sql import functions as F
 
-from pyspark.sql import SparkSession
-
-from src.common.config import (
-    KAFKA_BOOTSTRAP_SERVERS,
-    KAFKA_TOPICS,
-    KAFKA_STARTING_OFFSETS,
-    REDIS_HOST,
-    REDIS_PORT,
-    CHECKPOINT_DIR
-)
-from src.common.schemas import parse_gameplay_stream
-from src.common.alerts import emit_alert, flush_alerts_to_kafka
+from src.common.alerts import AlertBatch, make_alert
+from src.common.config import CHECKPOINT_DIR, DEFAULT_PROCESSING_TIME, KAFKA_TOPICS
+from src.common.runtime import kafka_source, redis_client, warn
+from src.common.schemas import SHOT_EVENT, parse_stream
 from src.common.sinks import safe_parquet_archive
 
 CUSUM_K = 0.5     # slack allowance per step (in sigmas)
-CUSUM_H = 5.0     # decision threshold (sigmas of cumulative evidence)
-DEFAULT_SD = 0.08 # accuracy population std used while the baseline is cold
+CUSUM_H = 8.0     # decision threshold (sigmas of cumulative evidence)
+WARMUP_STEPS = 10 # baseline-only steps before the detector judges
 BEHAVIOR_BOOST = 0.15  # suspicion add-on applied by cheat_detection
+MIN_STEP_SHOTS = 3
+BEHAVIOR_FLAG_TTL_SECONDS = 600
 
 
 def cusum_step(state, x, k=CUSUM_K, h=CUSUM_H):
@@ -43,25 +51,24 @@ def cusum_step(state, x, k=CUSUM_K, h=CUSUM_H):
     Returns (new_state, anomaly: bool, z: float). Pure — unit-testable.
     """
     n = int(state.get("n", 0))
-    if n == 0:
-        return {"n": 1, "mean": float(x), "m2": 0.0,
-                "s_pos": 0.0, "s_neg": 0.0, "anomalies": 0}, False, 0.0
-
-    sd = math.sqrt(float(state["m2"]) / (n - 1)) if n > 1 else DEFAULT_SD
-    sd = max(sd, 0.02)  # floor: a near-constant baseline must not explode z
-    z = (float(x) - float(state["mean"])) / sd
-    # Clip per-step evidence to ±4σ: one batch alone can contribute at most
-    # 4 - k = 3.5 < h, so only a SUSTAINED shift can ever trip the detector.
-    z = max(-4.0, min(4.0, z))
-
-    s_pos = max(0.0, float(state["s_pos"]) + z - k)
-    s_neg = min(0.0, float(state["s_neg"]) + z + k)
-    anomaly = s_pos > h or s_neg < -h
+    if n < WARMUP_STEPS:
+        z, s_pos, s_neg, anomaly = 0.0, 0.0, 0.0, False
+    else:
+        sd = max(math.sqrt(float(state["m2"]) / (n - 1)),
+                 0.02)  # floor: a near-constant baseline must not explode z
+        z = (float(x) - float(state["mean"])) / sd
+        # Clip per-step evidence to ±4σ: one batch alone adds at most
+        # 4 - k = 3.5 < h, so only a SUSTAINED shift can trip the detector.
+        z = max(-4.0, min(4.0, z))
+        s_pos = max(0.0, float(state["s_pos"]) + z - k)
+        s_neg = min(0.0, float(state["s_neg"]) + z + k)
+        anomaly = s_pos > h or s_neg < -h
 
     # Welford update of the baseline
     n1 = n + 1
-    mean = float(state["mean"]) + (float(x) - float(state["mean"])) / n1
-    m2 = float(state["m2"]) + (float(x) - mean) * (float(x) - float(state["mean"]))
+    prev_mean = float(state.get("mean", 0.0)) if n else float(x)
+    mean = prev_mean + (float(x) - prev_mean) / n1
+    m2 = float(state.get("m2", 0.0)) + (float(x) - mean) * (float(x) - prev_mean)
 
     new_state = {
         "n": n1,
@@ -93,108 +100,84 @@ def load_state(raw):
     }
 
 
+def player_steps(batch_df):
+    """Per-player CUSUM step inputs for one micro-batch, aggregated in Spark."""
+    return batch_df \
+        .filter((F.col("event_type") == SHOT_EVENT) & F.col("accuracy").isNotNull()) \
+        .groupBy("player_id") \
+        .agg(F.count(F.lit(1)).alias("shots"), F.avg("accuracy").alias("mean_accuracy")) \
+        .filter(F.col("shots") >= MIN_STEP_SHOTS)
+
+
+def update_behavior(r, alerts, steps):
+    """Advance each player's CUSUM by one step; raise, refresh or clear flags.
+
+    steps: rows with player_id, shots, mean_accuracy (see player_steps).
+    """
+    pipe = r.pipeline()
+    for row in steps:
+        pipe.hgetall(f"behavior:cusum:{row['player_id']}")
+        pipe.exists(f"player:behavior:{row['player_id']}")
+    reads = pipe.execute()
+
+    pipe = r.pipeline()
+    for row, raw, flag_alive in zip(steps, reads[::2], reads[1::2]):
+        player_id = row["player_id"]
+        batch_mean = float(row["mean_accuracy"])
+        new_state, anomaly, z = cusum_step(load_state(raw), batch_mean)
+        pipe.hset(f"behavior:cusum:{player_id}", mapping={
+            "n": str(new_state["n"]),
+            "mean": f"{new_state['mean']:.6f}",
+            "m2": f"{new_state['m2']:.6f}",
+            "s_pos": f"{new_state['s_pos']:.4f}",
+            "s_neg": f"{new_state['s_neg']:.4f}",
+            "anomalies": str(new_state["anomalies"]),
+        })
+
+        if anomaly:
+            info = {
+                "player_id": player_id,
+                "anomaly": "1",
+                "anomalies": str(new_state["anomalies"]),
+                "last_batch_mean": f"{batch_mean:.4f}",
+                "last_z": f"{z:.2f}",
+                "baseline_mean": f"{new_state['mean']:.4f}",
+                "baseline_n": str(new_state["n"]),
+                "detected_at": str(int(time.time())),
+            }
+            pipe.hset(f"player:behavior:{player_id}", mapping=info)
+            pipe.expire(f"player:behavior:{player_id}", BEHAVIOR_FLAG_TTL_SECONDS)
+            pipe.sadd("behavior:anomalies", player_id)
+            alerts.emit(make_alert(
+                "BEHAVIOR_ANOMALY", "WARNING", "PLAYER", player_id,
+                f"CUSUM detected sustained accuracy shift for {player_id} "
+                f"(z={z:.1f}, batch acc {batch_mean:.2f})",
+                info,
+            ))
+        elif not flag_alive:
+            pipe.srem("behavior:anomalies", player_id)
+    pipe.execute()
+
+
 def write_behavior_batch(batch_df, batch_id):
-    """Update per-player CUSUM from this micro-batch's mean accuracy."""
     if batch_df.isEmpty():
         return
-
-    import redis
-
-    sums = defaultdict(lambda: [0.0, 0])
-    for row in batch_df.collect():
-        acc = row["accuracy"]
-        if acc is None:
-            continue
-        s = sums[row["player_id"]]
-        s[0] += float(acc)
-        s[1] += 1
-
-    if not sums:
-        return
-
     try:
-        r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=0, decode_responses=True)
-        pending_alerts = []
-
-        for player_id, (total, count) in sums.items():
-            batch_mean = total / count
-            state = load_state(r.hgetall(f"behavior:cusum:{player_id}"))
-            new_state, anomaly, z = cusum_step(state, batch_mean)
-
-            r.hset(f"behavior:cusum:{player_id}", mapping={
-                "n": str(new_state["n"]),
-                "mean": f"{new_state['mean']:.6f}",
-                "m2": f"{new_state['m2']:.6f}",
-                "s_pos": f"{new_state['s_pos']:.4f}",
-                "s_neg": f"{new_state['s_neg']:.4f}",
-                "anomalies": str(new_state["anomalies"]),
-            })
-
-            if anomaly:
-                info = {
-                    "player_id": player_id,
-                    "anomaly": "1",
-                    "last_batch_mean": f"{batch_mean:.4f}",
-                    "last_z": f"{z:.2f}",
-                    "baseline_mean": f"{new_state['mean']:.4f}",
-                    "baseline_n": str(new_state["n"]),
-                    "detected_at": str(int(time.time())),
-                }
-                r.hset(f"player:behavior:{player_id}", mapping=info)
-                r.sadd("behavior:anomalies", player_id)
-                alert_payload = {
-                    "alert_id": f"behavior_{player_id}_{int(time.time())}",
-                    "alert_type": "BEHAVIOR_ANOMALY",
-                    "severity": "WARNING",
-                    "entity_type": "PLAYER",
-                    "entity_id": player_id,
-                    "message": (f"CUSUM detected sustained accuracy shift for "
-                                f"{player_id} (z={z:.1f}, batch acc {batch_mean:.2f})"),
-                    "details": info,
-                    "timestamp": int(time.time() * 1000),
-                }
-                emitted = emit_alert(r, alert_payload)
-                if emitted:
-                    pending_alerts.append(emitted)
-
-        flush_alerts_to_kafka(batch_df.sparkSession, pending_alerts)
-    except Exception as e:
-        print(f"[WARN] behavior batch {batch_id}: {e}", file=sys.stderr)
-
+        r = redis_client()
+        alerts = AlertBatch(r)
+        update_behavior(r, alerts, player_steps(batch_df).collect())
+        alerts.flush(batch_df.sparkSession)
+    except Exception as e:  # noqa: BLE001 - keep the stream alive; next batch retries
+        warn(f"behavior batch {batch_id}: {e}")
+    # Raw SHOT rows: the batch jobs (skill, weapon, peak) read this archive.
     safe_parquet_archive(batch_df, "behavior_change", batch_id)
 
 
 def start_queries(spark):
-    raw = spark.readStream \
-        .format("kafka") \
-        .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP_SERVERS) \
-        .option("subscribe", KAFKA_TOPICS["gameplay"]) \
-        .option("startingOffsets", KAFKA_STARTING_OFFSETS) \
-        .option("failOnDataLoss", "false") \
-        .load()
-
-    query = parse_gameplay_stream(raw).writeStream \
+    parsed = parse_stream(kafka_source(spark, KAFKA_TOPICS["gameplay"]), "gameplay")
+    return parsed.writeStream \
         .outputMode("append") \
         .foreachBatch(write_behavior_batch) \
         .option("checkpointLocation", os.path.join(CHECKPOINT_DIR, "behavior_change")) \
-        .trigger(processingTime="5 seconds") \
+        .trigger(processingTime=DEFAULT_PROCESSING_TIME) \
         .start()
-    return query
-
-
-def main():
-    spark = SparkSession.builder \
-        .appName("Gaming-BehaviorChange") \
-        .config("spark.sql.shuffle.partitions", "4") \
-        .getOrCreate()
-    spark.sparkContext.setLogLevel("WARN")
-
-    print(f"Connecting to Kafka at: {KAFKA_BOOTSTRAP_SERVERS}")
-    print(f"Subscribing to topic: {KAFKA_TOPICS['gameplay']}")
-    start_queries(spark)
-    print("Behavior Change (CUSUM) streaming pipeline started.")
-    spark.streams.awaitAnyTermination()
-
-
-if __name__ == "__main__":
-    main()
