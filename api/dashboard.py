@@ -17,6 +17,7 @@ import html
 import json
 import logging
 import os
+import time
 from typing import Any
 from urllib.parse import urlencode
 
@@ -53,6 +54,7 @@ POLL = {
     "anticheat": 2,
     "matches": 2,
     "tournament": 3,
+    "behavior": 3,
     "alerts_keepalive": 15,
 }
 LIVE_ROWS = 12
@@ -103,6 +105,22 @@ def _match_class(status: str) -> str:
 
 # ─── Fragment renderers (used for BOTH initial page render and SSE patches) ─
 
+ALERT_LABEL = {
+    "CHEAT_DETECTED": "Cheat",
+    "SMURF_DETECTED": "Smurf",
+    "BEHAVIOR_ANOMALY": "Behaviour shift",
+    "SERVER_DEGRADED": "Server degraded",
+    "MATCH_QUALITY_LOW": "Low-quality match",
+}
+SEVERITY_CLASS = {"CRITICAL": "bad", "WARNING": "warn"}
+
+
+def _alerts_last_minute() -> int:
+    cutoff_ms = (time.time() - 60) * 1000
+    return sum(1 for a in state.alert_log.recent(state.ALERT_LOG_SIZE)
+               if as_float(a.get("timestamp")) >= cutoff_ms)
+
+
 async def _kpi_dict() -> dict[str, Any]:
     snap = state.throughput_snapshot()
     counts = await state.current_counts()
@@ -112,32 +130,32 @@ async def _kpi_dict() -> dict[str, Any]:
         "chart_time": snap["latest_sample_time"],
         "total_events": snap["ingested_total"],
         "live_matches": state.feed.live_matches(),
-        "alerts_recent": len(state.alert_log),
+        "alerts_per_min": _alerts_last_minute(),
         **counts,
     }
 
 
+def _kpi(label: str, value: str, unit: str = "") -> str:
+    unit_html = f'<span class="kpi-unit">{E(unit)}</span>' if unit else ""
+    return (f'<div class="kpi"><div class="kpi-label">{E(label)}</div>'
+            f'<div class="kpi-value">{E(value)}{unit_html}</div></div>')
+
+
 def kpis_html(k: dict[str, Any]) -> str:
-    eps = f"{k['eps']:.0f}" if k["eps"] is not None else "—"
-    cards = [
-        ("Events / sec", eps, "kpi-live", "Velocity"),
-        ("Total Ingested", f"{k['total_events']:,}", "", "Kafka Input Topics"),
-        ("Active Matches", str(k["live_matches"]), "kpi-live" if k["live_matches"] else "",
-         "Server Metrics"),
-        ("Cheat Flagged", str(k["cheat_flagged"]), "kpi-bad" if k["cheat_flagged"] else "",
-         "Anti-Cheat"),
-        ("Smurf Accounts", str(k["smurf"]), "kpi-warn" if k["smurf"] else "", "Flagged"),
-        ("Behavior Shifts", str(k["behavior_anomalies"]),
-         "kpi-warn" if k["behavior_anomalies"] else "", "CUSUM Drift"),
-        ("Recent Alerts", str(k["alerts_recent"]), "kpi-warn" if k["alerts_recent"] else "",
-         f"Last {state.ALERT_LOG_SIZE}"),
-    ]
-    card_html = "".join(
-        f'<div class="kpi {cls}">'
-        f'<div class="kpi-tag">{E(tag)}</div>'
-        f'<div class="kpi-value">{E(value)}</div>'
-        f'<div class="kpi-label">{E(label)}</div></div>'
-        for label, value, cls, tag in cards)
+    eps = f"{k['eps']:,.0f}" if k["eps"] is not None else "—"
+    # The alert log holds the last ALERT_LOG_SIZE alerts, so a full log
+    # within the minute is a floor, not a count.
+    capped = k["alerts_per_min"] >= state.ALERT_LOG_SIZE
+    alerts_rate = f"{k['alerts_per_min']}{'+' if capped else ''}"
+    card_html = "".join([
+        _kpi("Throughput", eps, "ev/s"),
+        _kpi("Ingested", f"{k['total_events']:,}"),
+        _kpi("Live matches", str(k["live_matches"])),
+        _kpi("Flagged cheaters", str(k["cheat_flagged"])),
+        _kpi("Smurf accounts", str(k["smurf"])),
+        _kpi("Behaviour shifts", str(k["behavior_anomalies"])),
+        _kpi("Alerts", alerts_rate, "/ min"),
+    ])
     # Chart carrier: the latest 5 s sample (same series as the initial
     # timeline); the page dedupes on data-time so a sample plots once.
     chart_eps = "" if k["chart_eps"] is None else k["chart_eps"]
@@ -156,23 +174,35 @@ def alerts_html(n: int = 10) -> str:
     for a in rows:
         ts = as_float(a.get("timestamp")) / 1000
         when = state.clock(ts) if ts else "—"
+        severity = str(a.get("severity", "INFO"))
+        kind = str(a.get("alert_type", "?"))
+        msg = E(str(a.get("message", "")))
         out.append(
             f'<li class="alert">'
-            f'<span class="chip">{E(str(a.get("severity", "INFO")))}</span>'
-            f'<span class="alert-type">{E(str(a.get("alert_type", "?")))}</span>'
-            f'<span class="alert-msg">{E(str(a.get("message", "")))}</span>'
-            f'<time>{when}</time></li>')
+            f'<span class="sev {SEVERITY_CLASS.get(severity, "")}" title="{E(severity)}"></span>'
+            f'<span class="alert-entity">{E(str(a.get("entity_id") or "—"))}</span>'
+            f'<span class="alert-type">{E(ALERT_LABEL.get(kind, kind))}</span>'
+            f'<time>{when}</time>'
+            f'<span class="alert-msg" title="{msg}">{msg}</span></li>')
     return "".join(out)
 
 
-def flagged_html(rows: list[dict[str, str]], n: int = 8) -> str:
+def flagged_html(rows: list[dict[str, str]], n: int = 10) -> str:
     if not rows:
         return '<li class="empty">No players flagged.</li>'
     out = []
     for p in rows[:n]:
         pid = E(str(p.get("player_id", "?")))
-        out.append(f'<li><a href="/players/{pid}">{pid}</a>'
-                   f'<span class="score">{state.effective_suspicion(p):.2f}</span></li>')
+        eff = state.effective_suspicion(p)
+        signals = "".join(
+            f'<span class="chip kind" title="{title}">{name}</span>'
+            for name, title, on in (
+                ("IF", "Isolation Forest outlier", p.get("iforest_flag") == "true"),
+                ("CUSUM", "Sustained accuracy shift", p.get("behavior_anomaly") == "true"),
+            ) if on)
+        out.append(f'<li><a class="mono" href="/players/{pid}">{pid}</a>'
+                   f'<span class="signals">{signals}</span>'
+                   f'<span class="score {_suspicion_class(eff)}">{eff * 100:.0f}%</span></li>')
     return "".join(out)
 
 
@@ -261,6 +291,54 @@ def match_rows_html(rows: list[dict[str, Any]]) -> str:
             f'<td class="num">{as_float(m.get("kill_imbalance")):.2f}</td>'
             f'<td class="num">{E(str(m.get("disconnects", "0")))}</td>'
             f'<td class="num">{E(str(m.get("duration_s", "0")))}s</td>'
+            f'</tr>')
+    return "".join(out)
+
+
+BEHAVIOR_ROWS = 100  # most significant rows per table; the page states the total
+
+
+def _top_note(shown: int, total: int) -> str:
+    return f"top {shown} of {total}" if total > shown else f"{total}"
+
+
+def behavior_rows_html(rows: list[dict[str, str]]) -> str:
+    rows = sorted(rows, key=lambda a: -abs(as_float(a.get("last_z"))))[:BEHAVIOR_ROWS]
+    if not rows:
+        return ('<tr class="empty"><td colspan="5">No behaviour shifts yet — '
+                'a player needs a 10-step baseline before shifts are judged.</td></tr>')
+    out = []
+    for a in rows:
+        pid = E(str(a.get("player_id", "?")))
+        out.append(
+            f'<tr>'
+            f'<td><a class="mono" href="/players/{pid}">{pid}</a></td>'
+            f'<td class="num">{E(str(a.get("last_batch_mean", "—")))}</td>'
+            f'<td class="num">{E(str(a.get("baseline_mean", "—")))}'
+            f' <span class="hint">n={E(str(a.get("baseline_n", "0")))}</span></td>'
+            f'<td class="num warn">{E(str(a.get("last_z", "—")))}</td>'
+            f'<td class="num">{E(str(a.get("anomalies", "0")))}</td>'
+            f'</tr>')
+    return "".join(out)
+
+
+def smurf_rows_html(rows: list[dict[str, str]]) -> str:
+    rows = rows[:BEHAVIOR_ROWS]  # read_smurfs() is most-likely first
+    if not rows:
+        return '<tr class="empty"><td colspan="5">No smurfs flagged yet (needs scored combat).</td></tr>'
+    out = []
+    for s in rows:
+        pid = E(str(s.get("player_id", "?")))
+        prob = as_float(s.get("probability"))
+        out.append(
+            f'<tr>'
+            f'<td><a class="mono" href="/players/{pid}">{pid}</a></td>'
+            f'<td class="bar-cell"><div class="bar"><div class="bar-fill warn" '
+            f'style="width:{max(2, min(100, prob * 100)):.0f}%"></div></div>'
+            f'<span class="bar-num warn">{prob:.2f}</span></td>'
+            f'<td class="num">{E(str(s.get("account_age_days", "—")))}d</td>'
+            f'<td class="num">{E(str(s.get("games_played", "—")))}</td>'
+            f'<td class="mono">{E(str(s.get("archetype", "—")))}</td>'
             f'</tr>')
     return "".join(out)
 
@@ -398,7 +476,7 @@ async def view_overview(request: Request):
     return _page(request, "overview.html", "overview", sse="/sse/overview",
                  kpis=kpis_html(await _kpi_dict()),
                  alerts=alerts_html(6),
-                 flagged=flagged_html(await state.read_flagged_players(), 6),
+                 flagged=flagged_html(await state.read_flagged_players()),
                  event_rows=initial_event_rows_html(),
                  initial_timeline=state.throughput_timeline())
 
@@ -452,9 +530,13 @@ async def view_player_detail(request: Request, player_id: str):
 
 @router.get("/behavior")
 async def view_behavior(request: Request):
-    return _page(request, "behavior.html", "behavior",
-                 anomalies=await state.read_behavior_anomalies(),
-                 smurfs=await state.read_smurfs())
+    anomalies = await state.read_behavior_anomalies()
+    smurfs = await state.read_smurfs()
+    return _page(request, "behavior.html", "behavior", sse="/sse/behavior",
+                 behavior_rows=behavior_rows_html(anomalies),
+                 smurf_rows=smurf_rows_html(smurfs),
+                 behavior_count=_top_note(min(len(anomalies), BEHAVIOR_ROWS), len(anomalies)),
+                 smurf_count=_top_note(min(len(smurfs), BEHAVIOR_ROWS), len(smurfs)))
 
 
 @router.get("/tournament")
@@ -554,7 +636,7 @@ async def _pub_overview(bus: state.Broadcaster):
                 bus.publish("alerts", _patch(alerts_html(6), "#recent-alerts"))
                 try:
                     kpis = kpis_html(await _kpi_dict())
-                    flagged = flagged_html(await state.read_flagged_players(), 6)
+                    flagged = flagged_html(await state.read_flagged_players())
                 except state.UNAVAILABLE_ERRORS as e:
                     streak.fail(e)
                     continue
@@ -598,6 +680,19 @@ async def _pub_tournament(bus: state.Broadcaster):
         await asyncio.sleep(POLL["tournament"])
 
 
+async def _pub_behavior(bus: state.Broadcaster):
+    while True:
+        anomalies = await state.read_behavior_anomalies()
+        smurfs = await state.read_smurfs()
+        bus.publish("rows", _patch(behavior_rows_html(anomalies), "#behavior-rows"))
+        bus.publish("smurfs", _patch(smurf_rows_html(smurfs), "#smurf-rows"))
+        counts = (f'<span id="behavior-counts" class="hint">'
+                  f'{_top_note(min(len(anomalies), BEHAVIOR_ROWS), len(anomalies))} shifts · '
+                  f'{_top_note(min(len(smurfs), BEHAVIOR_ROWS), len(smurfs))} smurfs</span>')
+        bus.publish("counts", _patch(counts, "#behavior-counts"))
+        await asyncio.sleep(POLL["behavior"])
+
+
 async def _pub_alerts(bus: state.Broadcaster):
     """Re-render the live alert list whenever the engine publishes (via the
     process-wide alert listener), plus a keepalive re-patch when idle."""
@@ -621,6 +716,7 @@ BUSES = {name: state.Broadcaster(name, pub) for name, pub in (
     ("anticheat", _pub_anticheat),
     ("matches", _pub_matches),
     ("tournament", _pub_tournament),
+    ("behavior", _pub_behavior),
     ("alerts", _pub_alerts),
 )}
 

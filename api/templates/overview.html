@@ -7,9 +7,9 @@
 <div class="grid-bento">
   <section class="panel">
     <div class="panel-header">
-      <h2>// INGESTION VELOCITY <span class="hint">Kafka Log Offsets · 5s rate · sliding 120s window</span></h2>
+      <h2>Throughput <span class="hint">events per second across all topics · 5 s samples</span></h2>
       <div class="chart-header-actions">
-        <span class="badge-rate" id="chart-eps-badge">Live Rate</span>
+        <span class="badge-rate" id="chart-eps-badge">—</span>
       </div>
     </div>
     <div class="chart-container">
@@ -19,7 +19,7 @@
 
   <section class="panel">
     <div class="panel-header">
-      <h2>// ACTIVE INCIDENTS <span class="hint">Go Alert Engine · real-time</span></h2>
+      <h2>Incidents</h2>
       <a href="/alerts" class="hint">All alerts →</a>
     </div>
     <ul class="alerts" id="recent-alerts">{{ alerts|safe }}</ul>
@@ -29,8 +29,7 @@
 <div class="grid-bento">
   <section class="panel">
     <div class="panel-header">
-      <h2>// TELEMETRY STREAM <span class="hint">Gameplay · Player Events · Server Metrics</span></h2>
-      <span class="hint">Streaming live</span>
+      <h2>Live events <span class="hint">sampled from gameplay, player and server topics</span></h2>
     </div>
     <div class="table-wrap max-h-420">
       <table>
@@ -46,8 +45,8 @@
 
   <section class="panel">
     <div class="panel-header">
-      <h2>// FLAGGED ENTITIES <span class="hint">Isolation Forest + Anomaly Scoring</span></h2>
-      <a href="/anticheat" class="hint">Anti-Cheat →</a>
+      <h2>Flagged players <span class="hint">suspicion</span></h2>
+      <a href="/anticheat" class="hint">Anti-cheat →</a>
     </div>
     <ul class="flagged" id="flagged-mini">{{ flagged|safe }}</ul>
   </section>
@@ -115,6 +114,7 @@
     options: {
       responsive: true,
       maintainAspectRatio: false,
+      layout: { padding: { left: 4, right: 4 } },
       animation: { duration: 250 },
       interaction: { intersect: false, mode: 'index' },
       plugins: {
@@ -147,6 +147,8 @@
         },
         y: {
           beginAtZero: true,
+          // Reserve room for the widest label ("20.0k") so ticks never clip.
+          afterFit: (scale) => { scale.width = Math.max(scale.width, 44); },
           grid: { color: c.grid, drawBorder: false },
           ticks: {
             color: c.tick,
@@ -176,6 +178,9 @@
   }
 
   window.addEventListener('theme-changed', applyChartTheme);
+  // Axis widths are measured with the font available at creation; re-measure
+  // once Geist Mono has loaded or the tick labels clip at the canvas edges.
+  document.fonts.ready.then(() => throughputChart.update());
 
   function pushThroughputPoint(eps, timeStr) {
     if (eps === undefined || eps === null || isNaN(eps)) return;
