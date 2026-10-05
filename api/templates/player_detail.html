@@ -8,10 +8,10 @@
     <h2 class="mono">// PLAYER DOSSIER · {{ player_id }}</h2>
   </div>
   <div class="flag-row">
-    {% if flags.cheat %}<span class="chip bad">CHEAT FLAGGED</span>{% endif %}
-    {% if flags.smurf %}<span class="chip warn">SMURF</span>{% endif %}
-    {% if flags.behavior %}<span class="chip warn">BEHAVIOR SHIFT</span>{% endif %}
-    {% if not flags.cheat and not flags.smurf and not flags.behavior %}<span class="chip ok">CLEAN</span>{% endif %}
+    {% if flags.cheat_flagged %}<span class="chip bad">CHEAT FLAGGED</span>{% endif %}
+    {% if flags.smurf_flagged %}<span class="chip warn">SMURF</span>{% endif %}
+    {% if flags.behavior_anomaly %}<span class="chip warn">BEHAVIOR SHIFT</span>{% endif %}
+    {% if not flags.cheat_flagged and not flags.smurf_flagged and not flags.behavior_anomaly %}<span class="chip ok">CLEAN</span>{% endif %}
   </div>
 
   <h3>// SUSPICION EVALUATION</h3>
