@@ -1,868 +1,170 @@
+// Command simulator generates realistic competitive-shooter telemetry and
+// publishes it to Kafka: SHOT events (gameplay_events), player lifecycle
+// events (player_events) and per-server health samples (server_metrics).
 package main
 
 import (
 	"context"
-	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
-	"hash/fnv"
 	"io"
-	"math/rand"
+	"math/rand/v2"
 	"os"
 	"os/signal"
-	"path/filepath"
-	"strconv"
 	"strings"
-	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
-
-	"github.com/google/uuid"
-	"github.com/segmentio/kafka-go"
-	"golang.org/x/time/rate"
-	"gopkg.in/yaml.v3"
 )
 
-// Config holds command line simulation parameters.
-type Config struct {
-	Players            int
-	MatchesConcurrent  int
-	EventsPerSec       int
-	BehaviorShiftRatio float64
-	CheaterRatio       float64
-	SmurfRatio         float64
-	ToxicRatio         float64
-	ServerCount        int
-	KafkaBrokers       string
-	Duration           time.Duration
-	LateEventRatio     float64
-	ProfilesDir        string
-	DryRun             bool
-}
-
-// PlayerProfile represents statistical parameters for a player archetype.
-type ProfileDistribution struct {
-	Mean float64 `yaml:"mean"`
-	Std  float64 `yaml:"std"`
-}
-
-type PlayerProfile struct {
-	Name           string              `yaml:"name"`
-	SkillTier      string              `yaml:"skill_tier"`
-	AccountAgeDays int                 `yaml:"account_age_days"`
-	GamesPlayed    int                 `yaml:"games_played"`
-	Accuracy       ProfileDistribution `yaml:"accuracy"`
-	HeadshotRatio  ProfileDistribution `yaml:"headshot_ratio"`
-	ReactionTimeMs ProfileDistribution `yaml:"reaction_time_ms"`
-	KillsPerMin    ProfileDistribution `yaml:"kills_per_minute"`
-	DeathsPerMin   ProfileDistribution `yaml:"deaths_per_minute"`
-}
-
-type Player struct {
-	ID        string
-	Name      string
-	Archetype string
-	Profile   PlayerProfile
-	TeamID    string
-	MatchID   string
-	ServerID  string
-}
-
-type Match struct {
-	ID       string
-	ServerID string
-	TeamA    []*Player
-	TeamB    []*Player
-}
-
-// Event structures matching the PySpark schemas
-type GameplayEvent struct {
-	EventID        string   `json:"event_id"`
-	EventType      string   `json:"event_type"`
-	MatchID        string   `json:"match_id"`
-	PlayerID       string   `json:"player_id"`
-	TeamID         string   `json:"team_id"`
-	TargetPlayerID *string  `json:"target_player_id,omitempty"`
-	WeaponID       *string  `json:"weapon_id,omitempty"`
-	Damage         *float32 `json:"damage,omitempty"`
-	PositionX      float32  `json:"position_x"`
-	PositionY      float32  `json:"position_y"`
-	PositionZ      float32  `json:"position_z"`
-	Accuracy       *float32 `json:"accuracy,omitempty"`
-	Distance       *float32 `json:"distance,omitempty"`
-	ReactionTimeMs *int     `json:"reaction_time_ms,omitempty"`
-	IsHeadshot     bool     `json:"is_headshot"`
-	EventTime      int64    `json:"event_time"`
-	ServerID       string   `json:"server_id"`
-}
-
-type ServerMetric struct {
-	ServerID          string  `json:"server_id"`
-	Region            string  `json:"region"`
-	CPUPercent        float32 `json:"cpu_percent"`
-	RAMPercent        float32 `json:"ram_percent"`
-	TickRate          int     `json:"tick_rate"`
-	PacketLossPercent float32 `json:"packet_loss_percent"`
-	AvgLatencyMs      float32 `json:"avg_latency_ms"`
-	ActivePlayers     int     `json:"active_players"`
-	ActiveMatches     int     `json:"active_matches"`
-	Timestamp         int64   `json:"timestamp"`
-}
-
-type PlayerEvent struct {
-	EventID   string            `json:"event_id"`
-	PlayerID  string            `json:"player_id"`
-	EventType string            `json:"event_type"`
-	MatchID   *string           `json:"match_id,omitempty"`
-	Metadata  map[string]string `json:"metadata,omitempty"`
-	EventTime int64             `json:"event_time"`
-	ServerID  *string           `json:"server_id,omitempty"`
-}
-
-// Phase 3 behavior-shift injection: a share of players suddenly plays much
-// better at the run midpoint, giving behavior_change's CUSUM a real signal.
-var (
-	behaviorShifted map[string]bool
-	behaviorShiftAt time.Time
+// Exit codes.
+const (
+	exitOK      = 0
+	exitFailure = 1 // Kafka unreachable, or messages failed to deliver
+	exitUsage   = 2 // invalid flags or profiles
 )
 
-func selectShiftedPlayers(pool []*Player, ratio float64) map[string]bool {
-	shifted := make(map[string]bool)
-	if ratio <= 0 {
-		return shifted
-	}
-	for _, p := range pool {
-		if rand.Float64() < ratio {
-			shifted[p.ID] = true
-		}
-	}
-	return shifted
-}
-
-func applyBehaviorShift(playerID string, acc float32) float32 {
-	if behaviorShiftAt.IsZero() || time.Now().Before(behaviorShiftAt) {
-		return acc
-	}
-	if behaviorShifted[playerID] {
-		acc *= 1.7
-		if acc > 0.95 {
-			acc = 0.95
-		}
-	}
-	return acc
-}
-
-func sampleNormal(dist ProfileDistribution, minVal, maxVal float64) float64 {
-	val := rand.NormFloat64()*dist.Std + dist.Mean
-	if val < minVal {
-		val = minVal
-	}
-	if val > maxVal {
-		val = maxVal
-	}
-	return val
-}
-
-// chooseArchetype maps sampling rolls to a profile key.
-// roll picks the archetype class (cheater / smurf / toxic / normal);
-// rankRoll disambiguates within a class (aimbot vs wallhack, rank tier).
-// archetypeSeeds derives deterministic random draws from a player ID so the
-// same account keeps the same archetype across runs. Identity stability matters:
-// the CUSUM behavior baseline and the smurf ground truth both persist in Redis
-// between runs, and a re-rolled archetype would look like a behavior shift.
-func archetypeSeeds(playerID string) (float64, float64) {
-	h1 := fnv.New64a()
-	io.WriteString(h1, playerID+"#archetype")
-	h2 := fnv.New64a()
-	io.WriteString(h2, playerID+"#rank")
-	return float64(h1.Sum64()%1_000_000_000) / 1e9,
-		float64(h2.Sum64()%1_000_000_000) / 1e9
-}
-
-func chooseArchetype(roll, rankRoll, cheaterRatio, smurfRatio, toxicRatio float64) string {
-	switch {
-	case roll < cheaterRatio:
-		if rankRoll < 0.7 {
-			return "cheater_aimbot"
-		}
-		return "cheater_wallhack"
-	case roll < cheaterRatio+smurfRatio:
-		return "smurf"
-	case roll < cheaterRatio+smurfRatio+toxicRatio:
-		return "toxic"
-	default:
-		switch {
-		case rankRoll < 0.4:
-			return "normal_bronze"
-		case rankRoll < 0.8:
-			return "normal_gold"
-		default:
-			return "normal_diamond"
-		}
-	}
-}
-
-// validatePoolSize rejects configurations that would corrupt event semantics.
-// Players are assigned to matches in place (player.MatchID / player.TeamID are
-// overwritten per match), so a pool smaller than matches*10 would put the same
-// player in two matches simultaneously and corrupt team attribution.
-func validatePoolSize(players, matchesConcurrent int) error {
-	if matchesConcurrent > 0 && players < matchesConcurrent*10 {
-		return fmt.Errorf("--players (%d) must be at least --matches-concurrent*10 (%d); "+
-			"the player pool is assigned to matches in place",
-			players, matchesConcurrent*10)
-	}
-	return nil
-}
-
-func loadProfiles(dir string) (map[string]PlayerProfile, error) {
-	profiles := make(map[string]PlayerProfile)
-	files, err := os.ReadDir(dir)
-	if err != nil {
-		return nil, err
-	}
-
-	for _, f := range files {
-		if strings.HasSuffix(f.Name(), ".yaml") || strings.HasSuffix(f.Name(), ".yml") {
-			data, err := os.ReadFile(filepath.Join(dir, f.Name()))
-			if err != nil {
-				continue
-			}
-			var p PlayerProfile
-			if err := yaml.Unmarshal(data, &p); err == nil {
-				// Established-account defaults when a profile omits the fields,
-				// so only profiles that explicitly declare fresh accounts
-				// (e.g. smurf: 3 days / 12 games) can trigger smurf detection.
-				if p.AccountAgeDays <= 0 {
-					p.AccountAgeDays = 400
-				}
-				if p.GamesPlayed <= 0 {
-					p.GamesPlayed = 800
-				}
-				key := strings.TrimSuffix(f.Name(), filepath.Ext(f.Name()))
-				profiles[key] = p
-			}
-		}
-	}
-	return profiles, nil
-}
-
-// weaponCatalog is the purchasable weapon pool with in-game costs; used by
-// ITEM_PURCHASE events for economy analytics (weapon popularity / buy patterns).
-var weaponCatalog = []struct {
-	ID   string
-	Cost int
-}{
-	{"ak47", 2700}, {"m4a4", 3100}, {"awp", 4750}, {"usp", 200}, {"deagle", 700},
-}
-
-// initialPlayerEvents emits the session lifecycle events produced once per
-// simulation start: logins, queue entries, and match joins. LOGIN metadata
-// carries the archetype label as ground truth for later ML jobs.
-func initialPlayerEvents(players []*Player, matches []*Match, start time.Time) []PlayerEvent {
-	var events []PlayerEvent
-	base := start.UnixMilli()
-
-	for _, p := range players {
-		var serverID *string
-		if p.ServerID != "" {
-			serverID = &p.ServerID
-		}
-		events = append(events,
-			PlayerEvent{
-				EventID:   uuid.New().String(),
-				PlayerID:  p.ID,
-				EventType: "LOGIN",
-				Metadata: map[string]string{
-					"archetype":        p.Archetype,
-					"account_age_days": strconv.Itoa(p.Profile.AccountAgeDays),
-					"games_played":     strconv.Itoa(p.Profile.GamesPlayed),
-					"rank":             p.Profile.SkillTier,
-				},
-				EventTime: base,
-				ServerID:  serverID,
-			},
-			PlayerEvent{
-				EventID:   uuid.New().String(),
-				PlayerID:  p.ID,
-				EventType: "MATCHMAKING_START",
-				EventTime: base + 100,
-				ServerID:  serverID,
-			},
-			PlayerEvent{
-				EventID:   uuid.New().String(),
-				PlayerID:  p.ID,
-				EventType: "MATCHMAKING_FOUND",
-				EventTime: base + 250,
-				ServerID:  serverID,
-			},
-		)
-	}
-
-	for _, m := range matches {
-		join := func(p *Player) {
-			var serverID *string
-			if m.ServerID != "" {
-				serverID = &m.ServerID
-			}
-			events = append(events, PlayerEvent{
-				EventID:   uuid.New().String(),
-				PlayerID:  p.ID,
-				EventType: "MATCH_JOIN",
-				MatchID:   &m.ID,
-				Metadata:  map[string]string{"team_id": p.TeamID, "skill_tier": p.Profile.SkillTier},
-				EventTime: base + 400,
-				ServerID:  serverID,
-			})
-			w := weaponCatalog[rand.Intn(len(weaponCatalog))]
-			events = append(events, PlayerEvent{
-				EventID:   uuid.New().String(),
-				PlayerID:  p.ID,
-				EventType: "ITEM_PURCHASE",
-				MatchID:   &m.ID,
-				Metadata:  map[string]string{"weapon_id": w.ID, "cost": strconv.Itoa(w.Cost)},
-				EventTime: base + 500,
-				ServerID:  serverID,
-			})
-		}
-		for _, p := range m.TeamA {
-			join(p)
-		}
-		for _, p := range m.TeamB {
-			join(p)
-		}
-	}
-	return events
-}
+// pcgStream is the fixed second PCG word; the seed varies the first.
+const pcgStream = 0x9e3779b97f4a7c15
 
 func main() {
-	cfg := Config{}
+	os.Exit(run(os.Args[1:], os.Stdout, os.Stderr))
+}
 
-	flag.IntVar(&cfg.Players, "players", 500, "Total simulated player pool size")
-	flag.IntVar(&cfg.MatchesConcurrent, "matches-concurrent", 20, "Number of concurrent matches to simulate")
-	flag.IntVar(&cfg.EventsPerSec, "events-per-sec", 1000, "Target events published to Kafka per second")
-	flag.Float64Var(&cfg.CheaterRatio, "cheater-ratio", 0.05, "Proportion of active players exhibiting cheater characteristics")
-	flag.Float64Var(&cfg.SmurfRatio, "smurf-ratio", 0.05, "Proportion of active players exhibiting smurf characteristics")
-	flag.Float64Var(&cfg.ToxicRatio, "toxic-ratio", 0.05, "Proportion of active players exhibiting toxic traits")
-	flag.Float64Var(&cfg.BehaviorShiftRatio, "behavior-shift", 0.05, "Fraction of players whose accuracy jumps at the run midpoint (0 disables; feeds CUSUM detection)")
-	flag.IntVar(&cfg.ServerCount, "server-count", 10, "Total number of virtual game server instances")
-	// Use localhost:9094 as default for external host access
-	flag.StringVar(&cfg.KafkaBrokers, "kafka-brokers", "localhost:9094", "Comma-separated list of Kafka broker addresses")
-	flag.DurationVar(&cfg.Duration, "duration", 5*time.Minute, "Total simulation run duration (e.g. 5m, 1h)")
-	flag.Float64Var(&cfg.LateEventRatio, "late-event-ratio", 0.05, "Proportion of events emitted with simulated network delay")
-	flag.StringVar(&cfg.ProfilesDir, "profiles-dir", "./profiles", "Directory containing YAML player archetype profiles")
-	flag.BoolVar(&cfg.DryRun, "dry-run", false, "Simulate without sending to Kafka (prints stats to console)")
-
-	flag.Parse()
-
-	if err := validatePoolSize(cfg.Players, cfg.MatchesConcurrent); err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err)
-		os.Exit(1)
+func run(args []string, stdout, stderr io.Writer) int {
+	cfg, err := parseConfig(args, stderr)
+	if errors.Is(err, flag.ErrHelp) {
+		return exitOK
+	}
+	if err != nil {
+		fmt.Fprintf(stderr, "simulator: invalid configuration:\n%s\n", indent(err))
+		return exitUsage
+	}
+	profiles, err := loadProfiles(cfg.ProfilesDir)
+	if err != nil {
+		fmt.Fprintf(stderr, "simulator: invalid profiles:\n%s\n", indent(err))
+		return exitUsage
 	}
 
-	fmt.Println("=================================================================")
-	fmt.Println("🎮 Gaming Intelligence Platform - Real-Time Event Simulator")
-	fmt.Println("=================================================================")
-	fmt.Printf("• Player Pool Size       : %d\n", cfg.Players)
-	fmt.Printf("• Concurrent Matches     : %d\n", cfg.MatchesConcurrent)
-	fmt.Printf("• Target Throughput      : %d events/sec\n", cfg.EventsPerSec)
-	fmt.Printf("• Cheater Ratio          : %.2f%%\n", cfg.CheaterRatio*100)
-	fmt.Printf("• Smurf Ratio            : %.2f%%\n", cfg.SmurfRatio*100)
-	fmt.Printf("• Server Count           : %d\n", cfg.ServerCount)
-	fmt.Printf("• Kafka Brokers          : %s\n", cfg.KafkaBrokers)
-	fmt.Printf("• Duration               : %v\n", cfg.Duration)
-	fmt.Printf("• Dry Run Mode           : %v\n", cfg.DryRun)
-	fmt.Println("=================================================================")
-
-	profilesDir := cfg.ProfilesDir
-	if _, err := os.Stat(profilesDir); os.IsNotExist(err) {
-		if _, err2 := os.Stat("simulator/profiles"); err2 == nil {
-			profilesDir = "simulator/profiles"
-		}
+	seed := cfg.Seed
+	if seed == 0 {
+		seed = rand.Uint64()
 	}
 
-	profiles, err := loadProfiles(profilesDir)
-	if err != nil || len(profiles) == 0 {
-		fmt.Printf("[WARN] Failed to load profiles from %s: %v. Using built-in fallbacks.\n", profilesDir, err)
-		profiles = map[string]PlayerProfile{
-			"normal_gold": {
-				Name:           "Normal Gold Player",
-				SkillTier:      "gold",
-				Accuracy:       ProfileDistribution{Mean: 0.28, Std: 0.08},
-				HeadshotRatio:  ProfileDistribution{Mean: 0.15, Std: 0.05},
-				ReactionTimeMs: ProfileDistribution{Mean: 260, Std: 50},
-			},
-			"cheater_aimbot": {
-				Name:           "Aimbot Cheater",
-				SkillTier:      "silver",
-				Accuracy:       ProfileDistribution{Mean: 0.93, Std: 0.03},
-				HeadshotRatio:  ProfileDistribution{Mean: 0.88, Std: 0.05},
-				ReactionTimeMs: ProfileDistribution{Mean: 85, Std: 10},
-			},
-		}
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	var sink Sink
+	if cfg.DryRun {
+		sink = newDryRunSink()
 	} else {
-		fmt.Printf("Loaded %d player profiles from %s.\n", len(profiles), profilesDir)
-	}
-
-	brokers := strings.Split(cfg.KafkaBrokers, ",")
-	var gameplayWriter, playerWriter, serverWriter *kafka.Writer
-	var kafkaWriteErrors atomic.Uint64
-	writersDone := make(chan struct{})
-
-	// Async writers swallow delivery failures (WriteMessages returns nil
-	// once queued), but synchronous writes serialize the publisher behind
-	// every 20ms batch flush (~50 msg/s). So: run async for throughput, a
-	// monitor polls each writer's error counter so broker failures still
-	// surface mid-run, and recordWriteError catches the errors kafka-go
-	// does return synchronously (e.g. partition metadata lookup).
-	recordWriteError := func(topic string, err error) {
-		if err == nil {
-			return
-		}
-		if n := kafkaWriteErrors.Add(1); n <= 5 {
-			fmt.Fprintf(os.Stderr, "[KAFKA] %s write failed: %v\n", topic, err)
-		}
-	}
-
-	if !cfg.DryRun {
-		createWriter := func(topic string) *kafka.Writer {
-			w := &kafka.Writer{
-				Addr:         kafka.TCP(brokers...),
-				Topic:        topic,
-				Balancer:     &kafka.LeastBytes{},
-				BatchSize:    200,
-				BatchTimeout: 20 * time.Millisecond,
-				Async:        true,
-			}
-			go func() {
-				ticker := time.NewTicker(time.Second)
-				defer ticker.Stop()
-				var last int64
-				for {
-					select {
-					case <-writersDone:
-						return
-					case <-ticker.C:
-						if n := w.Stats().Errors; n > last {
-							fmt.Fprintf(os.Stderr, "[KAFKA] %s: %d async write failure(s)\n", topic, n-last)
-							last = n
-						}
-					}
-				}
-			}()
-			return w
-		}
-		gameplayWriter = createWriter("gameplay_events")
-		playerWriter = createWriter("player_events")
-		serverWriter = createWriter("server_metrics")
-	}
-
-	// Build servers
-	regions := []string{"us-east", "eu-west", "ap-south"}
-	servers := make([]string, cfg.ServerCount)
-	for i := 0; i < cfg.ServerCount; i++ {
-		servers[i] = fmt.Sprintf("server-%02d", i+1)
-	}
-
-	// Build players
-	players := make([]*Player, cfg.Players)
-	for i := 0; i < cfg.Players; i++ {
-		id := fmt.Sprintf("player_%04d", i+1)
-		roll, rankRoll := archetypeSeeds(id)
-		archetype := chooseArchetype(roll, rankRoll, cfg.CheaterRatio, cfg.SmurfRatio, cfg.ToxicRatio)
-
-		pProf, ok := profiles[archetype]
-		if !ok {
-			pProf = profiles["normal_gold"]
-		}
-
-		players[i] = &Player{
-			ID:        id,
-			Name:      fmt.Sprintf("Player_%d", i+1),
-			Archetype: archetype,
-			Profile:   pProf,
-		}
-	}
-
-	// Phase 3: choose behavior-shift victims and arm the midpoint trigger
-	behaviorShifted = selectShiftedPlayers(players, cfg.BehaviorShiftRatio)
-	behaviorShiftAt = time.Time{}
-	if len(behaviorShifted) > 0 {
-		behaviorShiftAt = time.Now().Add(cfg.Duration / 2)
-		fmt.Printf("Behavior shift: %d/%d players get +70%% accuracy after %s (CUSUM target)\n",
-			len(behaviorShifted), len(players), (cfg.Duration / 2).String())
-	}
-
-	// Build matches
-	matches := make([]*Match, cfg.MatchesConcurrent)
-	playersPerMatch := 10
-	for m := 0; m < cfg.MatchesConcurrent; m++ {
-		matchID := fmt.Sprintf("match_%04d", m+1)
-		srvID := servers[m%len(servers)]
-		match := &Match{
-			ID:       matchID,
-			ServerID: srvID,
-		}
-		startIdx := (m * playersPerMatch) % len(players)
-		for p := 0; p < playersPerMatch; p++ {
-			player := players[(startIdx+p)%len(players)]
-			player.MatchID = matchID
-			player.ServerID = srvID
-			if p < playersPerMatch/2 {
-				player.TeamID = "team_a"
-				match.TeamA = append(match.TeamA, player)
-			} else {
-				player.TeamID = "team_b"
-				match.TeamB = append(match.TeamB, player)
-			}
-		}
-		matches[m] = match
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), cfg.Duration)
-	defer cancel()
-
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	go func() {
-		<-sigChan
-		fmt.Println("\nReceived termination signal. Shutting down simulator...")
-		cancel()
-	}()
-
-	var totalGameplayEvents atomic.Uint64
-	var totalServerEvents atomic.Uint64
-	var totalPlayerEvents atomic.Uint64
-
-	// Emit the player session lifecycle burst (login -> queue -> join).
-	for _, ev := range initialPlayerEvents(players, matches, time.Now()) {
-		if !cfg.DryRun && playerWriter != nil {
-			payload, err := json.Marshal(ev)
-			if err != nil {
-				continue
-			}
-			recordWriteError("player_events", playerWriter.WriteMessages(ctx, kafka.Message{
-				Key:   []byte(ev.PlayerID),
-				Value: payload,
-			}))
-		}
-		totalPlayerEvents.Add(1)
-	}
-
-	limiter := rate.NewLimiter(rate.Limit(cfg.EventsPerSec), cfg.EventsPerSec*2)
-	weapons := []string{"ak47", "m4a4", "awp", "usp", "deagle"}
-
-	// publishGameplay rate-limits at the event level: --events-per-sec is
-	// the number of messages actually written to Kafka, not shot attempts
-	// (one attempt can emit SHOT_FIRED + DAMAGE + KILL).
-	publishGameplay := func(ev GameplayEvent) {
-		if err := limiter.Wait(ctx); err != nil {
-			return
-		}
-		payload, err := json.Marshal(ev)
+		ks, err := newKafkaSink(ctx, cfg.KafkaBrokers, stderr)
 		if err != nil {
-			return
+			fmt.Fprintf(stderr, "simulator: %v\n", err)
+			return exitFailure
 		}
-		if !cfg.DryRun && gameplayWriter != nil {
-			recordWriteError("gameplay_events", gameplayWriter.WriteMessages(ctx, kafka.Message{
-				Key:   []byte(ev.PlayerID),
-				Value: payload,
-			}))
-		}
-		totalGameplayEvents.Add(1)
+		sink = ks
 	}
 
-	var wg sync.WaitGroup
+	start := time.Now()
+	engine := newEngine(cfg, profiles, rand.New(rand.NewPCG(seed, pcgStream)), sink, stdout, stderr, start)
+	printBanner(stdout, cfg, seed, engine.world)
 
-	// ─── 1. Server Metrics Routine (Emitted every 1s per server) ───
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		ticker := time.NewTicker(1 * time.Second)
-		defer ticker.Stop()
+	runCtx, cancel := context.WithTimeout(ctx, cfg.Duration)
+	defer cancel()
+	// Once the run ends (timeout or first Ctrl+C), restore default signal
+	// handling so a second Ctrl+C exits at once even if the flush stalls.
+	context.AfterFunc(runCtx, stop)
 
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case now := <-ticker.C:
-				for idx, srv := range servers {
-					region := regions[idx%len(regions)]
-					// Introduce simulated degradation on server-02 for demonstration
-					var cpu, ram, loss, latency float32
-					tickRate := 128
-					if srv == "server-02" {
-						cpu = float32(85.0 + rand.Float64()*12.0)
-						ram = float32(88.0 + rand.Float64()*10.0)
-						loss = float32(6.0 + rand.Float64()*8.0)
-						latency = float32(95.0 + rand.Float64()*40.0)
-					} else {
-						cpu = float32(20.0 + rand.Float64()*35.0)
-						ram = float32(35.0 + rand.Float64()*25.0)
-						loss = float32(rand.Float64() * 0.8)
-						latency = float32(15.0 + rand.Float64()*25.0)
-					}
+	engine.Run(runCtx)
+	ran := time.Since(start) // the run itself, excluding the final flush
+	interrupted := !errors.Is(runCtx.Err(), context.DeadlineExceeded)
 
-					metric := ServerMetric{
-						ServerID:          srv,
-						Region:            region,
-						CPUPercent:        cpu,
-						RAMPercent:        ram,
-						TickRate:          tickRate,
-						PacketLossPercent: loss,
-						AvgLatencyMs:      latency,
-						ActivePlayers:     len(players) / len(servers),
-						ActiveMatches:     cfg.MatchesConcurrent / len(servers),
-						Timestamp:         now.UnixMilli(),
-					}
+	closeErr := sink.Close()
+	stats := sink.Stats()
+	printSummary(stdout, engine.stats, stats, ran, interrupted)
 
-					payload, _ := json.Marshal(metric)
-					if !cfg.DryRun && serverWriter != nil {
-						recordWriteError("server_metrics", serverWriter.WriteMessages(ctx, kafka.Message{
-							Key:   []byte(srv),
-							Value: payload,
-						}))
-					}
-					totalServerEvents.Add(1)
-				}
-			}
+	if closeErr != nil {
+		fmt.Fprintf(stderr, "simulator: flushing Kafka writers: %v\n", closeErr)
+	}
+	total := totalStats(stats)
+	if closeErr != nil || total.Failed > 0 || total.Unconfirmed() > 0 || engine.stats.EncodeErrors > 0 {
+		return exitFailure
+	}
+	return exitOK
+}
+
+func printBanner(w io.Writer, cfg Config, seed uint64, world *World) {
+	counts := map[Archetype]int{}
+	for _, p := range world.players {
+		counts[p.Archetype]++
+	}
+	var mix []string
+	for _, a := range archetypes {
+		if counts[a] > 0 {
+			mix = append(mix, fmt.Sprintf("%s=%d", a, counts[a]))
 		}
-	}()
-
-	// ─── 2. Gameplay Events Generator (Combat & Actions) ───
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			default:
-				match := matches[rand.Intn(len(matches))]
-				attackerTeam := match.TeamA
-				defenderTeam := match.TeamB
-				if rand.Float64() < 0.5 {
-					attackerTeam = match.TeamB
-					defenderTeam = match.TeamA
-				}
-
-				attacker := attackerTeam[rand.Intn(len(attackerTeam))]
-				defender := defenderTeam[rand.Intn(len(defenderTeam))]
-
-				accuracy := applyBehaviorShift(attacker.ID, float32(sampleNormal(attacker.Profile.Accuracy, 0.05, 1.0)))
-				hsChance := sampleNormal(attacker.Profile.HeadshotRatio, 0.02, 1.0)
-				rxnTime := int(sampleNormal(attacker.Profile.ReactionTimeMs, 50, 600))
-				weapon := weapons[rand.Intn(len(weapons))]
-				dist := float32(10.0 + rand.Float64()*40.0)
-
-				now := time.Now()
-				// Late event injection
-				if rand.Float64() < cfg.LateEventRatio {
-					now = now.Add(-time.Duration(5+rand.Intn(15)) * time.Second)
-				}
-				eventTime := now.UnixMilli()
-
-				// 1. Emit Shot Fired
-				shotEvent := GameplayEvent{
-					EventID:        uuid.New().String(),
-					EventType:      "SHOT_FIRED",
-					MatchID:        match.ID,
-					PlayerID:       attacker.ID,
-					TeamID:         attacker.TeamID,
-					TargetPlayerID: &defender.ID,
-					WeaponID:       &weapon,
-					Accuracy:       &accuracy,
-					Distance:       &dist,
-					ReactionTimeMs: &rxnTime,
-					IsHeadshot:     false,
-					EventTime:      eventTime,
-					ServerID:       match.ServerID,
-				}
-				publishGameplay(shotEvent)
-
-				// 2. Check if hit
-				if rand.Float32() < accuracy {
-					isHeadshot := rand.Float64() < hsChance
-					var dmg float32 = 28.0 + rand.Float32()*35.0
-					if isHeadshot {
-						dmg = 120.0
-					}
-
-					hitEvent := GameplayEvent{
-						EventID:        uuid.New().String(),
-						EventType:      "DAMAGE",
-						MatchID:        match.ID,
-						PlayerID:       attacker.ID,
-						TeamID:         attacker.TeamID,
-						TargetPlayerID: &defender.ID,
-						WeaponID:       &weapon,
-						Damage:         &dmg,
-						Accuracy:       &accuracy,
-						Distance:       &dist,
-						ReactionTimeMs: &rxnTime,
-						IsHeadshot:     isHeadshot,
-						EventTime:      eventTime + int64(rxnTime),
-						ServerID:       match.ServerID,
-					}
-					publishGameplay(hitEvent)
-
-					// 3. Check for kill
-					if dmg >= 100.0 || isHeadshot || rand.Float64() < 0.25 {
-						killEvent := GameplayEvent{
-							EventID:        uuid.New().String(),
-							EventType:      "KILL",
-							MatchID:        match.ID,
-							PlayerID:       attacker.ID,
-							TeamID:         attacker.TeamID,
-							TargetPlayerID: &defender.ID,
-							WeaponID:       &weapon,
-							Damage:         &dmg,
-							Accuracy:       &accuracy,
-							Distance:       &dist,
-							ReactionTimeMs: &rxnTime,
-							IsHeadshot:     isHeadshot,
-							EventTime:      eventTime + int64(rxnTime) + 10,
-							ServerID:       match.ServerID,
-						}
-						publishGameplay(killEvent)
-					}
-				}
-			}
-		}
-	}()
-
-	// ─── 3. Player Activity Events (chat, reports, disconnects) ───
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		ticker := time.NewTicker(1 * time.Second)
-		defer ticker.Stop()
-		disconnected := make(map[string]*Player)
-
-		emit := func(p *Player, eventType string, meta map[string]string) {
-			ev := PlayerEvent{
-				EventID:   uuid.New().String(),
-				PlayerID:  p.ID,
-				EventType: eventType,
-				EventTime: time.Now().UnixMilli(),
-			}
-			if p.MatchID != "" {
-				ev.MatchID = &p.MatchID
-			}
-			if p.ServerID != "" {
-				ev.ServerID = &p.ServerID
-			}
-			if meta != nil {
-				ev.Metadata = meta
-			}
-			if !cfg.DryRun && playerWriter != nil {
-				if payload, err := json.Marshal(ev); err == nil {
-					recordWriteError("player_events", playerWriter.WriteMessages(ctx, kafka.Message{
-						Key:   []byte(p.ID),
-						Value: payload,
-					}))
-				}
-			}
-			totalPlayerEvents.Add(1)
-		}
-
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				// Dropped players attempt a reconnect (30% each tick).
-				for id, p := range disconnected {
-					if rand.Float64() < 0.30 {
-						emit(p, "RECONNECT", nil)
-						delete(disconnected, id)
-					}
-				}
-
-				// Sparse per-player activity sampled each tick.
-				for i := 0; i < 5; i++ {
-					p := players[rand.Intn(len(players))]
-					if _, down := disconnected[p.ID]; down {
-						continue
-					}
-					switch {
-					case p.Archetype == "toxic" && rand.Float64() < 0.30:
-						emit(p, "CHAT_MESSAGE", map[string]string{
-							"chars": fmt.Sprintf("%d", 10+rand.Intn(120)),
-						})
-					case p.Archetype == "toxic" && rand.Float64() < 0.20:
-						target := players[rand.Intn(len(players))]
-						if target.ID != p.ID {
-							emit(p, "REPORT_PLAYER", map[string]string{
-								"reported_player": target.ID,
-								"reason":          []string{"gameplay", "chat", "griefing"}[rand.Intn(3)],
-							})
-						}
-					case rand.Float64() < 0.01:
-						emit(p, "DISCONNECT", map[string]string{
-							"cause": []string{"network", "crash", "quit"}[rand.Intn(3)],
-						})
-						disconnected[p.ID] = p
-					case p.MatchID != "" && rand.Float64() < 0.10:
-						// Re-buy / utility purchase mid-match (economy analytics).
-						w := weaponCatalog[rand.Intn(len(weaponCatalog))]
-						emit(p, "ITEM_PURCHASE", map[string]string{
-							"weapon_id": w.ID,
-							"cost":      strconv.Itoa(w.Cost),
-						})
-					}
-				}
-			}
-		}
-	}()
-
-	// ─── 4. Periodic Progress Reporter ───
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		ticker := time.NewTicker(3 * time.Second)
-		defer ticker.Stop()
-		startTime := time.Now()
-
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				elapsed := time.Since(startTime).Seconds()
-				gpTotal := totalGameplayEvents.Load()
-				svTotal := totalServerEvents.Load()
-				rate := float64(gpTotal+svTotal) / elapsed
-
-				fmt.Printf("[SIMULATOR] Elapsed: %4.1fs | Gameplay Events: %7d | Server Metrics: %5d | Rate: %6.0f events/sec\n",
-					elapsed, gpTotal, svTotal, rate)
-			}
-		}
-	}()
-
-	wg.Wait()
-
-	// Stop monitors, let async batches flush (BatchTimeout is 20ms), tally
-	// the writers' cumulative failure counters, then shut the writers down.
-	totalWriteErrors := kafkaWriteErrors.Load()
-	if !cfg.DryRun {
-		close(writersDone)
-		time.Sleep(300 * time.Millisecond)
-		totalWriteErrors += uint64(gameplayWriter.Stats().Errors)
-		totalWriteErrors += uint64(playerWriter.Stats().Errors)
-		totalWriteErrors += uint64(serverWriter.Stats().Errors)
-		_ = gameplayWriter.Close()
-		_ = playerWriter.Close()
-		_ = serverWriter.Close()
+	}
+	output := "kafka " + strings.Join(cfg.KafkaBrokers, ",")
+	if cfg.DryRun {
+		output = "dry run (nothing is sent)"
+	}
+	degraded := "none"
+	if len(cfg.DegradedServers) > 0 {
+		degraded = strings.Join(cfg.DegradedServers, ",")
 	}
 
-	fmt.Println("\n=================================================================")
-	fmt.Println("Simulation completed successfully.")
-	fmt.Printf("Total Gameplay Events Produced : %d\n", totalGameplayEvents.Load())
-	fmt.Printf("Total Server Metrics Produced  : %d\n", totalServerEvents.Load())
-	fmt.Printf("Total Player Events Produced   : %d\n", totalPlayerEvents.Load())
-	fmt.Printf("Kafka Write Errors             : %d\n", totalWriteErrors)
-	fmt.Println("=================================================================")
+	fmt.Fprintln(w, "Gaming Intelligence simulator")
+	fmt.Fprintf(w, "  players   %d in %d concurrent 5v5 matches (%d queued), %v per match\n",
+		cfg.Players, cfg.MatchesConcurrent, cfg.Players-cfg.MatchesConcurrent*playersPerMatch, cfg.MatchDuration)
+	fmt.Fprintf(w, "  mix       %s\n", strings.Join(mix, " "))
+	fmt.Fprintf(w, "  rate      %d shots/s for %v (late events %.0f%%, behaviour shift %.0f%%)\n",
+		cfg.EventsPerSec, cfg.Duration, cfg.LateEventRatio*100, cfg.BehaviorShiftRatio*100)
+	fmt.Fprintf(w, "  servers   %d (degraded: %s)\n", cfg.ServerCount, degraded)
+	fmt.Fprintf(w, "  output    %s\n", output)
+	fmt.Fprintf(w, "  seed      %d\n", seed)
+}
+
+func printSummary(w io.Writer, s runStats, byTopic map[Topic]TopicStats, elapsed time.Duration, interrupted bool) {
+	state := "complete"
+	if interrupted {
+		state = "interrupted"
+	}
+	fmt.Fprintf(w, "\nRun %s after %v\n", state, elapsed.Truncate(time.Millisecond))
+	fmt.Fprintf(w, "  shots          %d (%.0f/s), hit rate %.1f%%\n",
+		s.Shots, float64(s.Shots)/elapsed.Seconds(), percent(s.Hits, s.Shots))
+	fmt.Fprintf(w, "  kills          %d (headshot %.1f%%, assisted %.1f%%)\n",
+		s.Kills, percent(s.HeadshotKills, s.Kills), percent(s.Assists, s.Kills))
+	fmt.Fprintf(w, "  player events  %d\n", s.PlayerEvents)
+	fmt.Fprintf(w, "  server metrics %d\n", s.ServerMetrics)
+	if s.Idle > 0 || s.Dropped > 0 {
+		fmt.Fprintf(w, "  pacer          %d idle slots, %d dropped (generator fell behind)\n", s.Idle, s.Dropped)
+	}
+	for _, t := range topics {
+		ts := byTopic[t]
+		line := fmt.Sprintf("  %-16s published %d, delivered %d, failed %d", t, ts.Published, ts.Delivered, ts.Failed)
+		if n := ts.Unconfirmed(); n > 0 {
+			line += fmt.Sprintf(", unconfirmed %d", n)
+		}
+		fmt.Fprintln(w, line)
+	}
+	if s.EncodeErrors > 0 {
+		fmt.Fprintf(w, "  encode errors  %d\n", s.EncodeErrors)
+	}
+}
+
+func percent(n, total int) float64 {
+	if total == 0 {
+		return 0
+	}
+	return 100 * float64(n) / float64(total)
+}
+
+// indent renders a (possibly joined) error one problem per line.
+func indent(err error) string {
+	lines := strings.Split(err.Error(), "\n")
+	for i, l := range lines {
+		lines[i] = "  - " + l
+	}
+	return strings.Join(lines, "\n")
 }

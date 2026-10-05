@@ -1,11 +1,10 @@
 module github.com/gaming-intelligence/simulator
 
-go 1.26.0
+go 1.25.0
 
 require (
 	github.com/google/uuid v1.6.0
 	github.com/segmentio/kafka-go v0.4.51
-	golang.org/x/time v0.16.0
 	gopkg.in/yaml.v3 v3.0.1
 )
 
