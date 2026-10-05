@@ -15,7 +15,11 @@ from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 
 from src.common.schemas import GAMEPLAY_EVENT_SCHEMA, SHOT_EVENT
-from src.jobs.cheat_detection import best_window_per_player, build_suspicion_pipeline
+from src.jobs.cheat_detection import (
+    best_window_per_player,
+    build_suspicion_pipeline,
+    cheat_verdict,
+)
 from src.ml.iforest import HS_PRIOR, HS_PRIOR_HITS
 
 # Fixed event time => every synthetic event lands in one window.
@@ -173,3 +177,14 @@ def test_best_window_is_the_one_with_most_shots():
     by_player = {r["player_id"]: r for r in picked}
     assert by_player["a"]["window"]["end"] == 15
     assert by_player["b"]["window"]["end"] == 30
+
+
+def test_forest_flag_on_a_confirmed_smurf_is_not_a_cheat():
+    assert cheat_verdict(0.30, iforest_flag=True, smurf=True) == (False, False)
+    assert cheat_verdict(0.30, iforest_flag=True, smurf=False) == (True, True)
+
+
+def test_smurf_who_trips_the_heuristic_is_still_a_cheat():
+    assert cheat_verdict(0.75, iforest_flag=True, smurf=True) == (True, False)
+    assert cheat_verdict(0.90, iforest_flag=False, smurf=True) == (True, True)
+    assert cheat_verdict(0.50, iforest_flag=False, smurf=False) == (False, False)

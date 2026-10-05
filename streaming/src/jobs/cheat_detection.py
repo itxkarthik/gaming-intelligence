@@ -118,19 +118,38 @@ def best_window_per_player(rows):
     return [row for _, row in best.values()]
 
 
+def cheat_verdict(suspicion_eff, iforest_flag, smurf):
+    """(flagged, critical) for one judged window. Pure, unit-testable.
+
+    The heuristic flags on its own. An IsolationForest-only flag on a
+    confirmed smurf is explained by the smurf verdict (a fresh account
+    playing far above its rank IS a statistical outlier) and is left to
+    the SMURF_DETECTED alert; a smurf who also trips the heuristic is still
+    flagged as a cheat.
+    """
+    heuristic = suspicion_eff >= FLAG_THRESHOLD
+    forest = iforest_flag and not smurf
+    flagged = heuristic or forest
+    critical = flagged and (forest or suspicion_eff >= CRITICAL_THRESHOLD)
+    return flagged, critical
+
+
 def write_player_scores(r, spark, rows):
     """Score each player's best window; update profiles, flags and alerts."""
     rows = best_window_per_player(rows)
     alerts = AlertBatch(r)
     iforest_scores = score_rows(load_model(), rows)
+    evaluate_smurfs(r, alerts, rows)  # first: the cheat verdict reads it
 
     pipe = r.pipeline()
     for row in rows:
         pipe.hget(f"player:behavior:{row['player_id']}", "anomaly")
-    behavior_flags = pipe.execute()
+        pipe.hget(f"player:smurf:{row['player_id']}", "status")
+    reads = pipe.execute()
 
     pipe = r.pipeline()
-    for row, iforest_score, behavior in zip(rows, iforest_scores, behavior_flags):
+    for row, iforest_score, behavior, smurf_status in zip(
+            rows, iforest_scores, reads[::2], reads[1::2]):
         player_id = row["player_id"]
         behavior_anomaly = behavior == "1"
         suspicion = round(float(row["suspicion_score"]), 3)
@@ -141,11 +160,11 @@ def write_player_scores(r, spark, rows):
 
         # Too few shots to judge: refresh the stats, keep the previous verdict.
         if int(row["total_shots"]) >= MIN_SHOTS:
-            flagged = suspicion_eff >= FLAG_THRESHOLD or iforest_flag
+            flagged, critical = cheat_verdict(suspicion_eff, iforest_flag,
+                                              smurf_status == "SMURF")
             profile["flagged"] = "true" if flagged else "false"
             if flagged:
                 pipe.sadd("players:flagged", player_id)
-                critical = iforest_flag or suspicion_eff >= CRITICAL_THRESHOLD
                 alerts.emit(make_alert(
                     "CHEAT_DETECTED", "CRITICAL" if critical else "WARNING", "PLAYER", player_id,
                     f"Cheat anomaly for {player_id} in {row['match_id']}: "
@@ -158,8 +177,6 @@ def write_player_scores(r, spark, rows):
                 pipe.srem("players:flagged", player_id)
         pipe.hset(f"player:{player_id}", mapping=profile)
     pipe.execute()
-
-    evaluate_smurfs(r, alerts, rows)
     alerts.flush(spark)
 
 
