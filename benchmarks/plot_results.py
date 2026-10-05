@@ -3,7 +3,10 @@
 
     uv run --with matplotlib python3 benchmarks/plot_results.py [tiers.jsonl]
 
+With no argument the newest benchmarks/results/<ts>/tiers.jsonl is used.
+
 Left panel : target input vs achieved production vs consumption (throughput)
+             — gameplay_events (SHOT) only, the topic --events-per-sec drives
 Right panel: event-time -> result-time freshness (p50/p95) + end-of-tier lag
 """
 
@@ -14,7 +17,7 @@ from pathlib import Path
 import matplotlib
 
 matplotlib.use("Agg")
-import matplotlib.pyplot as plt  # noqa: E402
+import matplotlib.pyplot as plt
 
 PROJECT = Path(__file__).resolve().parent.parent
 
@@ -29,7 +32,7 @@ def newest_tiers() -> Path:
 def main() -> None:
     src = Path(sys.argv[1]) if len(sys.argv) > 1 else newest_tiers()
     tiers = sorted(
-        (json.loads(line) for line in open(src) if line.strip()),
+        (json.loads(line) for line in src.read_text().splitlines() if line.strip()),
         key=lambda r: r["target_rate"],
     )
     if not tiers:
@@ -37,12 +40,15 @@ def main() -> None:
 
     x = [t["target_rate"] for t in tiers]
     produced = [t["produced_per_s"] for t in tiers]
+    # rate is None for a query that had no committed batch at tier start
     consumed = [
-        max((d["rate"] for d in t["consumed"].values()), default=0) for t in tiers
+        max((d["rate"] for d in t["consumed"].values() if d["rate"] is not None),
+            default=0)
+        for t in tiers
     ]
     # Latency = stream lag in seconds behind (lag_at_end / achieved rate).
     # Per-tier result-freshness was too sparse to plot (result writes cluster
-    # at window close) — reported once over the whole run in docs/benchmarks.md.
+    # at window close); it stays in each tier record's "freshness" field.
     lag_s = [
         t["lag_at_end"] / max(t["produced_per_s"], 1.0) for t in tiers
     ]

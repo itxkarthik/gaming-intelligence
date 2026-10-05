@@ -3,13 +3,24 @@
 
 Subcommands (called by benchmarks/run_benchmark.sh):
 
-    snapshot               Kafka end offsets + all checkpoint offsets -> JSON
-    lag SNAP0 SNAP1 DUR    produced/consumed during [SNAP0,SNAP1], lag at SNAP1
+    snapshot               Kafka end offsets + committed checkpoint offsets
+                           -> JSON on stdout
+    maxlag                 take a fresh snapshot, print the worst per-query
+                           lag (events behind) as one integer
     freshness T0 T1        event-time -> Redis-write latency for results
-                           written in [T0,T1]: p50/p95 in seconds
-    stats CSV              peak/avg CPU + peak mem per container from
-                           docker-stats samples
-    tier JSON...           fold everything into one tier record (printed)
+                           written in [T0,T1]: p50/p95/p99/max in seconds
+    tier RATE T0 T1 DRAIN_S SNAP0 SNAP1 FRESH STATS OUT
+                           fold one tier into a record appended to OUT
+
+Lag has ONE definition here (`lag_by_dir`): Kafka end offset minus the
+offset of the latest *committed* micro-batch, summed per checkpoint dir.
+`maxlag` and `tier` both use it.
+
+The simulator's --events-per-sec targets SHOT events on gameplay_events, so
+throughput ("produced") counts that topic only. player_events and
+server_metrics are side streams that scale with the match count and are
+recorded for information; alerts are pipeline OUTPUT and are reported
+separately, never as produced input.
 
 All docker access goes through subprocess and therefore inherits the
 caller's group membership (run under `newgrp docker` or a docker group shell).
@@ -37,7 +48,10 @@ DIRS = [
     "economy_kills",
     "economy_purchases",
 ]
-TOPICS = ["gameplay_events", "player_events", "server_metrics", "alerts"]
+INPUT_TOPIC = "gameplay_events"          # what --events-per-sec controls
+SIDE_TOPICS = ["player_events", "server_metrics"]
+ALERTS_TOPIC = "alerts"                  # pipeline output
+TOPICS = [INPUT_TOPIC, *SIDE_TOPICS, ALERTS_TOPIC]
 
 
 def docker(*args: str) -> str:
@@ -47,8 +61,9 @@ def docker(*args: str) -> str:
 
 
 def kafka_end_offsets() -> dict:
-    """{topic: {partition: end_offset}} via GetOffsetShell (the only reliable
-    offset CLI in this image — see gaming-intelligence-ops skill)."""
+    """{topic: {"partition": end_offset}} via kafka-get-offsets.sh (the
+    GetOffsetShell class run through kafka-run-class prints nothing in this
+    image). Partition keys are strings, matching the checkpoint JSON."""
     out: dict = {}
     for t in TOPICS:
         raw = docker(
@@ -59,37 +74,43 @@ def kafka_end_offsets() -> dict:
         for line in raw.splitlines():
             m = re.match(r"^(.+):(\d+):(\d+)$", line.strip())
             if m:
-                parts[int(m.group(2))] = int(m.group(3))
+                parts[m.group(2)] = int(m.group(3))
         out[t] = parts
     return out
 
 
+def _batch_ids(d: Path) -> set:
+    return {int(p.name) for p in d.iterdir() if p.name.isdigit()} if d.is_dir() else set()
+
+
 def checkpoint_offsets() -> dict:
-    """{checkpoint_dir: {topic: {partition: committed_offset}}} — latest batch file."""
+    """{checkpoint_dir: {topic: {"partition": offset}}} of the latest batch
+    that is both planned (offsets/N) and finished (commits/N).
+
+    offsets/N is written when batch N STARTS, so its offsets are in flight;
+    only a batch with a matching commits/N has actually been processed.
+    """
     out: dict = {}
     for d in DIRS:
-        offs = CKPT / d / "offsets"
-        if not offs.is_dir():
-            continue
-        numeric = sorted(
-            (p for p in offs.iterdir() if p.name.isdigit()), key=lambda p: int(p.name)
-        )
-        if not numeric:
+        done = _batch_ids(CKPT / d / "offsets") & _batch_ids(CKPT / d / "commits")
+        if not done:
             continue
         # Spark writes one JSON line per source: a metadata line, a conf line,
         # then one {"<topic>": {partition: offset}} map per Kafka source —
         # match_quality reads gameplay+player, so ALL topic lines must merge.
         merged: dict = {}
-        with open(numeric[-1]) as fh:
-            for line in fh:
-                try:
-                    obj = json.loads(line)
-                except ValueError:
-                    continue
-                if isinstance(obj, dict) and any(k in TOPICS for k in obj):
-                    for t, parts in obj.items():
-                        if t in TOPICS:
-                            merged.setdefault(t, {}).update(parts)
+        text = (CKPT / d / "offsets" / str(max(done))).read_text()
+        for line in text.splitlines():
+            try:
+                obj = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(obj, dict) and any(k in TOPICS for k in obj):
+                for t, parts in obj.items():
+                    if t in TOPICS:
+                        merged.setdefault(t, {}).update(
+                            {str(p): int(o) for p, o in parts.items()}
+                        )
         if merged:
             out[d] = merged
     return out
@@ -99,50 +120,71 @@ def cmd_snapshot() -> dict:
     return {"end": kafka_end_offsets(), "ckpt": checkpoint_offsets()}
 
 
-def cmd_lag(snap0_path: str, snap1_path: str, duration: float) -> dict:
-    s0 = json.load(open(snap0_path))
-    s1 = json.load(open(snap1_path))
-    produced = {}
-    for t in TOPICS:
-        e0, e1 = s0["end"].get(t, {}), s1["end"].get(t, {})
-        produced[t] = sum(e1.values()) - sum(e0.values())
-    per_dir = {}
-    for d, ck1 in s1["ckpt"].items():
-        ck0 = s0["ckpt"].get(d, {})
-        consumed = 0
-        for t, parts in ck1.items():
-            p0 = ck0.get(t, {})
-            for p, off in parts.items():
-                consumed += off - p0.get(p, 0)
-        # lag at snap1: end - committed, per matching topic/partition
+def _topic_total(snap: dict, topic: str) -> int:
+    return sum(snap["end"].get(topic, {}).values())
+
+
+def lag_by_dir(snap: dict) -> dict:
+    """{dir: events behind} = sum over its partitions of end - committed."""
+    lags = {}
+    for d, ck in snap["ckpt"].items():
         lag = 0
-        for t, parts in ck1.items():
-            ends = {str(k): v for k, v in s1["end"].get(t, {}).items()}
+        for t, parts in ck.items():
+            ends = {str(k): v for k, v in snap["end"].get(t, {}).items()}
             for p, off in parts.items():
                 lag += max(0, ends.get(str(p), off) - off)
+        lags[d] = lag
+    return lags
+
+
+def cmd_maxlag() -> int:
+    return max(lag_by_dir(cmd_snapshot()).values(), default=0)
+
+
+def cmd_lag(s0: dict, s1: dict, duration: float) -> dict:
+    """produced/consumed during [s0, s1] and lag at s1."""
+    delta = {t: _topic_total(s1, t) - _topic_total(s0, t) for t in TOPICS}
+    lags = lag_by_dir(s1)
+    per_dir = {}
+    for d, ck1 in s1["ckpt"].items():
+        ck0 = s0["ckpt"].get(d)
+        consumed = None
+        if ck0 is not None:
+            # Only partitions with a baseline: a partition missing from snap0
+            # would otherwise count its whole history as consumed this tier.
+            consumed = {
+                t: sum(off - ck0[t][p] for p, off in parts.items() if p in ck0.get(t, {}))
+                for t, parts in ck1.items()
+                if t in ck0
+            }
         per_dir[d] = {
             "consumed": consumed,
-            "rate": round(consumed / duration, 1) if duration else 0.0,
-            "lag": lag,
+            # rate of the benchmarked input; side-stream-only queries
+            # (server_health) report their own topic's rate
+            "rate": (
+                round(consumed.get(INPUT_TOPIC, sum(consumed.values())) / duration, 1)
+                if consumed is not None and duration else None
+            ),
+            "lag": lags.get(d, 0),
         }
     return {
-        "produced": produced,
-        "produced_total": sum(produced.values()),
+        "produced": {INPUT_TOPIC: delta[INPUT_TOPIC]},
+        "side_streams": {t: delta[t] for t in SIDE_TOPICS},
+        "alerts_out": delta[ALERTS_TOPIC],
         "per_dir": per_dir,
-        "max_lag": max((v["lag"] for v in per_dir.values()), default=0),
-        "total_lag": sum(v["lag"] for v in per_dir.values()),
+        "max_lag": max(lags.values(), default=0),
     }
 
 
 def _parse_ts(s: str) -> float:
     """'2026-09-29 21:23:45[.ffffff]' (UTC — containers run UTC) -> epoch."""
     s = s.strip()
+    fmt = "%Y-%m-%d %H:%M:%S"
     if "." in s:
         head, frac = s.split(".", 1)
-        frac = (frac + "000000")[:6]
-        s = f"{head}.{frac}"
-    return datetime.strptime(s, "%Y-%m-%d %H:%M:%S.%f" if "." in s else
-                             "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc).timestamp()
+        s = f"{head}.{(frac + '000000')[:6]}"
+        fmt += ".%f"
+    return datetime.strptime(s, fmt).replace(tzinfo=timezone.utc).timestamp()
 
 
 def cmd_freshness(t0: int, t1: int) -> dict:
@@ -166,15 +208,12 @@ def cmd_freshness(t0: int, t1: int) -> dict:
                 samples.append(upd - _parse_ts(parts[1]))
         except ValueError:
             continue
-    samples.sort()
     if not samples:
         return {"n": 0}
+    samples.sort()
 
     def pct(p: float) -> float:
-        if not samples:
-            return 0.0
-        idx = min(len(samples) - 1, max(0, round(p * (len(samples) - 1))))
-        return round(samples[idx], 1)
+        return round(samples[min(len(samples) - 1, round(p * (len(samples) - 1)))], 1)
 
     return {
         "n": len(samples),
@@ -199,7 +238,7 @@ def cmd_stats(csv_path: str) -> dict:
     """docker-stats samples (Name,CPUPerc,MemUsage per line) -> per-container peaks."""
     per: dict = {}
     try:
-        lines = open(csv_path).read().splitlines()
+        lines = Path(csv_path).read_text().splitlines()
     except FileNotFoundError:
         return {}
     for line in lines:
@@ -222,39 +261,53 @@ def cmd_stats(csv_path: str) -> dict:
     return per
 
 
+def _load(path: str):
+    return json.loads(Path(path).read_text())
+
+
+def cmd_tier(rate, t0, t1, drain, p0, p1, pf, ps, out) -> dict:
+    load_s = int(t1) - int(t0)
+    snap1 = _load(p1)
+    lag = cmd_lag(_load(p0), snap1, float(load_s))
+    rec = {
+        "target_rate": int(rate),
+        "load_s": load_s,
+        "drain_s": int(drain),
+        "produced_per_s": round(lag["produced"][INPUT_TOPIC] / load_s, 1) if load_s else 0.0,
+        "produced": lag["produced"],
+        "side_streams": lag["side_streams"],
+        "alerts_out": lag["alerts_out"],
+        "consumed": lag["per_dir"],
+        "lag_at_end": lag["max_lag"],
+        "freshness": _load(pf),
+        "resources": cmd_stats(ps),
+        "snap1": snap1,
+    }
+    with open(out, "a") as fh:
+        fh.write(json.dumps(rec) + "\n")
+    return rec
+
+
+USAGE = "usage: collect.py snapshot | maxlag | freshness T0 T1 | tier RATE T0 T1 DRAIN_S SNAP0 SNAP1 FRESH STATS OUT"
+
+
 def main() -> None:
-    sub = sys.argv[1]
-    if sub == "snapshot":
+    args = sys.argv[1:]
+    sub = args[0] if args else ""
+    if sub == "snapshot" and len(args) == 1:
         print(json.dumps(cmd_snapshot()))
-    elif sub == "lag":
-        print(json.dumps(cmd_lag(sys.argv[2], sys.argv[3], float(sys.argv[4]))))
-    elif sub == "freshness":
-        print(json.dumps(cmd_freshness(int(sys.argv[2]), int(sys.argv[3]))))
-    elif sub == "stats":
-        print(json.dumps(cmd_stats(sys.argv[2])))
-    elif sub == "tier":
-        # tier RATE T0 T1 DRAIN_S SNAP0 SNAP1 FRESH STATS OUT
-        (rate, t0, t1, drain, p0, p1, pf, ps, out) = sys.argv[2:11]
-        snap1 = json.load(open(p1))
-        lag = cmd_lag(p0, p1, float(t1) - float(t0))
-        rec = {
-            "target_rate": int(rate),
-            "load_s": int(t1) - int(t0),
-            "drain_s": int(drain),
-            "produced_per_s": round(lag["produced_total"] / (float(t1) - float(t0)), 1),
-            "produced": lag["produced"],
-            "consumed": lag["per_dir"],
-            "lag_at_end": lag["max_lag"],
-            "freshness": json.load(open(pf)),
-            "resources": cmd_stats(ps),
-            "snap1": snap1,
-        }
-        with open(out, "a") as fh:
-            fh.write(json.dumps(rec) + "\n")
-        print(json.dumps({"rate": rate, "lag_at_end": rec["lag_at_end"],
+    elif sub == "maxlag" and len(args) == 1:
+        print(cmd_maxlag())
+    elif sub == "freshness" and len(args) == 3:
+        print(json.dumps(cmd_freshness(int(args[1]), int(args[2]))))
+    elif sub == "tier" and len(args) == 10:
+        rec = cmd_tier(*args[1:])
+        print(json.dumps({"rate": rec["target_rate"],
+                          "produced_per_s": rec["produced_per_s"],
+                          "lag_at_end": rec["lag_at_end"],
                           "freshness": rec["freshness"]}))
     else:
-        sys.exit(f"unknown subcommand: {sub}")
+        sys.exit(USAGE)
 
 
 if __name__ == "__main__":
