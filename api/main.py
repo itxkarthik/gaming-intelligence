@@ -1,48 +1,83 @@
 """FastAPI Application Entrypoint for Gaming Intelligence Platform.
 
-REST + WebSocket surface (Phase 2/4). Shared process state (Redis, Kafka
-event feed, throughput sampler, PostgreSQL pool) lives in state.py; the
-HTML dashboard (Phase 5, Datastar) lives in dashboard.py.
+REST + WebSocket surface (Phase 2/4). Shared process state (Redis readers,
+Kafka event feed, throughput sampler, alert listener, PostgreSQL pool) lives
+in state.py; the HTML dashboard (Phase 5, Datastar) lives in dashboard.py.
+Same-origin only: the dashboard is served by this process, so no CORS.
 """
 
 import asyncio
+import contextlib
 import json
-import time
-from datetime import datetime, timezone
-from typing import Optional
+import logging
+import os
+from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
-from fastapi.middleware.cors import CORSMiddleware
+import asyncpg
+import redis
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
-import redis.asyncio as aioredis
 
 import state
-from state import HEARTBEAT_SECONDS, _float, get_redis_client
 from dashboard import router as dashboard_router
+from dashboard import unavailable_page
+from state import HEARTBEAT_SECONDS, as_float
+
+logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(name)s: %(message)s")
+log = logging.getLogger("api")
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    state.feed.start()
+    state.start_throughput_sampler()
+    listener = asyncio.create_task(state.run_alert_listener(), name="alert-listener")
+    try:
+        yield
+    finally:
+        listener.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await listener
+        # Both threads close their Kafka consumers on the way out.
+        await asyncio.gather(asyncio.to_thread(state.feed.stop),
+                             asyncio.to_thread(state.stop_throughput_sampler))
+        await state.close_redis()
+        await state.close_pg_pool()
+
 
 app = FastAPI(
     title="Gaming Intelligence Platform API",
     description="Real-Time Competitive Gaming Analytics, Cheat Detection, and Server Health Monitoring",
-    version="1.1.0"
-)
-
-# Enable CORS for dashboard development
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    version=state.VERSION,
+    lifespan=lifespan,
 )
 
 app.include_router(dashboard_router)
-
-# Dashboard assets (Phase 5)
-import os as _os
 app.mount("/static",
-          StaticFiles(directory=_os.path.join(
-              _os.path.dirname(_os.path.abspath(__file__)), "static")),
+          StaticFiles(directory=os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")),
           name="static")
+
+
+async def _service_unavailable(request: Request, exc: Exception):
+    """Redis / PostgreSQL failures -> 503 (JSON for the API, a page for the
+    dashboard). Details go to the log, never to the client."""
+    service = ("Redis" if isinstance(exc, redis.RedisError)
+               else "PostgreSQL" if isinstance(exc, asyncpg.PostgresError | OSError)
+               else "backing service")
+    log.warning("%s %s -> 503 (%s): %r", request.method, request.url.path, service, exc)
+    if request.url.path.startswith("/api/") or request.url.path == "/health":
+        return JSONResponse({"detail": f"{service} unavailable"}, status_code=503)
+    return unavailable_page(request, service)
+
+
+for _exc in state.UNAVAILABLE_ERRORS:
+    app.add_exception_handler(_exc, _service_unavailable)
+
+
+def _heartbeat() -> str:
+    return json.dumps({"type": "heartbeat", "ts": datetime.now(UTC).isoformat()})
 
 
 # ─── Basic routes ───────────────────────────────────────────────────────────
@@ -52,27 +87,28 @@ async def root():
     return {
         "status": "online",
         "service": "gaming-intelligence-api",
-        "timestamp": datetime.now(timezone.utc).isoformat()
+        "timestamp": datetime.now(UTC).isoformat()
     }
 
 
 @app.get("/health")
 async def health_check():
-    redis_status = "unavailable"
+    """Redis = live PING; Kafka = freshness of the background offset sampler
+    (connected if its last successful sample is under 15 s old)."""
     try:
-        r = get_redis_client()
-        if r.ping():
-            redis_status = "connected"
-    except Exception:
-        redis_status = "disconnected"
-
+        redis_ok = bool(await state.redis_client().ping())
+    except state.UNAVAILABLE_ERRORS:
+        redis_ok = False
+    age = state.sampler_age()
+    kafka = ("unavailable" if age is None
+             else "connected" if age <= state.SAMPLER_STALE_SECONDS else "stale")
     return {
-        "status": "healthy" if redis_status == "connected" else "degraded",
-        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "status": "healthy" if redis_ok and kafka == "connected" else "degraded",
+        "timestamp": datetime.now(UTC).isoformat(),
         "components": {
             "api": "ready",
-            "redis": redis_status,
-            "kafka": "configured"
+            "redis": "connected" if redis_ok else "disconnected",
+            "kafka": kafka,
         }
     }
 
@@ -82,70 +118,50 @@ async def health_check():
 @app.get("/api/v1/servers")
 async def list_servers():
     """Returns real-time health metrics for all active game servers."""
-    try:
-        r = get_redis_client()
-        server_ids = r.smembers("servers:active")
-        results = []
-        for s_id in server_ids:
-            data = r.hgetall(f"server:{s_id}")
-            if data:
-                results.append(data)
-        return {"servers": sorted(results, key=lambda x: x.get("server_id", ""))}
-    except Exception as e:
-        return {"servers": [], "error": str(e)}
+    return {"servers": await state.read_servers()}
 
 
 @app.get("/api/v1/servers/{server_id}/health")
-def get_server_health(server_id: str):
+async def get_server_health(server_id: str):
     """Returns the latest health snapshot for one server."""
-    r = get_redis_client()
-    data = r.hgetall(f"server:{server_id}")
+    data = await state.read_server(server_id)
     if not data:
         raise HTTPException(status_code=404, detail=f"server '{server_id}' not found")
-    data["health_score"] = _float(data.get("health_score"))
+    data["health_score"] = as_float(data.get("health_score"))
     return data
 
 
 # ─── Matches ────────────────────────────────────────────────────────────────
 
 @app.get("/api/v1/matches/active")
-def list_active_matches(live_window_seconds: int = 90):
-    """Returns matches currently tracked in Redis, most recently updated first.
+async def list_active_matches(live_window_seconds: int = Query(state.MATCH_RECENT_SECONDS,
+                                                               ge=0, le=86_400)):
+    """Returns the 50 most recently SCORED matches, newest first.
 
-    A match whose quality window was updated within `live_window_seconds`
-    is flagged active: true (session-window jobs refresh them continuously
-    while a stream runs).
+    Match quality comes from append-mode session windows, which emit when a
+    match's session closes — so a row's `active` flag means "scored within
+    `live_window_seconds`" (the match recently ended), and `active` at the
+    top level counts those rows. `live_matches` is the real in-progress
+    count: the sum of server_metrics `active_matches` over servers that
+    reported in the last 30 s. `total` = all matches ever scored.
     """
-    r = get_redis_client()
-    now_ms = int(time.time() * 1000)
-    matches = []
-    for key in r.scan_iter("match:*"):
-        if ":" in key[len("match:"):]:  # skip match:meta style keys if any
-            continue
-        data = r.hgetall(key)
-        if not data:
-            continue
-        updated_ms = int(_float(data.get("updated_at"), 0)) * 1000
-        data["active"] = 0 <= (now_ms - updated_ms) <= live_window_seconds * 1000
-        data["quality_score"] = _float(data.get("quality_score"))
-        matches.append(data)
-    matches.sort(key=lambda m: m.get("updated_at", ""), reverse=True)
+    res = await state.read_recent_matches(limit=50, recent_seconds=live_window_seconds)
+    for m in res["rows"]:
+        m["active"] = m.pop("recent")
     return {
-        "matches": matches[:50],
-        "total": len(matches),
-        "active": sum(1 for m in matches if m["active"]),
+        "matches": res["rows"],
+        "total": res["tracked"],
+        "active": res["recent"],
+        "live_matches": state.feed.live_matches(),
     }
 
 
 @app.get("/api/v1/matches/{match_id}/quality")
-def get_match_quality(match_id: str):
+async def get_match_quality(match_id: str):
     """Returns the quality assessment (score, status, kills) for one match."""
-    r = get_redis_client()
-    data = r.hgetall(f"match:{match_id}")
+    data = await state.read_match(match_id)
     if not data:
         raise HTTPException(status_code=404, detail=f"match '{match_id}' not found")
-    score = r.zscore("matches:quality", match_id)
-    data["quality_score"] = _float(data.get("quality_score"), _float(score))
     return data
 
 
@@ -153,62 +169,39 @@ def get_match_quality(match_id: str):
 
 @app.get("/api/v1/players/flagged")
 async def list_flagged_players():
-    """Returns players flagged by real-time cheat detection."""
-    try:
-        r = get_redis_client()
-        player_ids = r.smembers("players:flagged")
-        results = []
-        for p_id in player_ids:
-            data = r.hgetall(f"player:{p_id}")
-            if data:
-                results.append(data)
-        return {"flagged_players": results}
-    except Exception as e:
-        return {"flagged_players": [], "error": str(e)}
+    """Returns players whose LATEST cheat evaluation is flagged (the
+    players:flagged set is lifetime; each hash's `flagged` field is current)."""
+    return {"flagged_players": await state.read_flagged_players()}
 
 
 @app.get("/api/v1/players/{player_id}/profile")
-def get_player_profile(player_id: str):
+async def get_player_profile(player_id: str):
     """Returns the combined live profile: combat stats, smurf evaluation,
-    and behavior-change status for one player."""
-    r = get_redis_client()
-    profile = r.hgetall(f"player:{player_id}")
-    smurf = r.hgetall(f"player:smurf:{player_id}")
-    behavior = r.hgetall(f"player:behavior:{player_id}")
-    if not profile and not smurf and not behavior:
+    behavior-change status, CUSUM state and current flags for one player."""
+    profile = await state.read_player(player_id)
+    if profile is None:
         raise HTTPException(status_code=404, detail=f"player '{player_id}' not found")
-    return {
-        "player_id": player_id,
-        "combat": profile or None,
-        "smurf_evaluation": smurf or None,
-        "behavior": behavior or None,
-        "flags": {
-            "cheat_flagged": r.sismember("players:flagged", player_id),
-            "smurf_flagged": r.sismember("players:smurf", player_id),
-            "behavior_anomaly": r.sismember("behavior:anomalies", player_id),
-        },
-    }
+    return profile
 
 
 @app.get("/api/v1/players/{player_id}/suspicion")
-def get_player_suspicion(player_id: str):
+async def get_player_suspicion(player_id: str):
     """Returns suspicion scores for one player: base suspicion, behavior
-    boosted suspicion, IsolationForest score, and flags."""
-    r = get_redis_client()
-    data = r.hgetall(f"player:{player_id}")
+    boosted suspicion, IsolationForest score (null until scored), and flags."""
+    data = await state.redis_client().hgetall(f"player:{player_id}")
     if not data:
         raise HTTPException(status_code=404, detail=f"player '{player_id}' not found")
-    base = _float(data.get("suspicion_score"))
-    effective = _float(data.get("suspicion_effective"), base)
+    base = as_float(data.get("suspicion_score"))
+    effective = state.effective_suspicion(data)
     return {
         "player_id": player_id,
         "suspicion_score": base,
         "suspicion_effective": effective,
         "behavior_boost": round(effective - base, 6),
-        "iforest_score": _float(data.get("iforest_score"), 0.0),
+        "iforest_score": as_float(data["iforest_score"]) if data.get("iforest_score") else None,
         "iforest_flag": data.get("iforest_flag") == "true",
         "behavior_anomaly": data.get("behavior_anomaly") == "true",
-        "flagged": r.sismember("players:flagged", player_id),
+        "flagged": data.get("flagged") == "true",
         "updated_at": data.get("updated_at"),
     }
 
@@ -217,58 +210,43 @@ def get_player_suspicion(player_id: str):
 
 @app.get("/api/v1/alerts/recent")
 async def list_recent_alerts(limit: int = 20):
-    """Returns recent alerts generated by streaming analytics."""
-    limit = max(1, min(limit, 100))  # clamp: limit<=0 would make lrange return the whole list
-    try:
-        r = get_redis_client()
-        raw_alerts = r.lrange("alerts:recent", 0, limit - 1)
-        alerts = [json.loads(a) for a in raw_alerts]
-        return {"alerts": alerts}
-    except Exception as e:
-        return {"alerts": [], "error": str(e)}
+    """Returns the latest alerts forwarded by the Go alert engine (post
+    dedup/rate-limit; live from Redis `alerts:stream`, seeded from
+    PostgreSQL at startup), newest first."""
+    limit = max(1, min(limit, state.ALERT_LOG_SIZE))
+    return {"alerts": state.alert_log.recent(limit)}
 
 
 @app.get("/api/v1/alerts/history")
 async def alert_history(limit: int = 50, offset: int = 0,
-                        alert_type: Optional[str] = None,
-                        severity: Optional[str] = None):
+                        alert_type: str | None = None,
+                        severity: str | None = None):
     """Paginated alert history from PostgreSQL (written by the Go alert
-    engine) — complements /alerts/recent (Redis, latest 100 only).
+    engine) — complements /alerts/recent (in-memory, latest 100 only).
     Filters: alert_type (SERVER_DEGRADED, CHEAT_DETECTED, ...) and
     severity (WARNING, CRITICAL)."""
     limit = max(1, min(limit, 200))
     offset = max(0, offset)
-    try:
-        return await state.fetch_alert_history(limit, offset, alert_type, severity)
-    except Exception as e:
-        raise HTTPException(status_code=503, detail=f"PostgreSQL unavailable: {e}")
+    return await state.fetch_alert_history(limit, offset, alert_type, severity)
 
 
 # ─── Tournament / aggregate stats ───────────────────────────────────────────
 
 @app.get("/api/v1/tournament/live")
-def tournament_live():
+async def tournament_live():
     """Returns live tournament aggregates: server health, match quality,
-    flagged/smurf/anomaly counts, and recent alert volume."""
-    return state.tournament_snapshot()
+    current flagged/smurf/anomaly counts, and recent engine alert volume."""
+    return await state.tournament_snapshot()
 
 
 # ─── Pipeline throughput (Kafka log offsets) ────────────────────────────────
 
-@app.on_event("startup")
-def _start_throughput_sampler():
-    state.start_throughput_sampler()
-
-
-@app.on_event("shutdown")
-async def _shutdown():
-    await state.close_pg_pool()
-
-
 @app.get("/api/v1/stats/throughput")
-def pipeline_throughput():
-    """Returns per-topic event totals and the pipeline's observed
-    events/sec rate over a sliding ~60 s window of Kafka log offsets."""
+async def pipeline_throughput():
+    """Returns the pipeline's events/sec over the input topics (sliding
+    ~60 s window of Kafka log-end offsets, plus the latest 5 s rate),
+    total events ingested into the input topics, and per-topic RETAINED
+    record counts (end − beginning offsets, all topics)."""
     snap = state.throughput_snapshot()
     if snap["samples"] == 0:
         raise HTTPException(status_code=503,
@@ -276,56 +254,43 @@ def pipeline_throughput():
     return snap
 
 
-# ─── Kafka → WebSocket live event feed ──────────────────────────────────────
+# ─── WebSockets ─────────────────────────────────────────────────────────────
 
-@app.websocket("/ws/live")
-async def ws_live(websocket: WebSocket):
-    """Real-time event feed: streams processed Kafka events (gameplay,
-    player events, server metrics) as they arrive. Heartbeat frame every
-    {HEARTBEAT_SECONDS}s keeps proxies from idling the connection out."""
-    await websocket.accept()
-    q = state.feed.register()
+async def _pump(websocket: WebSocket, q: asyncio.Queue):
+    """Forward queued frames; a heartbeat frame after HEARTBEAT_SECONDS of
+    silence keeps proxies from idling the connection out."""
     try:
         while True:
             try:
                 frame = await asyncio.wait_for(q.get(), timeout=HEARTBEAT_SECONDS)
-                await websocket.send_text(frame)
-            except asyncio.TimeoutError:
-                await websocket.send_text(json.dumps(
-                    {"type": "heartbeat",
-                     "ts": datetime.now(timezone.utc).isoformat()}))
-    except (WebSocketDisconnect, RuntimeError):
+            except TimeoutError:
+                frame = _heartbeat()
+            await websocket.send_text(frame)
+    except (WebSocketDisconnect, RuntimeError, OSError):
         pass
+
+
+@app.websocket("/ws/live")
+async def ws_live(websocket: WebSocket):
+    """Real-time event feed: streams processed Kafka events (gameplay,
+    player events, server metrics) as they arrive, from the one shared
+    consumer. Heartbeat frame every 15 s (HEARTBEAT_SECONDS) when idle."""
+    await websocket.accept()
+    q = state.feed.register()
+    try:
+        await _pump(websocket, q)
     finally:
         state.feed.unregister(q)
 
 
 @app.websocket("/ws/alerts")
 async def ws_alerts(websocket: WebSocket):
-    """Alert notifications: forwards every alert the Go alert engine
-    forwards (published on Redis channel `alerts:stream`) in real time."""
+    """Alert notifications: every alert the Go alert engine publishes on
+    Redis `alerts:stream`, fanned out from the one shared listener.
+    Heartbeat frame every 15 s (HEARTBEAT_SECONDS) when idle."""
     await websocket.accept()
-    r = aioredis.Redis(host=state.REDIS_HOST, port=state.REDIS_PORT, decode_responses=True)
-    pubsub = r.pubsub()
-    await pubsub.subscribe("alerts:stream")
-    last_beat = time.monotonic()
+    q = state.alert_bus.subscribe()
     try:
-        while True:
-            msg = await pubsub.get_message(ignore_subscribe_messages=True, timeout=1.0)
-            if msg and msg.get("type") == "message":
-                await websocket.send_text(msg["data"])
-                last_beat = time.monotonic()
-            elif time.monotonic() - last_beat >= HEARTBEAT_SECONDS:
-                await websocket.send_text(json.dumps(
-                    {"type": "heartbeat",
-                     "ts": datetime.now(timezone.utc).isoformat()}))
-                last_beat = time.monotonic()
-    except (WebSocketDisconnect, RuntimeError):
-        pass
+        await _pump(websocket, q)
     finally:
-        try:
-            await pubsub.unsubscribe("alerts:stream")
-            await pubsub.aclose()
-            await r.aclose()
-        except Exception:
-            pass
+        state.alert_bus.unsubscribe(q)
