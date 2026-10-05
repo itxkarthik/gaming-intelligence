@@ -7,7 +7,7 @@
 <div class="grid-bento">
   <section class="panel">
     <div class="panel-header">
-      <h2>// MATCH QUALITY DISTRIBUTION <span class="hint">Session-Window Scoring (0–100)</span></h2>
+      <h2>Quality distribution <span class="hint">score 0–100</span></h2>
       <div id="histogram">{{ histogram|safe }}</div>
     </div>
     <div class="chart-container" style="height: 190px;">
@@ -23,8 +23,7 @@
 
   <section class="panel">
     <div class="panel-header">
-      <h2>// RECENTLY SCORED SESSIONS <span class="hint">Streaming Session Windows · scored when a session closes</span></h2>
-      <span class="hint">Select match for breakdown</span>
+      <h2>Recently scored matches <span class="hint">scored when a match ends · click one for its breakdown</span></h2>
     </div>
     <div class="table-wrap max-h-360">
       <table>

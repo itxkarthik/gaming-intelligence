@@ -319,16 +319,6 @@ main {
   margin: 0 auto;
 }
 
-footer {
-  padding: 24px 20px;
-  text-align: center;
-  color: var(--text-dim);
-  font-size: 11px;
-  font-family: var(--mono);
-  border-top: 1px solid var(--border);
-  letter-spacing: 0.03em;
-}
-
 .grid-2 {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -369,15 +359,14 @@ footer {
 
 .panel h2 {
   margin: 0;
-  font-family: var(--mono);
-  font-size: 11.5px;
+  font-family: var(--sans);
+  font-size: 13px;
   font-weight: 600;
-  letter-spacing: 0.06em;
-  text-transform: uppercase;
+  letter-spacing: 0;
   color: var(--text);
   display: flex;
-  align-items: center;
-  gap: 8px;
+  align-items: baseline;
+  gap: 10px;
 }
 .panel h2 .hint {
   font-family: var(--sans);
@@ -435,15 +424,6 @@ footer {
   border-color: var(--border-strong);
 }
 
-.kpi-tag {
-  font-family: var(--mono);
-  font-size: 9.5px;
-  font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-  color: var(--text-dim);
-  margin-bottom: 4px;
-}
 
 .kpi-value {
   font-family: var(--mono);
@@ -456,19 +436,18 @@ footer {
 }
 
 .kpi-label {
-  font-size: 11px;
+  font-size: 11.5px;
   font-weight: 400;
   color: var(--text-muted);
-  margin-top: 4px;
+  margin-bottom: 6px;
 }
-
-.kpi-live .kpi-value { color: var(--ok); }
-.kpi-warn .kpi-value { color: var(--warn); }
-.kpi-bad .kpi-value { color: var(--bad); }
-
-.kpi-live { border-left: 2px solid var(--ok); }
-.kpi-warn { border-left: 2px solid var(--warn); }
-.kpi-bad { border-left: 2px solid var(--bad); }
+.kpi-unit {
+  margin-left: 5px;
+  font-size: 11px;
+  font-weight: 400;
+  letter-spacing: 0;
+  color: var(--text-dim);
+}
 
 .stats-row {
   display: flex;
@@ -577,10 +556,10 @@ tbody tr.empty td {
   color: var(--text);
 }
 
-tbody tr.k-kill td { border-left: 2px solid var(--bad); }
-tbody tr.k-dmg td { border-left: 2px solid var(--warn); }
-tbody tr.k-player td { border-left: 2px solid var(--accent); }
-tbody tr.k-server td { border-left: 2px solid var(--ok); }
+tbody tr.k-kill td:first-child { box-shadow: inset 2px 0 var(--bad); }
+tbody tr.k-dmg td:first-child { box-shadow: inset 2px 0 var(--warn); }
+tbody tr.k-player td:first-child { box-shadow: inset 2px 0 var(--accent); }
+tbody tr.k-server td:first-child { box-shadow: inset 2px 0 var(--ok); }
 
 /* ── Technical Chips & Meters: Rigid Rectangular Geometry ─────────────── */
 .chip {
@@ -692,10 +671,11 @@ ul.alerts, ul.flagged {
 
 ul.alerts li {
   display: grid;
-  grid-template-columns: auto auto 1fr auto;
-  gap: 10px;
+  grid-template-columns: 8px auto 1fr auto;
+  column-gap: 10px;
+  row-gap: 3px;
   align-items: center;
-  padding: 8px 6px;
+  padding: 9px 6px;
   border-bottom: 1px solid var(--border-subtle);
   font-size: 11.5px;
 }
@@ -705,17 +685,30 @@ ul.alerts li:hover {
 ul.alerts li:last-child {
   border-bottom: 0;
 }
-.alert-type {
+.sev {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--text-dim);
+}
+.sev.bad { background: var(--bad); }
+.sev.warn { background: var(--warn); }
+.alert-entity {
   font-family: var(--mono);
-  font-size: 10.5px;
+  font-weight: 600;
   color: var(--text);
-  letter-spacing: 0.03em;
+}
+.alert-type {
+  font-size: 11px;
+  color: var(--text-muted);
 }
 .alert-msg {
+  grid-column: 2 / -1;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  color: var(--text-muted);
+  color: var(--text-dim);
+  font-size: 11px;
 }
 ul.alerts time {
   color: var(--text-dim);
@@ -724,8 +717,9 @@ ul.alerts time {
 }
 
 ul.flagged li {
-  display: flex;
-  justify-content: space-between;
+  display: grid;
+  grid-template-columns: 1fr auto 48px;
+  gap: 10px;
   align-items: center;
   padding: 8px 6px;
   border-bottom: 1px solid var(--border-subtle);
@@ -737,11 +731,16 @@ ul.flagged li:hover {
 ul.flagged li:last-child {
   border-bottom: 0;
 }
-ul.flagged .score {
+ul.flagged .signals { display: flex; gap: 4px; }
+.flagged .score {
   font-family: var(--mono);
-  color: var(--warn);
+  font-variant-numeric: tabular-nums;
+  text-align: right;
   font-weight: 600;
+  color: var(--text-muted);
 }
+.flagged .score.warn { color: var(--warn); }
+.flagged .score.bad { color: var(--bad); }
 
 /* ── Details & Entity Views ────────────────────────────────────────────── */
 .detail-hero {
