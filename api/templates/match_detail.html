@@ -1,11 +1,11 @@
 {% extends "base.html" %}
 {% block title %}Match {{ match_id }}{% endblock %}
 {% block content %}
-<p class="crumbs"><a href="/matches">// BACK TO MATCHES</a></p>
+<p class="crumbs"><a href="/matches">← Matches</a></p>
 
 <section class="panel">
   <div class="panel-header">
-    <h2 class="mono">// SESSION TELEMETRY · {{ match_id }}</h2>
+    <h2>Match <span class="mono">{{ match_id }}</span></h2>
   </div>
   {% set status = m.get('status', '?') %}
   {% set cls = 'bad' if status == 'STOMPED' else 'warn' if status == 'UNBALANCED' else 'ok' %}
@@ -13,20 +13,20 @@
     <div class="score-big {{ cls }}">{{ '%.1f'|format(score) }}</div>
     <div>
       <span class="chip {{ cls }}">{{ status }}</span>
-      <span class="hint">Quality Metric (0–100)</span>
+      <span class="hint">quality score, 0–100</span>
     </div>
   </div>
   <div class="bar tall"><div class="bar-fill {{ cls }}" style="width:{{ [score, 100]|min }}%"></div></div>
 
   <dl class="kv">
     <dt>Kills A / B</dt><dd>{{ m.get('kills_a', '0') }} : {{ m.get('kills_b', '0') }} (total {{ m.get('total_kills', '0') }})</dd>
-    <dt>Kill Imbalance</dt><dd>{{ m.get('kill_imbalance', '—') }}</dd>
-    <dt>Kill Entropy</dt><dd>{{ m.get('kill_entropy', '—') }}</dd>
-    <dt>Skill Imbalance</dt><dd>{{ m.get('skill_imbalance', '—') }}</dd>
+    <dt>Kill imbalance</dt><dd>{{ m.get('kill_imbalance', '—') }}</dd>
+    <dt>Kill entropy</dt><dd>{{ m.get('kill_entropy', '—') }}</dd>
+    <dt>Skill imbalance</dt><dd>{{ m.get('skill_imbalance', '—') }}</dd>
     <dt>Disconnects</dt><dd>{{ m.get('disconnects', '0') }}</dd>
     <dt>Duration</dt><dd>{{ m.get('duration_s', '—') }}s</dd>
-    <dt>Window End</dt><dd class="mono">{{ m.get('window_end', '—') }}</dd>
-    <dt>Updated At</dt><dd class="mono">{{ m.get('updated_at', '—') }}</dd>
+    <dt>Ended</dt><dd class="mono">{{ m.get('window_end', '—') }}</dd>
+    <dt>Scored at</dt><dd class="mono">{{ m.get('updated_at', '—') }}</dd>
   </dl>
 </section>
 {% endblock %}

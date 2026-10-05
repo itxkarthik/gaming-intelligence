@@ -1,60 +1,60 @@
 {% extends "base.html" %}
 {% block title %}Player {{ player_id }}{% endblock %}
 {% block content %}
-<p class="crumbs"><a href="/anticheat">// BACK TO ANTI-CHEAT</a></p>
+<p class="crumbs"><a href="/anticheat">← Anti-cheat</a></p>
 
 <section class="panel">
   <div class="panel-header">
-    <h2 class="mono">// PLAYER DOSSIER · {{ player_id }}</h2>
+    <h2>Player <span class="mono">{{ player_id }}</span></h2>
   </div>
   <div class="flag-row">
-    {% if flags.cheat_flagged %}<span class="chip bad">CHEAT FLAGGED</span>{% endif %}
-    {% if flags.smurf_flagged %}<span class="chip warn">SMURF</span>{% endif %}
-    {% if flags.behavior_anomaly %}<span class="chip warn">BEHAVIOR SHIFT</span>{% endif %}
-    {% if not flags.cheat_flagged and not flags.smurf_flagged and not flags.behavior_anomaly %}<span class="chip ok">CLEAN</span>{% endif %}
+    {% if flags.cheat_flagged %}<span class="chip bad">Cheat flagged</span>{% endif %}
+    {% if flags.smurf_flagged %}<span class="chip warn">Smurf</span>{% endif %}
+    {% if flags.behavior_anomaly %}<span class="chip warn">Behaviour shift</span>{% endif %}
+    {% if not flags.cheat_flagged and not flags.smurf_flagged and not flags.behavior_anomaly %}<span class="chip ok">Clean</span>{% endif %}
   </div>
 
-  <h3>// SUSPICION EVALUATION</h3>
+  <h3>Suspicion</h3>
   <div class="bar tall"><div class="bar-fill {{ 'bad' if eff >= 0.85 else 'warn' if eff >= 0.70 else 'ok' }}"
        style="width:{{ [eff * 100, 100]|min }}%"></div></div>
   <dl class="kv">
-    <dt>Effective Score</dt><dd><b>{{ '%.3f'|format(eff) }}</b></dd>
-    <dt>Base Suspicion</dt><dd>{{ '%.3f'|format(base) }}</dd>
-    <dt>Behavior Boost</dt><dd>+{{ '%.3f'|format(eff - base) }}</dd>
-    <dt>IsolationForest</dt><dd>{{ profile.get('iforest_score', '—') }}
+    <dt>Effective score</dt><dd><b>{{ '%.3f'|format(eff) }}</b></dd>
+    <dt>Base suspicion</dt><dd>{{ '%.3f'|format(base) }}</dd>
+    <dt>Behaviour boost</dt><dd>+{{ '%.3f'|format(eff - base) }}</dd>
+    <dt>Isolation Forest</dt><dd>{{ profile.get('iforest_score', '—') }}
       {% if profile.get('iforest_flag') == 'true' %}<span class="chip warn">IF Flag</span>{% endif %}</dd>
   </dl>
 
   {% if profile %}
-  <h3>// COMBAT PROFILE</h3>
+  <h3>Combat profile <span class="hint">best recent window</span></h3>
   <dl class="kv">
-    <dt>Active Match</dt><dd class="mono">{{ profile.get('match_id', '—') }}</dd>
+    <dt>Match</dt><dd class="mono">{{ profile.get('match_id', '—') }}</dd>
     <dt>Shots / Kills</dt><dd>{{ profile.get('total_shots', '0') }} / {{ profile.get('total_kills', '0') }}</dd>
-    <dt>Headshot Ratio</dt><dd>{{ profile.get('headshot_ratio', '—') }}</dd>
-    <dt>Avg Accuracy</dt><dd>{{ profile.get('avg_accuracy', '—') }}</dd>
-    <dt>Avg Reaction</dt><dd>{{ profile.get('avg_reaction_time_ms', '—') }} ms</dd>
-    <dt>Behavior Anomaly</dt><dd>{{ profile.get('behavior_anomaly', '—') }}</dd>
+    <dt>Headshots per hit</dt><dd>{{ profile.get('headshot_ratio', '—') }}</dd>
+    <dt>Accuracy</dt><dd>{{ profile.get('avg_accuracy', '—') }}</dd>
+    <dt>Reaction time</dt><dd>{{ profile.get('avg_reaction_time_ms', '—') }} ms</dd>
+    <dt>Behaviour shift</dt><dd>{{ profile.get('behavior_anomaly', '—') }}</dd>
   </dl>
   {% endif %}
 
   {% if smurf %}
-  <h3>// SMURF CLASSIFICATION</h3>
+  <h3>Smurf check</h3>
   <dl class="kv">
     <dt>Probability</dt><dd><b>{{ smurf.get('probability', '—') }}</b></dd>
     <dt>Status</dt><dd>{{ smurf.get('status', '—') }}</dd>
-    <dt>Account Age</dt><dd>{{ smurf.get('account_age_days', '—') }} days · {{ smurf.get('games_played', '—') }} games</dd>
-    <dt>Declared Rank</dt><dd>{{ smurf.get('declared_rank', '—') }}</dd>
-    <dt>Archetype</dt><dd class="mono">{{ smurf.get('archetype', '—') }}</dd>
+    <dt>Account</dt><dd>{{ smurf.get('account_age_days', '—') }} days · {{ smurf.get('games_played', '—') }} games</dd>
+    <dt>Declared rank</dt><dd>{{ smurf.get('declared_rank', '—') }}</dd>
+    <dt>Simulator label <span class="hint">ground truth, evaluation only</span></dt><dd class="mono">{{ smurf.get('archetype', '—') }}</dd>
     <dt>Reason</dt><dd>{{ smurf.get('reason', '—') }}</dd>
   </dl>
   {% endif %}
 
   {% if behavior %}
-  <h3>// STATISTICAL CUSUM PROFILE</h3>
+  <h3>Behaviour (CUSUM)</h3>
   <dl class="kv">
-    <dt>Last Batch Acc</dt><dd>{{ behavior.get('last_batch_mean', '—') }}</dd>
-    <dt>Baseline Mean (n)</dt><dd>{{ behavior.get('baseline_mean', '—') }} (n={{ behavior.get('baseline_n', '0') }})</dd>
-    <dt>Z-Score</dt><dd>{{ behavior.get('last_z', '—') }}</dd>
+    <dt>Latest accuracy</dt><dd>{{ behavior.get('last_batch_mean', '—') }}</dd>
+    <dt>Baseline (n)</dt><dd>{{ behavior.get('baseline_mean', '—') }} (n={{ behavior.get('baseline_n', '0') }})</dd>
+    <dt>z-score</dt><dd>{{ behavior.get('last_z', '—') }}</dd>
     <dt>Anomalies</dt><dd>{{ behavior.get('anomalies', '0') }}</dd>
   </dl>
   {% endif %}

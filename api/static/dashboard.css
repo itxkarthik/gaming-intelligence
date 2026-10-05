@@ -378,13 +378,10 @@ main {
 }
 
 .panel h3 {
-  margin: 16px 0 8px;
-  font-family: var(--mono);
-  font-size: 11px;
+  margin: 18px 0 8px;
+  font-size: 13px;
   font-weight: 600;
-  text-transform: uppercase;
-  letter-spacing: 0.08em;
-  color: var(--text-muted);
+  color: var(--text);
 }
 
 .crumbs {
