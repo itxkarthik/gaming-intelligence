@@ -10,16 +10,26 @@ ROADMAP Phase 6 spec:
     cheat     Cheat detection precision/recall vs simulator archetype labels
     quality   Match quality distribution histogram + status mix
     servers   Server reliability ranking (health, critical time, latency)
-    peak      Peak-hour analysis (events per hour of day)
+    peak      Peak-hour analysis (shots per hour of day)
     all       (default) every analysis, in order
 
 Submit with `make spark-batch JOB=<name>` — local mode on purpose: the
 4-core cluster is fully subscribed by the streaming jobs, and batch analysis
 should not steal from them.
 
-Ground truth for the accuracy job: the simulator stamps every LOGIN event
-with its `archetype` metadata (simulator/cmd/simulator/main.go) which lands
+Ground truth for the cheat job: the simulator stamps every LOGIN event
+with its `archetype` metadata (simulator/cmd/simulator/world.go) which lands
 in the smurf_detection archive's `metadata` map — labels never touch Redis.
+
+Archive semantics this job has to undo:
+  * server_health and cheat_detection stream in UPDATE mode, so a window is
+    archived again by every micro-batch that touched it (partial results).
+    `latest_per_key` keeps only the last archived row per (entity, window).
+  * economy_purchases uses 60 s windows sliding by 30 s, so every purchase
+    sits in two windows; only the minute-aligned windows are summed.
+  * economy_weapon_kills is not read here: weapon kill stats come from the
+    per-kill gameplay rows (behavior_change), which also allow the per-rank
+    join. That archive remains an audit trail of the streaming output.
 """
 
 import argparse
@@ -33,6 +43,8 @@ from pyspark.sql import functions as F
 from pyspark.sql.window import Window
 
 from src.common.config import HDFS_OUTPUT_DIR
+from src.common.schemas import SHOT_EVENT
+from src.ml.iforest import MIN_SHOTS  # cheat_detection's evidence floor
 
 RANK_ORDER = ["bronze", "silver", "gold", "diamond"]
 
@@ -51,43 +63,87 @@ def read(spark, name):
     if not os.path.isdir(path):
         print(f"\n── {name}: archive not found at {path} (skipped)")
         return None
-    df = spark.read.parquet(path)
-    if df.rdd.isEmpty():
+    # mergeSchema: the archive holds files written before and after columns
+    # were added (e.g. is_kill); without it Spark may take one file's schema.
+    df = spark.read.option("mergeSchema", "true").parquet(path)
+    if df.isEmpty():
         print(f"\n── {name}: archive empty (skipped)")
         return None
     return df
 
 
-def labels(spark):
-    """player_id -> (archetype, rank) from LOGIN metadata — simulator truth."""
-    smurf = read(spark, "smurf_detection")
-    if smurf is None:
-        return None
-    return (
-        smurf.filter(F.col("event_type") == "LOGIN")
-        .select(
-            "player_id",
-            F.col("metadata")["archetype"].alias("archetype"),
-            F.col("metadata")["rank"].alias("rank"),
-        )
-        .filter(F.col("archetype").isNotNull())
-        .dropDuplicates(["player_id"])
+# The gameplay archive spans two wire formats. Legacy runs emitted a
+# SHOT_FIRED row per shot plus separate DAMAGE and KILL rows that repeated
+# the shot's accuracy and reaction time; current runs emit a single SHOT row
+# with the outcome inline. These selectors return one row per shot and one
+# row per kill under either format, so history is never double-counted.
+LEGACY_SHOT, LEGACY_KILL = "SHOT_FIRED", "KILL"
+
+
+def shot_rows(df):
+    return df.filter(F.col("event_type").isin(SHOT_EVENT, LEGACY_SHOT))
+
+
+def kill_rows(df):
+    current = (F.col("event_type") == SHOT_EVENT) & F.col("is_kill") \
+        if "is_kill" in df.columns else F.lit(False)
+    return df.filter(current | (F.col("event_type") == LEGACY_KILL))
+
+
+def latest_per_key(df, keys):
+    """Keep the last archived row per key.
+
+    Update-mode queries re-archive a window each micro-batch until the
+    watermark closes it; the final row is the complete one. Every micro-batch
+    writes its own file (coalesce(1)), so the source file's modification time
+    orders the versions. Call on a DataFrame straight from read() — the
+    hidden _metadata column only exists on the file source.
+    """
+    w = Window.partitionBy(*keys).orderBy(
+        F.col("_metadata.file_modification_time").desc()
     )
+    return (
+        df.withColumn("_rn", F.row_number().over(w))
+        .filter(F.col("_rn") == 1)
+        .drop("_rn")
+    )
+
+
+_LABELS = {}
+
+
+def labels(spark):
+    """player_id -> (archetype, rank, since) from each player's latest LOGIN.
+
+    An account's archetype depends on the run's --cheater/--smurf/--toxic
+    ratios, so one player can carry different labels in different runs.
+    Ground truth is the most recent LOGIN, and evaluations only use rows
+    from that run on (event time >= since). Picking an arbitrary LOGIN per
+    player mixed labels from unrelated runs.
+
+    Built once per session and cached: --job all uses it twice.
+    """
+    if spark not in _LABELS:
+        smurf = read(spark, "smurf_detection")
+        archetype = F.col("metadata")["archetype"]
+        _LABELS[spark] = None if smurf is None else (
+            smurf.filter((F.col("event_type") == "LOGIN") & archetype.isNotNull())
+            .groupBy("player_id")
+            .agg(
+                F.max_by(archetype, "event_time").alias("archetype"),
+                F.max_by(F.col("metadata")["rank"], "event_time").alias("rank"),
+                F.max("event_time").alias("since"),
+            )
+            .cache()
+        )
+    return _LABELS[spark]
 
 
 def table(headers, rows, aligns=None):
     """Minimal aligned text table — no tabulate dependency."""
-    aligns = aligns or ["<"] * len(headers)
-    fmts = [
-        (f"{{:{a}}}" if a in "<>" else f"{{:{a}}}")
-        for a in aligns
-    ]
-    print("   " + "  ".join(f.format(h) for f, h in zip(fmts, headers)))
-    for row in rows:
-        cells = []
-        for f, v in zip(fmts, row):
-            cells.append(f.format(v))
-        print("   " + "  ".join(cells))
+    fmts = [f"{{:{a}}}" for a in aligns or ["<"] * len(headers)]
+    for row in [headers, *rows]:
+        print("   " + "  ".join(f.format(v) for f, v in zip(fmts, row)))
 
 
 # ── skill ─────────────────────────────────────────────────────────────────
@@ -97,14 +153,15 @@ def job_skill(spark):
     if beh is None:
         return
     agg = (
-        beh.filter(F.col("accuracy").isNotNull() & F.col("event_time").isNotNull())
+        shot_rows(beh)
+        .filter(F.col("accuracy").isNotNull() & F.col("event_time").isNotNull())
         .withColumn(
             "bucket",
             F.window(F.from_unixtime(F.col("event_time") / 1000), "15 minutes").start,
         )
         .groupBy("bucket")
         .agg(
-            F.count(F.lit(1)).alias("events"),
+            F.count(F.lit(1)).alias("shots"),
             F.approx_count_distinct("player_id").alias("players"),
             F.avg("accuracy").alias("avg_acc"),
             F.percentile_approx("accuracy", 0.5).alias("p50_acc"),
@@ -117,11 +174,11 @@ def job_skill(spark):
         note("no rows")
         return
     table(
-        ["BUCKET (UTC)", "EVENTS", "PLAYERS", "AVG ACC", "P50 ACC", "AVG RXN ms"],
+        ["BUCKET (UTC)", "SHOTS", "PLAYERS", "AVG ACC", "P50 ACC", "AVG RXN ms"],
         [
             [
                 str(r["bucket"])[:16],
-                f"{r['events']:,}",
+                f"{r['shots']:,}",
                 r["players"],
                 f"{r['avg_acc']:.3f}",
                 f"{r['p50_acc']:.3f}",
@@ -145,28 +202,38 @@ def job_weapon(spark):
     beh = read(spark, "behavior_change")
     if beh is None:
         return
-    kills = beh.filter(F.col("event_type") == "KILL")
+    kills = kill_rows(beh)
     lab = labels(spark)
 
+    # Kill-side stats from kill rows; accuracy from shot rows, where each
+    # shot counts once (legacy KILL rows repeated the killing shot's value).
+    accuracy = shot_rows(beh).groupBy("weapon_id").agg(F.avg("accuracy").alias("avg_acc"))
     meta = (
         kills.groupBy("weapon_id")
         .agg(
             F.count(F.lit(1)).alias("kills"),
             F.avg(F.col("is_headshot").cast("int")).alias("hs_rate"),
-            F.avg("accuracy").alias("avg_acc"),
         )
+        .join(accuracy, "weapon_id", "left")
         .orderBy(F.col("kills").desc())
         .collect()
     )
     if not meta:
-        note("no KILL rows")
+        note("no kills")
         return
     total_kills = sum(r["kills"] for r in meta)
-    # purchase mix from the economy archive (small: one row per weapon)
+    # Purchase mix from the economy archive. Its 60 s windows slide by 30 s,
+    # so each purchase is in two windows: sum only the minute-aligned ones,
+    # which tile time exactly once. Append mode emits a window once; the
+    # dropDuplicates absorbs replayed micro-batches.
     purch = {}
     econ = read(spark, "economy_purchases")
     if econ is not None:
-        for r in econ.groupBy("weapon_id").agg(F.sum("purchases").alias("p")).collect():
+        aligned = (
+            econ.filter(F.unix_timestamp(F.col("window.start")) % 60 == 0)
+            .dropDuplicates(["window", "weapon_id"])
+        )
+        for r in aligned.groupBy("weapon_id").agg(F.sum("purchases").alias("p")).collect():
             purch[r["weapon_id"]] = int(r["p"])
     table(
         ["WEAPON", "KILLS", "SHARE", "HS RATE", "AVG ACC", "PURCHASES"],
@@ -176,7 +243,7 @@ def job_weapon(spark):
                 f"{r['kills']:,}",
                 f"{100.0 * r['kills'] / total_kills:.1f}%",
                 f"{100.0 * r['hs_rate']:.1f}%",
-                f"{r['avg_acc']:.3f}",
+                f"{r['avg_acc']:.3f}" if r["avg_acc"] is not None else "—",
                 f"{purch.get(r['weapon_id'], 0):,}",
             ]
             for r in meta
@@ -189,6 +256,7 @@ def job_weapon(spark):
         return
     by_rank = (
         kills.join(lab, "player_id")
+        .filter(F.col("event_time") >= F.col("since"))
         .groupBy("rank", "weapon_id")
         .agg(F.count(F.lit(1)).alias("kills"))
     )
@@ -215,21 +283,35 @@ def job_cheat(spark):
     if lab is None or cheat is None:
         note("missing labels or cheat archive — skipped")
         return
-    pred = cheat.groupBy("player_id").agg(
-        F.max("suspicion_score").alias("max_suspicion")
+    # Final row per window (the archive holds every update-mode partial),
+    # then production's flag gate: a window needs >= MIN_SHOTS shots
+    # (cheat_detection.py: flagged = (... >= 0.70 or iforest) and
+    # total_shots >= MIN_SHOTS). Judge each player only on windows from their latest
+    # labelled run.
+    run_start = (F.col("since") / 1000).cast("timestamp")
+    pred = (
+        latest_per_key(cheat, ["player_id", "match_id", "window"])
+        .filter(F.col("total_shots") >= MIN_SHOTS)
+        .join(lab.select("player_id", "since"), "player_id")
+        .filter(F.col("window.start") >= run_start)
+        .groupBy("player_id")
+        .agg(F.max("suspicion_score").alias("max_suspicion"))
     )
     ev = (
         lab.join(pred, "player_id", "left")
+        # coverage BEFORE the coalesce: a scored window with suspicion 0.0
+        # still counts as covered
+        .withColumn("scored", F.col("max_suspicion").isNotNull())
         .withColumn("max_suspicion", F.coalesce(F.col("max_suspicion"), F.lit(0.0)))
         .withColumn("actual", F.col("archetype").startswith("cheater"))
         .cache()
     )
     total = ev.count()
     positives = ev.filter(F.col("actual")).count()
-    covered = ev.filter(F.col("max_suspicion") > 0).count()
+    covered = ev.filter(F.col("scored")).count()
     note(
         f"labeled players: {total} · actual cheaters: {positives} · "
-        f"scored in cheat windows: {covered}"
+        f"scored in a >= {MIN_SHOTS}-shot window: {covered}"
     )
     table(
         ["THRESHOLD", "PRED+", "TP", "FP", "FN", "PRECISION", "RECALL", "F1"],
@@ -281,7 +363,8 @@ def job_quality(spark):
         return
     buckets = (
         latest.withColumn(
-            "bucket", (F.floor(F.col("quality_score") / 10)).cast("int")
+            # a perfect 100 joins the 90–100 bucket instead of an 11th
+            "bucket", F.least(F.floor(F.col("quality_score") / 10), F.lit(9)).cast("int")
         )
         .groupBy("bucket")
         .agg(F.count(F.lit(1)).alias("n"))
@@ -323,8 +406,10 @@ def job_servers(spark):
     sh = read(spark, "server_health")
     if sh is None:
         return
+    # one row per 10 s window: the archive holds every update-mode partial
     agg = (
-        sh.groupBy("server_id", "region")
+        latest_per_key(sh, ["server_id", "region", "window"])
+        .groupBy("server_id", "region")
         .agg(
             F.count(F.lit(1)).alias("windows"),
             F.avg("health_score").alias("avg_health"),
@@ -359,16 +444,19 @@ def job_servers(spark):
 
 # ── peak ──────────────────────────────────────────────────────────────────
 def job_peak(spark):
-    banner("PEAK HOUR ANALYSIS (events per hour of day, event time)")
+    banner("PEAK HOUR ANALYSIS (shots per hour of day, event time)")
     beh = read(spark, "behavior_change")
     if beh is None:
         return
+    # one row per shot under either archive format (legacy DAMAGE/KILL rows
+    # would otherwise inflate hours with more hits)
     agg = (
-        beh.filter(F.col("event_time").isNotNull())
+        shot_rows(beh)
+        .filter(F.col("event_time").isNotNull())
         .withColumn("hour", F.hour(F.from_unixtime(F.col("event_time") / 1000)))
         .groupBy("hour")
         .agg(
-            F.count(F.lit(1)).alias("events"),
+            F.count(F.lit(1)).alias("shots"),
             F.approx_count_distinct("player_id").alias("players"),
         )
         .orderBy("hour")
@@ -377,12 +465,12 @@ def job_peak(spark):
     if not agg:
         note("no rows")
         return
-    total = sum(r["events"] for r in agg)
-    peak = max(r["events"] for r in agg)
+    total = sum(r["shots"] for r in agg)
+    peak = max(r["shots"] for r in agg)
     for r in agg:
-        bar = "█" * max(1, round(36 * r["events"] / peak))
+        bar = "█" * max(1, round(36 * r["shots"] / peak))
         print(
-            f"   {r['hour']:>2}:00 {r['events']:>9,} {100.0 * r['events'] / total:>5.1f}% "
+            f"   {r['hour']:>2}:00 {r['shots']:>9,} shots {100.0 * r['shots'] / total:>5.1f}% "
             f"{bar}  ({r['players']} players)"
         )
     note("synthetic traffic: archive spans a handful of simulated days")
