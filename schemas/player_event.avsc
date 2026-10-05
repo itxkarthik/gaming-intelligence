@@ -11,7 +11,7 @@
       "type": {
         "type": "enum",
         "name": "PlayerEventType",
-        "symbols": ["LOGIN", "LOGOUT", "MATCHMAKING_START", "MATCHMAKING_FOUND", "MATCH_JOIN", "MATCH_LEAVE", "DISCONNECT", "RECONNECT", "REPORT_PLAYER", "CHAT_MESSAGE"]
+        "symbols": ["LOGIN", "MATCHMAKING_START", "MATCHMAKING_FOUND", "MATCH_JOIN", "MATCH_END", "ITEM_PURCHASE", "CHAT_MESSAGE", "REPORT_PLAYER", "DISCONNECT", "RECONNECT"]
       }
     },
     {"name": "match_id", "type": ["null", "string"], "default": null, "doc": "Associated match ID if in-match"},

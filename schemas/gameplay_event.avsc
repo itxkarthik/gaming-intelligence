@@ -2,7 +2,7 @@
   "type": "record",
   "name": "GameplayEvent",
   "namespace": "com.gaming.events",
-  "doc": "Individual action or combat event during a competitive match",
+  "doc": "One shot fired during a competitive match, with its outcome inline. Every row is exactly one trigger pull, so per-shot statistics (accuracy, reaction time) are never repeated across rows.",
   "fields": [
     {"name": "event_id", "type": "string", "doc": "Unique UUID for the event"},
     {
@@ -10,22 +10,26 @@
       "type": {
         "type": "enum",
         "name": "GameplayEventType",
-        "symbols": ["KILL", "DEATH", "DAMAGE", "HEADSHOT", "ABILITY_USE", "ITEM_PURCHASE", "MOVEMENT", "SHOT_FIRED", "RELOAD", "GRENADE_THROW"]
+        "symbols": ["SHOT"]
       }
     },
     {"name": "match_id", "type": "string", "doc": "Match identifier"},
-    {"name": "player_id", "type": "string", "doc": "Player emitting the event"},
-    {"name": "team_id", "type": "string", "doc": "Team A or Team B identifier"},
-    {"name": "target_player_id", "type": ["null", "string"], "default": null, "doc": "Target player if engagement"},
-    {"name": "weapon_id", "type": ["null", "string"], "default": null, "doc": "Weapon or ability used"},
-    {"name": "damage", "type": ["null", "float"], "default": null, "doc": "Damage dealt"},
-    {"name": "position_x", "type": "float", "doc": "Map X coordinate"},
-    {"name": "position_y", "type": "float", "doc": "Map Y coordinate"},
-    {"name": "position_z", "type": "float", "doc": "Map Z coordinate (altitude/level)"},
-    {"name": "accuracy", "type": ["null", "float"], "default": null, "doc": "Calculated shot accuracy 0.0-1.0"},
-    {"name": "distance", "type": ["null", "float"], "default": null, "doc": "Distance in meters to target"},
-    {"name": "reaction_time_ms", "type": ["null", "int"], "default": null, "doc": "Time between target visibility and shot in ms"},
-    {"name": "is_headshot", "type": "boolean", "default": false},
+    {"name": "player_id", "type": "string", "doc": "Shooter"},
+    {"name": "team_id", "type": "string", "doc": "Shooter's team: team_a or team_b"},
+    {"name": "target_player_id", "type": ["null", "string"], "default": null, "doc": "Player shot at"},
+    {"name": "weapon_id", "type": ["null", "string"], "default": null, "doc": "Weapon fired"},
+    {"name": "position_x", "type": "float", "doc": "Shooter map X coordinate"},
+    {"name": "position_y", "type": "float", "doc": "Shooter map Y coordinate"},
+    {"name": "position_z", "type": "float", "doc": "Shooter map Z coordinate (altitude/level)"},
+    {"name": "distance", "type": "float", "doc": "Distance in meters to the target"},
+    {"name": "accuracy", "type": "float", "doc": "Hit probability of this shot, 0.0-1.0"},
+    {"name": "reaction_time_ms", "type": "int", "doc": "Time between target visibility and the shot in ms"},
+    {"name": "hit", "type": "boolean", "default": false, "doc": "Shot connected"},
+    {"name": "damage", "type": ["null", "float"], "default": null, "doc": "Health removed from the target (capped at its remaining HP); null on a miss"},
+    {"name": "is_headshot", "type": "boolean", "default": false, "doc": "Hit landed on the head"},
+    {"name": "is_kill", "type": "boolean", "default": false, "doc": "Shot was the final blow; damage from other players earlier in the same life does not reset"},
+    {"name": "victim_hp_after", "type": ["null", "int"], "default": null, "doc": "Target health after the shot (0 on a kill); null on a miss"},
+    {"name": "assister_id", "type": ["null", "string"], "default": null, "doc": "On a kill: the other player who dealt the most damage (>= 40) to that life"},
     {"name": "event_time", "type": {"type": "long", "logicalType": "timestamp-millis"}, "doc": "UTC timestamp of event creation"},
     {"name": "server_id", "type": "string", "doc": "Originating game server instance"}
   ]
