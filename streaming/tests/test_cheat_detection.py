@@ -14,8 +14,9 @@ import pytest
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 
-from src.common.schemas import GAMEPLAY_EVENT_SCHEMA
-from src.jobs.cheat_detection import build_suspicion_pipeline
+from src.common.schemas import GAMEPLAY_EVENT_SCHEMA, SHOT_EVENT
+from src.jobs.cheat_detection import best_window_per_player, build_suspicion_pipeline
+from src.ml.iforest import HS_PRIOR, HS_PRIOR_HITS
 
 # Fixed event time => every synthetic event lands in one window.
 EVENT_TIME = 1_700_000_000_000
@@ -36,42 +37,44 @@ def spark():
     session.stop()
 
 
-def _event(idx, event_type, player_id, match_id, accuracy, reaction, is_headshot):
+def _shot(idx, player_id, match_id, accuracy, reaction,
+          hit=False, headshot=False, kill=False):
+    """One SHOT event exactly as the Go simulator emits it."""
     return {
         "event_id": f"e{idx:05d}",
-        "event_type": event_type,
+        "event_type": SHOT_EVENT,
         "match_id": match_id,
         "player_id": player_id,
         "team_id": "team_a",
         "target_player_id": "player_victim",
         "weapon_id": "ak47",
-        "damage": 120.0 if is_headshot else 40.0,
+        "damage": (100.0 if kill else 36.0) if hit else None,
         "position_x": 0.0,
         "position_y": 0.0,
         "position_z": 0.0,
         "accuracy": accuracy,
         "distance": 25.0,
         "reaction_time_ms": reaction,
-        "is_headshot": is_headshot,
+        "hit": hit,
+        "is_headshot": headshot,
+        "is_kill": kill,
+        "victim_hp_after": (0 if kill else 64) if hit else None,
+        "assister_id": None,
         "event_time": EVENT_TIME,
         "server_id": "server-01",
     }
 
 
-def _chain(player_id, match_id, accuracy, reaction, shots, hits, kill_hs, kills, start=0):
-    """Build one player's combat chain the way the Go simulator emits it:
-    SHOT_FIRED rows, DAMAGE rows for hits, KILL rows for kills."""
+def _chain(player_id, match_id, accuracy, reaction, shots, hits, kills, kill_hs, start=0):
+    """`shots` SHOT rows: the first `kills` are lethal (the first `kill_hs`
+    of them headshots), the next hits - kills are non-lethal hits, and the
+    rest are misses."""
+    assert kill_hs <= kills <= hits <= shots
     rows = []
-    idx = start
-    for _ in range(shots):
-        rows.append(_event(idx, "SHOT_FIRED", player_id, match_id, accuracy, reaction, False))
-        idx += 1
-    for _ in range(hits):
-        rows.append(_event(idx, "DAMAGE", player_id, match_id, accuracy, reaction, False))
-        idx += 1
-    for i in range(kills):
-        rows.append(_event(idx, "KILL", player_id, match_id, accuracy, reaction, i < kill_hs))
-        idx += 1
+    for i in range(shots):
+        kill = i < kills
+        rows.append(_shot(start + i, player_id, match_id, accuracy, reaction,
+                          hit=i < hits, headshot=i < kill_hs, kill=kill))
     return rows
 
 
@@ -87,7 +90,7 @@ def _score(spark, rows):
 
 def test_aimbot_is_flagged(spark):
     rows = _chain("p_aimbot", "m1", accuracy=0.93, reaction=85,
-                  shots=40, hits=35, kill_hs=27, kills=30)
+                  shots=40, hits=35, kills=30, kill_hs=27)
     scored = _score(spark, rows)["p_aimbot"]
 
     assert scored["total_shots"] == 40
@@ -101,7 +104,7 @@ def test_aimbot_is_flagged(spark):
 
 def test_normal_player_is_not_flagged(spark):
     rows = _chain("p_normal", "m1", accuracy=0.28, reaction=260,
-                  shots=40, hits=15, kill_hs=1, kills=10)
+                  shots=40, hits=15, kills=10, kill_hs=1)
     scored = _score(spark, rows)["p_normal"]
 
     assert scored["suspicion_score"] < 0.50, (
@@ -109,34 +112,64 @@ def test_normal_player_is_not_flagged(spark):
     )
 
 
-def test_headshot_ratio_never_exceeds_one(spark):
-    """Regression: headshots used to be counted on DAMAGE and KILL rows
-    while dividing by KILL count only — yielding ratios like 1.92 in
-    production alerts. A ratio of headshot-kills / kills is bounded by 1."""
-    rows = []
-    rows += _chain("p_allhs", "m1", accuracy=0.93, reaction=90,
-                   shots=30, hits=0, kill_hs=0, kills=0)
-    # Every DAMAGE and every KILL flagged as headshot (old bug: 60/30 = 2.0).
-    idx = 30
-    for _ in range(30):
-        rows.append(_event(idx, "DAMAGE", "p_allhs", "m1", 0.93, 90, True))
-        idx += 1
-    for _ in range(30):
-        rows.append(_event(idx, "KILL", "p_allhs", "m1", 0.93, 90, True))
-        idx += 1
+def test_every_shot_counts_once_in_averages(spark):
+    """Regression: the simulator used to emit SHOT_FIRED + DAMAGE + KILL for
+    one lethal shot, each carrying that shot's accuracy and reaction time,
+    so plain averages weighted lethal shots 3x. One SHOT row per shot makes
+    the average exact: (0.9 + 9 x 0.1) / 10 = 0.18, not 0.33."""
+    rows = [_shot(0, "p_mix", "m1", 0.9, 100, hit=True, headshot=True, kill=True)]
+    rows += [_shot(i, "p_mix", "m1", 0.1, 400) for i in range(1, 10)]
+    scored = _score(spark, rows)["p_mix"]
 
-    scored = _score(spark, rows)["p_allhs"]
-    assert scored["total_kills"] == 30
-    assert scored["headshot_ratio"] == pytest.approx(1.0, abs=1e-9), (
-        f"headshot_ratio must be <= 1.0, got {scored['headshot_ratio']}"
-    )
+    assert scored["total_shots"] == 10
+    assert scored["avg_accuracy"] == pytest.approx(0.18, abs=1e-6)
+    assert scored["avg_reaction_time"] == pytest.approx(370.0, abs=1e-6)
 
 
-def test_zero_kill_player_has_zero_ratio(spark):
-    rows = _chain("p_nokill", "m1", accuracy=0.30, reaction=250,
-                  shots=10, hits=3, kill_hs=0, kills=0)
-    scored = _score(spark, rows)["p_nokill"]
+def test_headshot_ratio_is_per_hit_and_smoothed(spark):
+    """Headshots per HIT (lethal or not), shrunk toward the population rate:
+    (headshots + HS_PRIOR * HS_PRIOR_HITS) / (hits + HS_PRIOR_HITS)."""
+    rows = _chain("p_hs", "m1", accuracy=0.5, reaction=250,
+                  shots=40, hits=20, kills=4, kill_hs=1)
+    rows += [_shot(100 + i, "p_hs", "m1", 0.5, 250, hit=True, headshot=True)
+             for i in range(4)]  # 4 non-lethal headshot hits count too
+
+    scored = _score(spark, rows)["p_hs"]
+    assert scored["total_hits"] == 24
+    assert scored["headshots"] == 5
+    assert scored["headshot_ratio"] == pytest.approx(
+        (5 + HS_PRIOR * HS_PRIOR_HITS) / (24 + HS_PRIOR_HITS), abs=1e-9)
+
+
+def test_one_lucky_headshot_is_not_a_headshot_machine(spark):
+    rows = _chain("p_lucky", "m1", accuracy=0.28, reaction=260,
+                  shots=12, hits=1, kills=1, kill_hs=1)
+    scored = _score(spark, rows)["p_lucky"]
+
+    assert scored["headshot_ratio"] < 0.40, "1/1 must not read as a 100% headshot rate"
+    assert scored["hs_score"] == 0.0
+
+
+def test_all_miss_window_scores_cleanly(spark):
+    """is_kill and is_headshot are null on misses; sums must still be 0."""
+    rows = _chain("p_miss", "m1", accuracy=0.30, reaction=250,
+                  shots=10, hits=0, kills=0, kill_hs=0)
+    scored = _score(spark, rows)["p_miss"]
 
     assert scored["total_kills"] == 0
-    assert scored["headshot_ratio"] == 0.0
+    assert scored["headshots"] == 0
+    assert scored["headshot_ratio"] == pytest.approx(HS_PRIOR, abs=1e-9)
     assert scored["suspicion_score"] < 0.50
+
+
+def test_best_window_is_the_one_with_most_shots():
+    def row(player, end, shots):
+        return {"player_id": player, "window": {"end": end}, "total_shots": shots}
+
+    picked = best_window_per_player([
+        row("a", 15, 30), row("a", 30, 6),    # newest window is the young one
+        row("b", 15, 10), row("b", 30, 10),   # tie -> newest
+    ])
+    by_player = {r["player_id"]: r for r in picked}
+    assert by_player["a"]["window"]["end"] == 15
+    assert by_player["b"]["window"]["end"] == 30

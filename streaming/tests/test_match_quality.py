@@ -34,7 +34,7 @@ def spark():
 def _kill(idx, match_id, team, offset_s):
     return {
         "event_id": f"k{idx:04d}",
-        "event_type": "KILL",
+        "event_type": "SHOT",
         "match_id": match_id,
         "player_id": f"shooter_{idx}",
         "team_id": team,
@@ -43,7 +43,8 @@ def _kill(idx, match_id, team, offset_s):
         "damage": 100.0,
         "position_x": 0.0, "position_y": 0.0, "position_z": 0.0,
         "accuracy": 0.4, "distance": 20.0, "reaction_time_ms": 250,
-        "is_headshot": False,
+        "hit": True, "is_headshot": False, "is_kill": True, "victim_hp_after": 0,
+        "assister_id": None,
         "event_time": T0 + offset_s * 1000,
         "server_id": "server-01",
     }
@@ -66,13 +67,24 @@ def _player(idx, event_type, match_id, team=None, tier=None, offset_s=0):
     }
 
 
-def _joins(n_team_a, n_team_b, tier_a="gold", tier_b="gold"):
+def _match(n_team_a, n_team_b, end_s, tier_a="gold", tier_b="gold"):
+    """A match's player_events lifecycle, like the simulator emits it.
+
+    Everyone joins at t=0, someone buys every 60 s (keeps the session open
+    across quiet stretches, as live purchases do) and MATCH_END lands at
+    end_s, so the match lasts end_s seconds.
+    """
     rows = []
     idx = 0
     for team, count in (("team_a", n_team_a), ("team_b", n_team_b)):
-        for i in range(count):
-            rows.append(_player(idx, "MATCH_JOIN", "m_test", team=team, tier=tier_a if team == "team_a" else tier_b))
+        for _ in range(count):
+            rows.append(_player(idx, "MATCH_JOIN", "m_test", team=team,
+                                tier=tier_a if team == "team_a" else tier_b))
             idx += 1
+    for offset_s in range(60, end_s, 60):
+        rows.append(_player(idx, "ITEM_PURCHASE", "m_test", offset_s=offset_s))
+        idx += 1
+    rows.append(_player(idx, "MATCH_END", "m_test", offset_s=end_s))
     return rows
 
 
@@ -91,7 +103,7 @@ def _score(spark, gameplay_rows, player_rows):
 def test_balanced_long_match_scores_high(spark):
     kills = [_kill(i, "m_test", "team_a" if i % 2 == 0 else "team_b", offset_s=i * 40)
              for i in range(10)]  # 5v5 over ~6.5 minutes
-    players = _joins(5, 5)
+    players = _match(5, 5, end_s=400)
 
     scored = _score(spark, kills, players)
 
@@ -107,8 +119,10 @@ def test_balanced_long_match_scores_high(spark):
 def test_stomped_match_scores_low(spark):
     kills = [_kill(i, "m_test", "team_a" if i < 9 else "team_b", offset_s=i * 30)
              for i in range(10)]  # 9:1 stomp over ~4.5 minutes
-    players = _joins(5, 5)
-    players.append(_player(99, "DISCONNECT", "m_test", offset_s=100))
+    players = _match(5, 5, end_s=280)
+    # player_0003 drops twice (reconnect in between): one disconnected player
+    players.append({**_player(3, "DISCONNECT", "m_test", offset_s=100), "event_id": "d1"})
+    players.append({**_player(3, "DISCONNECT", "m_test", offset_s=200), "event_id": "d2"})
 
     scored = _score(spark, kills, players)
 
@@ -123,19 +137,19 @@ def test_stomped_match_scores_low(spark):
 def test_skill_imbalance_lowers_score(spark):
     kills = [_kill(i, "m_test", "team_a" if i % 2 == 0 else "team_b", offset_s=i * 60)
              for i in range(6)]  # balanced 3v3, long duration
-    players = _joins(5, 5, tier_a="diamond", tier_b="bronze")
+    players = _match(5, 5, end_s=320, tier_a="diamond", tier_b="bronze")
 
     scored = _score(spark, kills, players)
 
     assert scored["skill_imbalance"] == pytest.approx(2.0, abs=1e-6)
-    # Perfectly balanced combat, but max tier gap: 100 - 15 - small duration term
-    assert 60.0 < scored["quality_score"] <= 85.0
+    # Perfectly balanced combat over a full-length match, max tier gap: 100 - 15
+    assert scored["quality_score"] == pytest.approx(85.0, abs=0.5)
 
 
 def test_short_match_gets_duration_penalty(spark):
     kills = [_kill(i, "m_test", "team_a" if i % 2 == 0 else "team_b", offset_s=i * 5)
-             for i in range(4)]  # all action inside a 15-second window
-    players = _joins(5, 5)
+             for i in range(4)]  # all action inside a 15-second match
+    players = _match(5, 5, end_s=15)
 
     scored = _score(spark, kills, players)
 
@@ -145,14 +159,37 @@ def test_short_match_gets_duration_penalty(spark):
 
 
 def test_session_gap_excluded_from_duration(spark):
-    """duration_s must be activity span, not session-window span (gap excluded)."""
-    # 6 alternating kills 2 minutes apart: perfectly balanced, spans 10 minutes
+    """duration_s is the match span (join -> MATCH_END), not the session window."""
     kills = [_kill(i, "m_test", "team_a" if i % 2 == 0 else "team_b", offset_s=i * 120)
-             for i in range(6)]
-    players = _joins(5, 5)
+             for i in range(6)]  # balanced, kills 2 minutes apart over 10 minutes
+    players = _match(5, 5, end_s=600)
 
     scored = _score(spark, kills, players)
 
-    expected = 5 * 120  # first->last kill activity span
-    assert scored["duration_s"] == pytest.approx(expected, abs=2)
+    assert scored["duration_s"] == pytest.approx(600, abs=2)
     assert scored["quality_score"] == pytest.approx(100.0, abs=0.5)
+
+
+def test_duration_comes_from_the_match_lifecycle_not_the_kills(spark):
+    kills = [_kill(i, "m_test", "team_a" if i % 2 == 0 else "team_b", offset_s=i * 5)
+             for i in range(4)]  # every kill inside the first 15 s ...
+    players = _match(5, 5, end_s=300)  # ... of a 5-minute match
+
+    scored = _score(spark, kills, players)
+
+    assert scored["duration_s"] == pytest.approx(300, abs=2)
+    assert scored["quality_score"] == pytest.approx(100.0, abs=0.5)
+
+
+def test_late_disconnect_does_not_score_the_match_twice(spark):
+    """A drop long after the joins stays in the match's one session (_score
+    asserts exactly one row); it used to open a second player session that
+    joined the same combat session again."""
+    kills = [_kill(i, "m_test", "team_a" if i % 2 == 0 else "team_b", offset_s=i * 60)
+             for i in range(8)]
+    players = _match(5, 5, end_s=480)
+    players.append({**_player(7, "DISCONNECT", "m_test", offset_s=470), "event_id": "late"})
+
+    scored = _score(spark, kills, players)
+
+    assert scored["disconnects"] == 1

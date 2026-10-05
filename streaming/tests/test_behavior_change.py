@@ -6,10 +6,11 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from src.jobs.behavior_change import (
-    cusum_step,
-    apply_behavior_boost,
-    load_state,
     BEHAVIOR_BOOST,
+    WARMUP_STEPS,
+    apply_behavior_boost,
+    cusum_step,
+    load_state,
 )
 
 
@@ -40,14 +41,14 @@ def test_sustained_shift_flags_once():
 
 
 def test_single_spike_does_not_flag():
-    # One outlier is absorbed by the CUSUM slack (k=0.5, h=5.0)
+    # One outlier is absorbed by the CUSUM slack (k=0.5, h=8.0)
     series = [0.28] * 40 + [0.75] + [0.28] * 5
-    state, anomalies = _run(series)
+    _, anomalies = _run(series)
     assert anomalies == 0, "one-shot spike must accumulate < h evidence"
 
 
 def test_cusum_state_roundtrip():
-    state, anomalies = _run([0.10] * 5 + [0.45] * 15)
+    state, _ = _run([0.10, 0.12] * 6 + [0.45] * 8)
     restored = load_state({k: str(v) for k, v in state.items()})
     assert restored == state
     assert restored["n"] == 20
@@ -58,3 +59,16 @@ def test_behavior_boost_clamps_and_applies():
     assert apply_behavior_boost(0.65, True) == round(0.65 + BEHAVIOR_BOOST, 4)
     assert apply_behavior_boost(0.95, True) == 1.0  # clamped at 1.0
     assert apply_behavior_boost(0, True) == BEHAVIOR_BOOST
+
+
+def test_no_verdict_while_the_baseline_warms_up():
+    # A jump inside the warm-up only widens the baseline; it is never judged.
+    _, anomalies = _run([0.28, 0.29] + [0.60] * (WARMUP_STEPS - 2))
+    assert anomalies == 0
+
+
+def test_noisy_but_stable_player_never_flags():
+    # Batch means of a few shots scatter widely around a steady skill level.
+    series = [0.28, 0.36, 0.21, 0.31, 0.25, 0.34, 0.19, 0.30, 0.27, 0.33] * 10
+    _, anomalies = _run(series)
+    assert anomalies == 0
