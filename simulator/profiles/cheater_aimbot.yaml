@@ -1,7 +1,9 @@
+# Aim-assist cheat: inhuman accuracy, headshot rate and reaction time on a
+# low-rank account.
 name: "Aimbot Cheater"
+skill_tier: "silver"
 account_age_days: 45
 games_played: 120
-skill_tier: "silver"  # Low apparent account rank
 accuracy:
   mean: 0.93
   std: 0.03
@@ -11,15 +13,8 @@ headshot_ratio:
 reaction_time_ms:
   mean: 85
   std: 10
-kills_per_minute:
-  mean: 4.5
-  std: 0.80
-deaths_per_minute:
-  mean: 0.2
-  std: 0.10
-movement:
-  pattern: "natural"  # Movement might still look normal
-  speed_variance: 0.15
-item_purchase_delay_ms:
-  mean: 3000
-  std: 1000
+activity:
+  chat_per_minute: 0.1
+  reported_per_minute: 0.6
+  disconnects_per_hour: 2
+  purchases_per_minute: 1.0

@@ -1,7 +1,8 @@
+# Median player of the population.
 name: "Normal Gold Player"
+skill_tier: "gold"
 account_age_days: 500
 games_played: 1200
-skill_tier: "gold"
 accuracy:
   mean: 0.28
   std: 0.08
@@ -11,15 +12,8 @@ headshot_ratio:
 reaction_time_ms:
   mean: 260
   std: 50
-kills_per_minute:
-  mean: 0.8
-  std: 0.25
-deaths_per_minute:
-  mean: 0.7
-  std: 0.20
-movement:
-  pattern: "natural"
-  speed_variance: 0.15
-item_purchase_delay_ms:
-  mean: 3000
-  std: 1000
+activity:
+  chat_per_minute: 0.4
+  reported_per_minute: 0.02
+  disconnects_per_hour: 2
+  purchases_per_minute: 1.0

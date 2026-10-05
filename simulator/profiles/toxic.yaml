@@ -1,7 +1,8 @@
+# Average aim, bad behaviour: chats a lot, gets reported, rage-quits.
 name: "Toxic Player"
+skill_tier: "gold"
 account_age_days: 600
 games_played: 2500
-skill_tier: "gold"
 accuracy:
   mean: 0.25
   std: 0.08
@@ -11,20 +12,8 @@ headshot_ratio:
 reaction_time_ms:
   mean: 280
   std: 60
-kills_per_minute:
-  mean: 0.7
-  std: 0.30
-deaths_per_minute:
-  mean: 0.8
-  std: 0.30
-movement:
-  pattern: "natural"
-  speed_variance: 0.20
-toxicity:
-  team_damage_ratio: 0.15  # Deals friendly fire damage
-  chat_frequency: "high"
-  report_frequency: 0.40  # Reported in ~40% of played matches
-  early_quit_ratio: 0.25  # Frequent rage quits
-item_purchase_delay_ms:
-  mean: 4000
-  std: 2000
+activity:
+  chat_per_minute: 3.0
+  reported_per_minute: 0.5
+  disconnects_per_hour: 8
+  purchases_per_minute: 1.0

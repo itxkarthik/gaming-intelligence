@@ -1,5 +1,7 @@
+# Experienced player on a fresh low-rank account. The young account age and
+# low game count are what smurf_detection keys on.
 name: "Smurf Account"
-skill_tier: "bronze"  # New / low-rank account
+skill_tier: "bronze"
 account_age_days: 3
 games_played: 12
 accuracy:
@@ -11,16 +13,8 @@ headshot_ratio:
 reaction_time_ms:
   mean: 160
   std: 25
-kills_per_minute:
-  mean: 2.5
-  std: 0.50
-deaths_per_minute:
-  mean: 0.3
-  std: 0.10
-movement:
-  pattern: "precise"  # Advanced movement mechanics in low-tier lobbies
-  speed_variance: 0.08
-win_rate: 0.92
-item_purchase_delay_ms:
-  mean: 1000
-  std: 300
+activity:
+  chat_per_minute: 0.5
+  reported_per_minute: 0.1
+  disconnects_per_hour: 1
+  purchases_per_minute: 1.0
