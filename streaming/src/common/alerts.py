@@ -1,67 +1,81 @@
-"""Alert emission helpers shared by streaming jobs (dedup + dual sink).
+"""Alert emission shared by the streaming jobs.
 
 Every alert goes to BOTH:
-  - Redis `alerts:recent`  → fast path for the REST API (Phase 2 behavior)
-  - Kafka `alerts` topic   → transport for the Go alert engine (Phase 4):
-    dedup/rate-limit layer, PostgreSQL history, webhooks, WebSocket fan-out
+  - Redis `alerts:recent` -> fast path for the REST API
+  - Kafka alerts topic    -> transport for the Go alert engine (second dedup
+    layer, PostgreSQL history, webhooks, WebSocket fan-out)
 """
 
 import json
-import sys
+import time
 
-from src.common.config import KAFKA_BOOTSTRAP_SERVERS
+from src.common.config import KAFKA_BOOTSTRAP_SERVERS, KAFKA_TOPICS
+from src.common.runtime import warn
 
-DEFAULT_ALERT_TTL_SECONDS = 300
-ALERTS_TOPIC = "alerts"
+ALERTS_TOPIC = KAFKA_TOPICS["alerts"]
+DEDUP_TTL_SECONDS = 300
+RECENT_KEY = "alerts:recent"
+RECENT_MAX = 100
 
 
-def should_emit_alert(redis_client, alert_type, entity_id,
-                      ttl_seconds=DEFAULT_ALERT_TTL_SECONDS):
-    """True at most once per (alert_type, entity) per TTL window.
+def make_alert(alert_type, severity, entity_type, entity_id, message, details):
+    """Payload matching schemas/alert.avsc (details values must be strings)."""
+    now_ms = int(time.time() * 1000)
+    return {
+        "alert_id": f"{alert_type.lower()}_{entity_id}_{now_ms}",
+        "alert_type": alert_type,
+        "severity": severity,
+        "entity_type": entity_type,
+        "entity_id": entity_id,
+        "message": message,
+        "details": details,
+        "timestamp": now_ms,
+    }
 
-    Without this, every micro-batch re-alerts the same degraded server or
-    flagged player and floods the capped alerts:recent list. Backed by
-    Redis SET NX EX — atomic, no extra round trips.
+
+def _dedup_key(payload):
+    return f"alert:dedup:{payload['alert_type']}:{payload['entity_id']}"
+
+
+class AlertBatch:
+    """Alerts raised during one micro-batch.
+
+    emit() claims the dedup key (SET NX EX: at most one alert per type and
+    entity per TTL, or every micro-batch would re-alert the same entity) and
+    pushes the Redis copy. flush() publishes everything to Kafka in ONE Spark
+    write; a per-alert write would launch a distributed job per alert.
+
+    A failed Kafka write never kills the micro-batch. It releases the dedup
+    claims, so the next batch that still sees the condition publishes again
+    instead of the alert staying muted for the TTL; the Redis copy already
+    landed (and is pushed once more on that retry).
     """
-    key = f"alert:dedup:{alert_type}:{entity_id}"
-    return bool(redis_client.set(key, "1", nx=True, ex=ttl_seconds))
 
+    def __init__(self, r):
+        self.r = r
+        self.pending = []
 
-def emit_alert(redis_client, payload,
-               ttl_seconds=DEFAULT_ALERT_TTL_SECONDS):
-    """Dedup gate + Redis write for one alert.
+    def emit(self, payload):
+        if not self.r.set(_dedup_key(payload), "1", nx=True, ex=DEDUP_TTL_SECONDS):
+            return
+        pipe = self.r.pipeline()
+        pipe.lpush(RECENT_KEY, json.dumps(payload))
+        pipe.ltrim(RECENT_KEY, 0, RECENT_MAX - 1)
+        pipe.execute()
+        self.pending.append(payload)
 
-    Returns the payload when it was emitted (collect it in the batch's
-    pending list), or None when deduped. Kafka publication happens ONCE per
-    micro-batch via flush_alerts_to_kafka — a per-alert Spark write would
-    launch a separate distributed job for every single alert.
-    """
-    if not should_emit_alert(redis_client, payload["alert_type"],
-                             payload["entity_id"], ttl_seconds):
-        return None
-
-    raw = json.dumps(payload)
-    redis_client.lpush("alerts:recent", raw)
-    redis_client.ltrim("alerts:recent", 0, 99)  # Keep latest 100 alerts
-    return payload
-
-
-def flush_alerts_to_kafka(spark, payloads):
-    """Publish all alerts collected during one micro-batch in a SINGLE job.
-
-    Kafka failures must never kill the micro-batch: they are logged and the
-    Redis copies already landed, so the API keeps serving.
-    """
-    if not payloads:
-        return
-    try:
-        spark.createDataFrame([(json.dumps(p),) for p in payloads],
-                              schema="value string") \
-            .write \
-            .format("kafka") \
-            .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP_SERVERS) \
-            .option("topic", ALERTS_TOPIC) \
-            .save()
-    except Exception as e:
-        print(f"[WARN] alert Kafka flush failed ({len(payloads)} alerts): {e}",
-              file=sys.stderr)
+    def flush(self, spark):
+        if not self.pending:
+            return
+        pending, self.pending = self.pending, []
+        try:
+            spark.createDataFrame([(json.dumps(p),) for p in pending],
+                                  schema="value string") \
+                .write \
+                .format("kafka") \
+                .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP_SERVERS) \
+                .option("topic", ALERTS_TOPIC) \
+                .save()
+        except Exception as e:  # noqa: BLE001 - any Spark/Kafka failure; the batch survives
+            warn(f"alert Kafka flush failed ({len(pending)} alerts): {e}")
+            self.r.delete(*(_dedup_key(p) for p in pending))
