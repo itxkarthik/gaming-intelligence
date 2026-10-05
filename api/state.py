@@ -10,6 +10,7 @@ import time).
 """
 
 import asyncio
+import itertools
 import json
 import logging
 import os
@@ -438,7 +439,7 @@ def _throughput_sampler():
                     while _samples and _samples[0]["ts"] < cutoff:
                         _samples.pop(0)
                 streak.ok()
-            except Exception as e:  # kafka-python raises many unrelated types
+            except Exception as e:  # noqa: BLE001 - kafka-python raises many unrelated types
                 streak.fail(e)
                 if consumer is not None:
                     _close_quietly(consumer)
@@ -452,7 +453,7 @@ def _throughput_sampler():
 def _close_quietly(consumer: KafkaConsumer):
     try:
         consumer.close()
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - best-effort close on shutdown
         log.debug("kafka consumer close: %r", e)
 
 
@@ -525,7 +526,7 @@ def throughput_timeline() -> list[dict[str, Any]]:
     with _samples_lock:
         samples = list(_samples)
     out: list[dict[str, Any]] = []
-    for s0, s1 in zip(samples, samples[1:]):
+    for s0, s1 in itertools.pairwise(samples):
         rate = _input_rate(s0, s1)
         if rate is not None:
             out.append({"time": clock(s1["ts"]), "eps": rate})
@@ -579,7 +580,7 @@ class Broadcaster:
                 raise RuntimeError("publisher returned")
             except asyncio.CancelledError:
                 raise
-            except Exception as e:
+            except Exception as e:  # noqa: BLE001 - a publisher must survive any render error
                 self._streak.fail(e, traceback=not isinstance(e, UNAVAILABLE_ERRORS))
             if time.monotonic() - started > 60:
                 backoff = 1.0                    # it had been healthy for a while
@@ -840,7 +841,7 @@ class EventFeed:
                     records.sort(key=lambda r: (r.timestamp or 0, r.offset))
                     for rec in records:
                         self._dispatch(rec)
-            except Exception as e:  # kafka-python raises many unrelated types
+            except Exception as e:  # noqa: BLE001 - kafka-python raises many unrelated types
                 streak.fail(e)
                 self._stop.wait(3.0)
             finally:
