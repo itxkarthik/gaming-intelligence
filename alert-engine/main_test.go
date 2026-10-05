@@ -1,27 +1,36 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 )
 
 // ─── fakeGate ──────────────────────────────────────────────────────────────
 
+// fakeGate is an in-memory Gate with the same idempotent semantics as
+// redisGate (TTL is not modelled). Setting err makes every call fail.
 type fakeGate struct {
-	seen map[string]bool
+	holders map[string]string
+	err     error
 }
 
 func newFakeGate() *fakeGate {
-	return &fakeGate{seen: map[string]bool{}}
+	return &fakeGate{holders: map[string]string{}}
 }
 
-func (g *fakeGate) First(key string, _ time.Duration) bool {
-	if g.seen[key] {
-		return false
+func (g *fakeGate) Admit(_ context.Context, key, alertID string, _ time.Duration) (bool, error) {
+	if g.err != nil {
+		return false, g.err
 	}
-	g.seen[key] = true
-	return true
+	holder, held := g.holders[key]
+	if !held {
+		g.holders[key] = alertID
+		return true, nil
+	}
+	return holder == alertID, nil
 }
 
 // ─── classify ──────────────────────────────────────────────────────────────
@@ -56,17 +65,20 @@ func TestClassifyDefaultsInvalidSeverity(t *testing.T) {
 // ─── parseAlert ────────────────────────────────────────────────────────────
 
 func TestParseAlertValid(t *testing.T) {
-	raw, _ := json.Marshal(Alert{
+	raw, err := json.Marshal(Alert{
 		AlertID: "cheat_player_0001_1", AlertType: "CHEAT_DETECTED",
 		Severity: "CRITICAL", EntityType: "PLAYER", EntityID: "player_0001",
 		Message: "m", Timestamp: 1759000000000,
 		Details: map[string]any{"suspicion": "0.91"},
 	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	a, err := parseAlert(raw)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if a.EntityID != "player_0001" || a.AlertType != "CHEAT_DETECTED" {
+	if a.EntityID != "player_0001" || a.AlertType != "CHEAT_DETECTED" || a.Timestamp != 1759000000000 {
 		t.Errorf("parsed wrong fields: %+v", a)
 	}
 }
@@ -78,15 +90,19 @@ func TestParseAlertRejectsMalformed(t *testing.T) {
 }
 
 func TestParseAlertRejectsMissingRequiredFields(t *testing.T) {
-	cases := []string{
-		`{"alert_id":"a","entity_id":"e"}`,   // no alert_type
-		`{"alert_type":"T","entity_id":"e"}`, // no alert_id
-		`{"alert_id":"a","alert_type":"T"}`,  // no entity_id
+	cases := map[string]string{
+		"no alert_type":  `{"alert_id":"a","entity_type":"PLAYER","entity_id":"e"}`,
+		"no alert_id":    `{"alert_type":"T","entity_type":"PLAYER","entity_id":"e"}`,
+		"no entity_id":   `{"alert_id":"a","alert_type":"T","entity_type":"PLAYER"}`,
+		"no entity_type": `{"alert_id":"a","alert_type":"T","entity_id":"e"}`,
+		"empty object":   `{}`,
 	}
-	for _, raw := range cases {
-		if _, err := parseAlert([]byte(raw)); err == nil {
-			t.Errorf("want error for %s, got nil", raw)
-		}
+	for name, raw := range cases {
+		t.Run(name, func(t *testing.T) {
+			if _, err := parseAlert([]byte(raw)); err == nil {
+				t.Errorf("want error for %s, got nil", raw)
+			}
+		})
 	}
 }
 
@@ -106,52 +122,95 @@ func TestKeyFormats(t *testing.T) {
 
 func TestShouldForwardFirstTime(t *testing.T) {
 	g := newFakeGate()
-	a := Alert{AlertType: "CHEAT_DETECTED", EntityType: "PLAYER", EntityID: "p1"}
-	if !shouldForward(g, a, 5*time.Minute, 5*time.Minute) {
+	a := Alert{AlertID: "a1", AlertType: "CHEAT_DETECTED", EntityType: "PLAYER", EntityID: "p1"}
+	if !shouldForward(context.Background(), g, a, 5*time.Minute, 5*time.Minute) {
 		t.Error("first alert must forward")
 	}
 }
 
-func TestShouldForwardDeduplicatesSameAlert(t *testing.T) {
+func TestShouldForwardDeduplicatesSameTypeAndEntity(t *testing.T) {
 	g := newFakeGate()
-	a := Alert{AlertType: "CHEAT_DETECTED", EntityType: "PLAYER", EntityID: "p1"}
-	shouldForward(g, a, time.Minute, time.Minute)
-	if shouldForward(g, a, time.Minute, time.Minute) {
-		t.Error("duplicate (type+entity) must be suppressed")
+	first := Alert{AlertID: "a1", AlertType: "CHEAT_DETECTED", EntityType: "PLAYER", EntityID: "p1"}
+	repeat := first
+	repeat.AlertID = "a2"
+	shouldForward(context.Background(), g, first, time.Minute, time.Minute)
+	if shouldForward(context.Background(), g, repeat, time.Minute, time.Minute) {
+		t.Error("new alert with duplicate (type+entity) must be suppressed")
 	}
 }
 
 func TestShouldForwardRateLimitsAcrossTypes(t *testing.T) {
 	g := newFakeGate()
-	first := Alert{AlertType: "CHEAT_DETECTED", EntityType: "PLAYER", EntityID: "p1"}
-	second := Alert{AlertType: "BEHAVIOR_ANOMALY", EntityType: "PLAYER", EntityID: "p1"}
-	shouldForward(g, first, time.Minute, time.Minute)
+	first := Alert{AlertID: "a1", AlertType: "CHEAT_DETECTED", EntityType: "PLAYER", EntityID: "p1"}
+	second := Alert{AlertID: "a2", AlertType: "BEHAVIOR_ANOMALY", EntityType: "PLAYER", EntityID: "p1"}
+	shouldForward(context.Background(), g, first, time.Minute, time.Minute)
 	// Same entity, different type: dedup key passes but rate limit blocks —
 	// "max 1 alert per player per 5 min".
-	if shouldForward(g, second, time.Minute, time.Minute) {
+	if shouldForward(context.Background(), g, second, time.Minute, time.Minute) {
 		t.Error("second alert for same entity within window must be rate limited")
 	}
 }
 
 func TestShouldForwardIndependentEntities(t *testing.T) {
 	g := newFakeGate()
-	a1 := Alert{AlertType: "CHEAT_DETECTED", EntityType: "PLAYER", EntityID: "p1"}
-	a2 := Alert{AlertType: "CHEAT_DETECTED", EntityType: "PLAYER", EntityID: "p2"}
-	if !shouldForward(g, a1, time.Minute, time.Minute) {
+	a1 := Alert{AlertID: "a1", AlertType: "CHEAT_DETECTED", EntityType: "PLAYER", EntityID: "p1"}
+	a2 := Alert{AlertID: "a2", AlertType: "CHEAT_DETECTED", EntityType: "PLAYER", EntityID: "p2"}
+	if !shouldForward(context.Background(), g, a1, time.Minute, time.Minute) {
 		t.Error("p1 must forward")
 	}
-	if !shouldForward(g, a2, time.Minute, time.Minute) {
+	if !shouldForward(context.Background(), g, a2, time.Minute, time.Minute) {
 		t.Error("p2 must forward independently of p1")
 	}
 }
 
 func TestShouldForwardServerEntity(t *testing.T) {
 	g := newFakeGate()
-	a := Alert{AlertType: "SERVER_DEGRADED", EntityType: "SERVER", EntityID: "eu-central-1"}
-	if !shouldForward(g, a, time.Minute, time.Minute) {
+	a := Alert{AlertID: "s1", AlertType: "SERVER_DEGRADED", EntityType: "SERVER", EntityID: "eu-central-1"}
+	b := a
+	b.AlertID = "s2"
+	if !shouldForward(context.Background(), g, a, time.Minute, time.Minute) {
 		t.Error("server alert must forward")
 	}
-	if shouldForward(g, a, time.Minute, time.Minute) {
+	if shouldForward(context.Background(), g, b, time.Minute, time.Minute) {
 		t.Error("server alert must dedup within window")
+	}
+}
+
+// TestShouldForwardIdempotentGate covers at-least-once redelivery: the same
+// alert_id passing the gate again is let through, a different alert for the
+// same keys is not.
+func TestShouldForwardIdempotentGate(t *testing.T) {
+	original := Alert{AlertID: "a1", AlertType: "CHEAT_DETECTED", EntityType: "PLAYER", EntityID: "p1"}
+	otherSameKeys := original
+	otherSameKeys.AlertID = "a2"
+	otherTypeSameEntity := Alert{AlertID: "a3", AlertType: "SMURF_DETECTED", EntityType: "PLAYER", EntityID: "p1"}
+
+	steps := []struct {
+		name  string
+		alert Alert
+		want  bool
+	}{
+		{"first sighting forwards", original, true},
+		{"different alert, same type+entity, suppressed", otherSameKeys, false},
+		{"redelivery of same alert_id forwards", original, true},
+		{"different type, same entity, rate limited", otherTypeSameEntity, false},
+		{"second redelivery still forwards", original, true},
+	}
+	g := newFakeGate()
+	for _, s := range steps {
+		if got := shouldForward(context.Background(), g, s.alert, time.Minute, time.Minute); got != s.want {
+			t.Errorf("%s: shouldForward(%s) = %v, want %v", s.name, s.alert.AlertID, got, s.want)
+		}
+	}
+}
+
+func TestShouldForwardFailsOpenOnGateError(t *testing.T) {
+	g := newFakeGate()
+	g.err = errors.New("redis: connection refused")
+	a := Alert{AlertID: "a1", AlertType: "CHEAT_DETECTED", EntityType: "PLAYER", EntityID: "p1"}
+	for i := range 2 {
+		if !shouldForward(context.Background(), g, a, time.Minute, time.Minute) {
+			t.Errorf("call %d: gate error must fail open (forward)", i+1)
+		}
 	}
 }
