@@ -1,40 +1,33 @@
 """Economy Analytics Streaming Pipeline.
 
-Two independent sliding-window queries (no join needed):
-  1. weapon popularity — KILL share per weapon over the last 60s (30s slide)
-  2. buy patterns      — ITEM_PURCHASE counts + spend per weapon, same window
+Two independent sliding-window queries (60 s windows, 30 s slide):
+  1. weapon popularity: share of kills per weapon
+  2. buy patterns:      ITEM_PURCHASE count per weapon and total spend
 
-Results land in Redis under `economy:*` guarded by window_end so replays are
-idempotent, plus a Parquet archive for the Phase 6 batch analysis.
+Each completed window replaces `economy:weapons` / `economy:purchases` (and
+their `:info` hashes) in one transaction, guarded by window_end so replays
+and out-of-order windows never regress the served state. Both queries also
+archive to Parquet for the batch analysis.
 """
 
-import sys
 import os
 
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
-
-from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 
-from src.common.config import (
-    KAFKA_BOOTSTRAP_SERVERS,
-    KAFKA_TOPICS,
-    KAFKA_STARTING_OFFSETS,
-    REDIS_HOST,
-    REDIS_PORT,
-    CHECKPOINT_DIR
-)
-from src.common.schemas import parse_gameplay_stream, parse_player_stream
+from src.common.config import CHECKPOINT_DIR, DEFAULT_PROCESSING_TIME, KAFKA_TOPICS
+from src.common.runtime import kafka_source, redis_client, warn
+from src.common.schemas import parse_stream
 from src.common.sinks import safe_parquet_archive
 
 WINDOW_DURATION = "60 seconds"
 SLIDE_DURATION = "30 seconds"
+WATERMARK = "30 seconds"
 
 
 def summarise_counts(counts):
-    """{weapon: count} -> {weapon: (count, share_pct)} with shares summing ~100.
+    """{weapon: count} -> {weapon: (count, share_pct)}, largest first.
 
-    Pure — unit-testable.
+    Pure, unit-testable.
     """
     total = sum(counts.values())
     if total == 0:
@@ -45,163 +38,97 @@ def summarise_counts(counts):
     }
 
 
-def _window_end_ms(row):
-    return int(row["window"].end.timestamp() * 1000)
+def group_windows(rows, count_col, spend_col=None):
+    """Window rows (one per weapon) -> {window_end: {"window", "counts", "spend"}}."""
+    windows = {}
+    for row in rows:
+        end = row["window"]["end"]
+        bucket = windows.setdefault(end, {"window": row["window"], "counts": {}, "spend": 0})
+        weapon = row["weapon_id"]
+        bucket["counts"][weapon] = bucket["counts"].get(weapon, 0) + int(row[count_col])
+        if spend_col is not None:
+            bucket["spend"] += int(row[spend_col] or 0)  # sum() is null when every cost is null
+    return windows
 
 
-def _store_window(r, prefix, row, counts, extra_info):
-    """Write one completed window if it is newer than what Redis already has."""
-    end_ms = _window_end_ms(row)
-    current = int(r.hget(f"{prefix}:info", "window_end_ms") or 0)
-    if end_ms <= current:
-        return False  # replay or out-of-order window — keep serving state stable
+def store_window(r, prefix, window, counts, extra_info):
+    """Replace the served window if this one is newer; False when skipped."""
+    end_ms = int(window["end"].timestamp() * 1000)
+    if end_ms <= int(r.hget(f"{prefix}:info", "window_end_ms") or 0):
+        return False
 
     summary = summarise_counts(counts)
-    r.delete(prefix)
-    for weapon, (count, share) in summary.items():
-        r.hset(prefix, mapping={weapon: f"{count}:{share}"})
     info = {
         "window_end_ms": str(end_ms),
-        "window_end": str(row["window"].end),
+        "window_end": str(window["end"]),
         "total": str(sum(counts.values())),
         "top_weapon": next(iter(summary), ""),
+        **extra_info,
     }
-    info.update(extra_info)
-    r.hset(f"{prefix}:info", mapping=info)
+    pipe = r.pipeline(transaction=True)
+    pipe.delete(prefix)
+    if summary:
+        pipe.hset(prefix, mapping={w: f"{count}:{share}" for w, (count, share) in summary.items()})
+    pipe.hset(f"{prefix}:info", mapping=info)
+    pipe.execute()
     return True
 
 
 def write_kill_windows(batch_df, batch_id):
-    """Weapon popularity from completed sliding windows."""
     if batch_df.isEmpty():
         return
-
-    import redis
-
     try:
-        r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=0, decode_responses=True)
-        by_window = {}
-        for row in batch_df.collect():
-            end_ms = _window_end_ms(row)
-            bucket = by_window.setdefault(end_ms, {"row": row, "counts": {}})
-            bucket["counts"][row["weapon_id"]] = bucket["counts"].get(row["weapon_id"], 0) + int(row["kills"])
-
-        for bucket in by_window.values():
-            _store_window(r, "economy:weapons", bucket["row"],
-                          bucket["counts"], {"kind": "kill_share"})
-    except Exception as e:
-        print(f"[WARN] economy kills batch {batch_id}: {e}", file=sys.stderr)
-
+        r = redis_client()
+        for _, bucket in sorted(group_windows(batch_df.collect(), "kills").items()):
+            store_window(r, "economy:weapons", bucket["window"], bucket["counts"],
+                         {"kind": "kill_share"})
+    except Exception as e:  # noqa: BLE001 - keep the stream alive; next batch retries
+        warn(f"economy kills batch {batch_id}: {e}")
     safe_parquet_archive(batch_df, "economy_weapon_kills", batch_id)
 
 
 def write_purchase_windows(batch_df, batch_id):
-    """Item purchase patterns (count + spend) from completed windows."""
     if batch_df.isEmpty():
         return
-
-    import redis
-
     try:
-        r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=0, decode_responses=True)
-        by_window = {}
-        for row in batch_df.collect():
-            end_ms = _window_end_ms(row)
-            bucket = by_window.setdefault(end_ms, {"row": row, "counts": {}})
-            bucket["counts"][row["weapon_id"]] = bucket["counts"].get(row["weapon_id"], 0) + int(row["purchases"])
-
-        for bucket in by_window.values():
-            spend = int(bucket["row"]["total_spend"] or 0)  # F.sum is NULL when all costs are null
-            _store_window(r, "economy:purchases", bucket["row"],
-                          bucket["counts"], {"kind": "purchase_count",
-                                             "total_spend": str(spend)})
-    except Exception as e:
-        print(f"[WARN] economy purchases batch {batch_id}: {e}", file=sys.stderr)
-
+        r = redis_client()
+        windows = group_windows(batch_df.collect(), "purchases", "total_spend")
+        for _, bucket in sorted(windows.items()):
+            store_window(r, "economy:purchases", bucket["window"], bucket["counts"],
+                         {"kind": "purchase_count", "total_spend": str(bucket["spend"])})
+    except Exception as e:  # noqa: BLE001 - keep the stream alive; next batch retries
+        warn(f"economy purchases batch {batch_id}: {e}")
     safe_parquet_archive(batch_df, "economy_purchases", batch_id)
 
 
-def _kafka_stream(spark, topic):
-    return spark.readStream \
-        .format("kafka") \
-        .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP_SERVERS) \
-        .option("subscribe", topic) \
-        .option("startingOffsets", KAFKA_STARTING_OFFSETS) \
-        .option("failOnDataLoss", "false") \
-        .load()
+def _sliding(df):
+    return df.withWatermark("event_timestamp", WATERMARK) \
+        .groupBy(F.window("event_timestamp", WINDOW_DURATION, SLIDE_DURATION), "weapon_id")
+
+
+def _start(df, writer, checkpoint):
+    return df.writeStream \
+        .outputMode("append") \
+        .foreachBatch(writer) \
+        .option("checkpointLocation", os.path.join(CHECKPOINT_DIR, checkpoint)) \
+        .trigger(processingTime=DEFAULT_PROCESSING_TIME) \
+        .start()
 
 
 def start_queries(spark):
-    queries = []
+    kills = parse_stream(kafka_source(spark, KAFKA_TOPICS["gameplay"]), "gameplay") \
+        .filter(F.col("is_kill"))
+    kill_windows = _sliding(kills).agg(F.count(F.lit(1)).alias("kills"))
 
-    # 1. Weapon popularity from kills
-    kill_windows = parse_gameplay_stream(_kafka_stream(spark, KAFKA_TOPICS["gameplay"])) \
-        .filter(F.col("event_type") == "KILL") \
-        .withWatermark("event_timestamp", "30 seconds") \
-        .groupBy(
-            F.window("event_timestamp", WINDOW_DURATION, SLIDE_DURATION),
-            "weapon_id",
-        ) \
-        .agg(F.count(F.lit(1)).alias("kills"))
-
-    queries.append(
-        kill_windows.writeStream \
-            .outputMode("append") \
-            .foreachBatch(write_kill_windows) \
-            .option("checkpointLocation", os.path.join(CHECKPOINT_DIR, "economy_kills")) \
-            .trigger(processingTime="5 seconds") \
-            .start()
-    )
-
-    # 2. Buy patterns from ITEM_PURCHASE events
-    purchase_windows = parse_player_stream(_kafka_stream(spark, KAFKA_TOPICS["player"])) \
+    purchases = parse_stream(kafka_source(spark, KAFKA_TOPICS["player"]), "player") \
         .filter(F.col("event_type") == "ITEM_PURCHASE") \
-        .withWatermark("event_timestamp", "30 seconds") \
-        .groupBy(
-            F.window("event_timestamp", WINDOW_DURATION, SLIDE_DURATION),
-            F.col("metadata")["weapon_id"].alias("weapon_id"),
-        ) \
-        .agg(
-            F.count(F.lit(1)).alias("purchases"),
-            F.sum(F.col("metadata")["cost"].cast("int")).alias("total_spend"),
-        )
-
-    queries.append(
-        purchase_windows.writeStream \
-            .outputMode("append") \
-            .foreachBatch(write_purchase_windows) \
-            .option("checkpointLocation", os.path.join(CHECKPOINT_DIR, "economy_purchases")) \
-            .trigger(processingTime="5 seconds") \
-            .start()
+        .withColumn("weapon_id", F.col("metadata")["weapon_id"])
+    purchase_windows = _sliding(purchases).agg(
+        F.count(F.lit(1)).alias("purchases"),
+        F.sum(F.col("metadata")["cost"].cast("int")).alias("total_spend"),
     )
 
-    # Console view for demos: latest kill-popularity rows as they complete
-    queries.append(
-        kill_windows.select("window", "weapon_id", "kills") \
-            .writeStream \
-            .outputMode("append") \
-            .format("console") \
-            .option("truncate", "false") \
-            .trigger(processingTime="10 seconds") \
-            .start()
-    )
-
-    return queries
-
-
-def main():
-    spark = SparkSession.builder \
-        .appName("Gaming-EconomyAnalytics") \
-        .config("spark.sql.shuffle.partitions", "4") \
-        .getOrCreate()
-    spark.sparkContext.setLogLevel("WARN")
-
-    print(f"Connecting to Kafka at: {KAFKA_BOOTSTRAP_SERVERS}")
-    print(f"Subscribing to topics: {KAFKA_TOPICS['gameplay']} (kills), {KAFKA_TOPICS['player']} (purchases)")
-    start_queries(spark)
-    print("Economy Analytics streaming pipelines started.")
-    spark.streams.awaitAnyTermination()
-
-
-if __name__ == "__main__":
-    main()
+    return [
+        _start(kill_windows, write_kill_windows, "economy_kills"),
+        _start(purchase_windows, write_purchase_windows, "economy_purchases"),
+    ]
