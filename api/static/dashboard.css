@@ -300,6 +300,13 @@ code {
 .status-marker.live {
   animation: pulse-step 1.5s steps(2, start) infinite;
 }
+/* Stream indicator states (base.html follows the Datastar stream). */
+.telemetry-badge.idle { color: var(--text-dim); }
+.telemetry-badge.idle .status-marker { background: var(--text-dim); }
+.telemetry-badge.warn { color: var(--warn); }
+.telemetry-badge.warn .status-marker { background: var(--warn); }
+.telemetry-badge.bad { color: var(--bad); }
+.telemetry-badge.bad .status-marker { background: var(--bad); }
 @keyframes pulse-step {
   0%, 100% { opacity: 1; }
   50% { opacity: 0.2; }

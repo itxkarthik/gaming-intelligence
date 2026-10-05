@@ -6,8 +6,10 @@ events pushed over SSE from this module. One long-lived stream per view,
 opened by `data-init="@get('/sse/<view>')"` in the page.
 
 Data sources are shared process state (state.py): the Kafka EventFeed fan-out
-for the live stream, the offset sampler for KPIs, Redis for live entities,
-PostgreSQL for alert history.
+for the live stream, the offset sampler for KPIs, the shared async Redis
+readers for live entities, the engine alert log (alerts:stream) and
+PostgreSQL for alert history. Fragment renderers are pure functions of the
+data they are given; the same renderer feeds the initial page and SSE.
 """
 
 import asyncio
@@ -15,23 +17,21 @@ import html
 import json
 import logging
 import os
-import time
-from typing import Any, Dict, List, Optional
-
-from fastapi import APIRouter, Request
-from fastapi.templating import Jinja2Templates
-import redis.asyncio as aioredis
+from typing import Any
+from urllib.parse import urlencode
 
 from datastar_py import ServerSentEventGenerator as SSE
 from datastar_py.consts import ElementPatchMode as PatchMode
 from datastar_py.fastapi import DatastarResponse
+from fastapi import APIRouter, HTTPException, Request
+from fastapi.templating import Jinja2Templates
 
 import state
-from state import _float, get_redis_client
+from state import as_float
 
-logger = logging.getLogger(__name__)
+log = logging.getLogger("api.dashboard")
 
-router = APIRouter()
+router = APIRouter(include_in_schema=False)
 templates = Jinja2Templates(
     directory=os.path.join(os.path.dirname(os.path.abspath(__file__)), "templates"))
 
@@ -45,137 +45,92 @@ NAV = [
     ("alerts", "Alerts", "/alerts"),
 ]
 
+# Publisher cadences (seconds). Templates print the same numbers.
+POLL = {
+    "rows": 1,              # overview live-feed batch
+    "kpi": 5,               # overview KPI / alert / flagged panels
+    "servers": 2,
+    "anticheat": 2,
+    "matches": 2,
+    "tournament": 3,
+    "alerts_keepalive": 15,
+}
+LIVE_ROWS = 12
+ALERTS_PAGE_SIZE = 20
+
+templates.env.globals.update(
+    VERSION=state.VERSION,
+    POLL=POLL,
+    ALERT_TYPES=state.ALERT_TYPES,
+    ALERT_SEVERITIES=state.ALERT_SEVERITIES,
+    SUSPICION_FLAG=state.SUSPICION_FLAG,
+    SUSPICION_CRITICAL=state.SUSPICION_CRITICAL,
+    MATCH_BALANCED_MIN=state.MATCH_BALANCED_MIN,
+    MATCH_UNBALANCED_MIN=state.MATCH_UNBALANCED_MIN,
+)
+
 E = html.escape
 
 
-def _page(request: Request, name: str, active: str,
-          sse: Optional[str] = None, **ctx: Any):
-    context = {"nav": NAV, "active": active, "sse": sse}
-    context.update(ctx)
-    return templates.TemplateResponse(request=request, name=name, context=context)
+def _page(request: Request, name: str, active: str, sse: str | None = None,
+          status_code: int = 200, **ctx: Any):
+    context = {"nav": NAV, "active": active, "sse": sse, **ctx}
+    return templates.TemplateResponse(request=request, name=name, context=context,
+                                      status_code=status_code)
 
 
-# ─── Data readers (sync Redis — tiny keys, run inside the event loop) ───────
-
-def _servers() -> List[Dict[str, str]]:
-    try:
-        r = get_redis_client()
-        rows = []
-        for s_id in r.smembers("servers:active"):
-            data = r.hgetall(f"server:{s_id}")
-            if data:
-                rows.append(data)
-        rows.sort(key=lambda s: _float(s.get("health_score"), 101.0))
-        return rows
-    except Exception:
-        return []
+def _not_found(request: Request, active: str, what: str, ident: str):
+    return _page(request, "notfound.html", active, status_code=404, what=what, ident=ident)
 
 
-def _flagged() -> List[Dict[str, str]]:
-    try:
-        r = get_redis_client()
-        rows = []
-        for p_id in r.smembers("players:flagged"):
-            data = r.hgetall(f"player:{p_id}")
-            if data:
-                rows.append(data)
-        rows.sort(key=lambda p: _float(p.get("suspicion_effective"),
-                                       _float(p.get("suspicion_score"))), reverse=True)
-        return rows
-    except Exception:
-        return []
+def unavailable_page(request: Request, service: str):
+    """503 page for Redis/PostgreSQL outages (main.py exception handler)."""
+    return _page(request, "unavailable.html", "", status_code=503, service=service)
 
 
-def _matches() -> List[Dict[str, Any]]:
-    try:
-        r = get_redis_client()
-        now_ms = int(time.time() * 1000)
-        rows = []
-        for key in r.scan_iter("match:*"):
-            if ":" in key[len("match:"):]:
-                continue
-            data = r.hgetall(key)
-            if not data:
-                continue
-            updated_ms = int(_float(data.get("updated_at"), 0)) * 1000
-            data["active"] = 0 <= (now_ms - updated_ms) <= 90_000
-            data["quality_score"] = _float(data.get("quality_score"))
-            rows.append(data)
-        rows.sort(key=lambda m: str(m.get("updated_at", "")), reverse=True)
-        return rows
-    except Exception:
-        return []
+def _patch(html_fragment: str, selector: str):
+    return SSE.patch_elements(html_fragment, selector=selector, mode=PatchMode.INNER)
 
 
-def _recent_alerts(n: int = 10) -> List[Dict[str, Any]]:
-    try:
-        r = get_redis_client()
-        out = []
-        for raw in r.lrange("alerts:recent", 0, n - 1):
-            try:
-                out.append(json.loads(raw))
-            except ValueError:
-                continue
-        return out
-    except Exception:
-        return []
+def _suspicion_class(eff: float) -> str:
+    return ("bad" if eff >= state.SUSPICION_CRITICAL
+            else "warn" if eff >= state.SUSPICION_FLAG else "ok")
 
 
-def _kpi_dict() -> Dict[str, Any]:
-    snap = state.throughput_snapshot()
-    matches = _matches()
-    flagged = 0
-    smurf = 0
-    anomalies = 0
-    alerts_recent = 0
-    try:
-        r = get_redis_client()
-        flagged = r.scard("players:flagged")
-        smurf = r.scard("players:smurf")
-        anomalies = r.scard("behavior:anomalies")
-        alerts_recent = r.llen("alerts:recent")
-    except Exception:
-        pass
-
-    return {
-        "eps": snap["events_per_sec"],
-        "totals": snap["per_topic_total"],
-        "total_events": sum(snap["per_topic_total"].values()),
-        "matches_tracked": len(matches),
-        "matches_active": sum(1 for m in matches if m["active"]),
-        "flagged": flagged,
-        "smurf": smurf,
-        "anomalies": anomalies,
-        "alerts_recent": alerts_recent,
-    }
-
-
-def _histogram_buckets() -> List[int]:
-    buckets = [0] * 10
-    try:
-        r = get_redis_client()
-        for _, score in r.zrange("matches:quality", 0, -1, withscores=True):
-            buckets[min(9, max(0, int(score // 10)))] += 1
-    except Exception:
-        pass
-    return buckets
+def _match_class(status: str) -> str:
+    return "bad" if status == "STOMPED" else "warn" if status == "UNBALANCED" else "ok"
 
 
 # ─── Fragment renderers (used for BOTH initial page render and SSE patches) ─
 
-def kpis_html() -> str:
-    k = _kpi_dict()
+async def _kpi_dict() -> dict[str, Any]:
+    snap = state.throughput_snapshot()
+    counts = await state.current_counts()
+    return {
+        "eps": snap["events_per_sec"],
+        "chart_eps": snap["latest_events_per_sec"],
+        "chart_time": snap["latest_sample_time"],
+        "total_events": snap["ingested_total"],
+        "live_matches": state.feed.live_matches(),
+        "alerts_recent": len(state.alert_log),
+        **counts,
+    }
+
+
+def kpis_html(k: dict[str, Any]) -> str:
     eps = f"{k['eps']:.0f}" if k["eps"] is not None else "—"
-    raw_eps = k["eps"] if k["eps"] is not None else 0.0
-    now_str = time.strftime("%H:%M:%S")
     cards = [
         ("Events / sec", eps, "kpi-live", "Velocity"),
-        ("Total Ingested", f"{k['total_events']:,}", "", "Kafka Events"),
-        ("Active Matches", f"{k['matches_active']} / {k['matches_tracked']}", "kpi-live" if k["matches_active"] else "", "Sessions"),
-        ("Cheat Flagged", str(k["flagged"]), "kpi-bad" if k["flagged"] else "", "Anti-Cheat"),
-        ("Smurf Accounts", str(k["smurf"]), "kpi-warn" if k["smurf"] else "", "Evaluated"),
-        ("Behavior Shifts", str(k["anomalies"]), "kpi-warn" if k["anomalies"] else "", "CUSUM Drift"),
-        ("Recent Alerts", str(k["alerts_recent"]), "kpi-warn" if k["alerts_recent"] else "", "Last 100"),
+        ("Total Ingested", f"{k['total_events']:,}", "", "Kafka Input Topics"),
+        ("Active Matches", str(k["live_matches"]), "kpi-live" if k["live_matches"] else "",
+         "Server Metrics"),
+        ("Cheat Flagged", str(k["cheat_flagged"]), "kpi-bad" if k["cheat_flagged"] else "",
+         "Anti-Cheat"),
+        ("Smurf Accounts", str(k["smurf"]), "kpi-warn" if k["smurf"] else "", "Flagged"),
+        ("Behavior Shifts", str(k["behavior_anomalies"]),
+         "kpi-warn" if k["behavior_anomalies"] else "", "CUSUM Drift"),
+        ("Recent Alerts", str(k["alerts_recent"]), "kpi-warn" if k["alerts_recent"] else "",
+         f"Last {state.ALERT_LOG_SIZE}"),
     ]
     card_html = "".join(
         f'<div class="kpi {cls}">'
@@ -183,53 +138,56 @@ def kpis_html() -> str:
         f'<div class="kpi-value">{E(value)}</div>'
         f'<div class="kpi-label">{E(label)}</div></div>'
         for label, value, cls, tag in cards)
-    carrier = (f'<div id="telemetry-carrier" data-eps="{raw_eps}" data-time="{now_str}" '
+    # Chart carrier: the latest 5 s sample (same series as the initial
+    # timeline); the page dedupes on data-time so a sample plots once.
+    chart_eps = "" if k["chart_eps"] is None else k["chart_eps"]
+    carrier = (f'<div id="telemetry-carrier" data-eps="{chart_eps}" '
+               f'data-time="{E(k["chart_time"] or "")}" '
                f'data-total="{k["total_events"]}" style="display:none"></div>')
     return card_html + carrier
 
 
 def alerts_html(n: int = 10) -> str:
-    rows = _recent_alerts(n)
+    """Last n Go-engine alerts (alerts:stream, seeded from alert_history)."""
+    rows = state.alert_log.recent(n)
     if not rows:
         return '<li class="empty">No alerts yet — the engine forwards within seconds of a detection.</li>'
     out = []
     for a in rows:
-        sev = str(a.get("severity", "INFO"))
-        ts = int(_float(a.get("timestamp"))) / 1000
-        when = time.strftime("%H:%M:%S", time.localtime(ts)) if ts else "—"
+        ts = as_float(a.get("timestamp")) / 1000
+        when = state.clock(ts) if ts else "—"
         out.append(
-            f'<li class="alert sev-{E(sev.lower())}">'
-            f'<span class="chip">{E(sev)}</span>'
+            f'<li class="alert">'
+            f'<span class="chip">{E(str(a.get("severity", "INFO")))}</span>'
             f'<span class="alert-type">{E(str(a.get("alert_type", "?")))}</span>'
             f'<span class="alert-msg">{E(str(a.get("message", "")))}</span>'
             f'<time>{when}</time></li>')
     return "".join(out)
 
 
-def flagged_html(n: int = 8) -> str:
-    rows = _flagged()[:n]
+def flagged_html(rows: list[dict[str, str]], n: int = 8) -> str:
     if not rows:
         return '<li class="empty">No players flagged.</li>'
     out = []
-    for p in rows:
-        eff = _float(p.get("suspicion_effective"), _float(p.get("suspicion_score")))
-        pid = str(p.get("player_id", "?"))
-        out.append(
-            f'<li><a href="/players/{E(pid)}">{E(pid)}</a>'
-            f'<span class="score">{eff:.2f}</span></li>')
+    for p in rows[:n]:
+        pid = E(str(p.get("player_id", "?")))
+        out.append(f'<li><a href="/players/{pid}">{pid}</a>'
+                   f'<span class="score">{state.effective_suspicion(p):.2f}</span></li>')
     return "".join(out)
 
 
-def server_rows_html(rows: Optional[List[Dict[str, str]]] = None) -> str:
-    if rows is None:
-        rows = _servers()
+def _worst_first(rows: list[dict[str, str]]) -> list[dict[str, str]]:
+    return sorted(rows, key=lambda s: as_float(s.get("health_score"), 101.0))
+
+
+def server_rows_html(rows: list[dict[str, str]]) -> str:
     if not rows:
         return '<tr class="empty"><td colspan="8">No server metrics yet.</td></tr>'
     out = []
-    for s in rows:
-        hs = _float(s.get("health_score"), 100.0)
-        cls = "bad" if hs < 30 else "warn" if hs < 50 else "ok"
+    for s in _worst_first(rows):
+        hs = as_float(s.get("health_score"))
         status = str(s.get("status", "?"))
+        cls = state.SERVER_STATUS_CLASS.get(status, "warn")
         out.append(
             f'<tr>'
             f'<td class="mono">{E(str(s.get("server_id", "?")))}</td>'
@@ -238,20 +196,18 @@ def server_rows_html(rows: Optional[List[Dict[str, str]]] = None) -> str:
             f'style="width:{max(2, min(100, hs)):.0f}%"></div></div>'
             f'<span class="bar-num {cls}">{hs:.1f}</span></td>'
             f'<td><span class="chip {cls}">{E(status)}</span></td>'
-            f'<td class="num">{_float(s.get("avg_cpu")):.0f}%</td>'
-            f'<td class="num">{_float(s.get("avg_ram")):.0f}%</td>'
-            f'<td class="num">{_float(s.get("avg_latency")):.0f} ms</td>'
+            f'<td class="num">{as_float(s.get("avg_cpu")):.0f}%</td>'
+            f'<td class="num">{as_float(s.get("avg_ram")):.0f}%</td>'
+            f'<td class="num">{as_float(s.get("avg_latency")):.0f} ms</td>'
             f'<td class="num">{E(str(s.get("peak_players", "0")))}</td>'
             f'</tr>')
     return "".join(out)
 
 
-def servers_stats_html(rows: Optional[List[Dict[str, str]]] = None) -> str:
-    if rows is None:
-        rows = _servers()
-    scores = [_float(s.get("health_score")) for s in rows]
+def servers_stats_html(rows: list[dict[str, str]]) -> str:
+    scores = [as_float(s.get("health_score")) for s in rows]
     avg = sum(scores) / len(scores) if scores else 0.0
-    degraded = sum(1 for h in scores if h < 50.0)
+    degraded = sum(1 for s in rows if s.get("status") != state.SERVER_HEALTHY)
     return (
         f'<span class="stat"><b>{len(rows)}</b> servers</span>'
         f'<span class="stat"><b>{avg:.1f}</b> avg health</span>'
@@ -259,96 +215,87 @@ def servers_stats_html(rows: Optional[List[Dict[str, str]]] = None) -> str:
     )
 
 
-def cheat_rows_html() -> str:
-    rows = _flagged()
+def cheat_rows_html(rows: list[dict[str, str]]) -> str:
     if not rows:
         return '<tr class="empty"><td colspan="7">No flagged players — detections appear within seconds of a suspicious match.</td></tr>'
     out = []
     for p in rows:
-        pid = str(p.get("player_id", "?"))
-        base = _float(p.get("suspicion_score"))
-        eff = _float(p.get("suspicion_effective"), base)
+        pid = E(str(p.get("player_id", "?")))
+        base = as_float(p.get("suspicion_score"))
+        eff = state.effective_suspicion(p)
         boost = max(0.0, eff - base)
-        iforest = str(p.get("iforest_score") or "—")
-        iflag = "yes" if p.get("iforest_flag") == "true" else "—"
-        cls = "bad" if eff >= 0.85 else "warn" if eff >= 0.70 else "ok"
+        cls = _suspicion_class(eff)
+        ml_flag = '<span class="chip warn">IF</span>' if p.get("iforest_flag") == "true" else "—"
         out.append(
             f'<tr>'
-            f'<td><a class="mono" href="/players/{E(pid)}">{E(pid)}</a></td>'
+            f'<td><a class="mono" href="/players/{pid}">{pid}</a></td>'
             f'<td class="bar-cell"><div class="bar"><div class="bar-fill {cls}" '
             f'style="width:{max(2, min(100, eff * 100)):.0f}%"></div></div>'
             f'<span class="bar-num {cls}">{eff:.2f}</span></td>'
             f'<td class="num">{base:.2f}</td>'
             f'<td class="num {"warn" if boost > 0 else ""}">+{boost:.2f}</td>'
-            f'<td class="num">{E(iforest)}</td>'
-            f'<td>{"<span class=\'chip warn\'>IF</span>" if iflag == "yes" else "—"}</td>'
+            f'<td class="num">{E(p.get("iforest_score") or "—")}</td>'
+            f'<td>{ml_flag}</td>'
             f'<td class="num">{E(str(p.get("total_shots", "0")))}</td>'
             f'</tr>')
     return "".join(out)
 
 
-def match_rows_html(rows: Optional[List[Dict[str, Any]]] = None) -> str:
-    if rows is None:
-        rows = _matches()
+def match_rows_html(rows: list[dict[str, Any]]) -> str:
     if not rows:
         return '<tr class="empty"><td colspan="7">No matches scored yet.</td></tr>'
     out = []
-    for m in rows[:40]:
-        mid = str(m.get("match_id", "?"))
+    for m in rows:
+        mid = E(str(m.get("match_id", "?")))
         score = m["quality_score"]
         status = str(m.get("status", "?"))
-        cls = "bad" if status == "STOMPED" else "warn" if status == "UNBALANCED" else "ok"
-        live = '<span class="dot live" title="live"></span> ' if m["active"] else ""
+        cls = _match_class(status)
         out.append(
             f'<tr>'
-            f'<td><a class="mono" href="/matches/{E(mid)}">{live}{E(mid)}</a></td>'
+            f'<td><a class="mono" href="/matches/{mid}">{mid}</a></td>'
             f'<td class="bar-cell"><div class="bar"><div class="bar-fill {cls}" '
             f'style="width:{max(2, min(100, score)):.0f}%"></div></div>'
             f'<span class="bar-num {cls}">{score:.1f}</span></td>'
             f'<td><span class="chip {cls}">{E(status)}</span></td>'
             f'<td class="num">{E(str(m.get("total_kills", "0")))}</td>'
-            f'<td class="num">{_float(m.get("kill_imbalance")):.2f}</td>'
+            f'<td class="num">{as_float(m.get("kill_imbalance")):.2f}</td>'
             f'<td class="num">{E(str(m.get("disconnects", "0")))}</td>'
             f'<td class="num">{E(str(m.get("duration_s", "0")))}s</td>'
             f'</tr>')
     return "".join(out)
 
 
-def histogram_html() -> str:
-    buckets = _histogram_buckets()
+def histogram_html(buckets: list[int]) -> str:
     total = sum(buckets)
-    carrier = f'<div id="hist-carrier" data-buckets=\'{json.dumps(buckets)}\' data-total="{total}" style="display:none"></div>'
-    summary = f'<span class="hint" style="font-family:var(--mono)">Total Scored: <b style="color:var(--text)">{total}</b> matches</span>'
+    carrier = (f'<div id="hist-carrier" data-buckets="{E(json.dumps(buckets))}" '
+               f'data-total="{total}" style="display:none"></div>')
+    summary = (f'<span class="hint" style="font-family:var(--mono)">Total Scored: '
+               f'<b style="color:var(--text)">{total}</b> matches</span>')
     return carrier + summary
 
 
-def matches_stats_html(rows: Optional[List[Dict[str, Any]]] = None) -> str:
-    if rows is None:
-        rows = _matches()
-    balanced = sum(1 for m in rows if str(m.get("status")) == "BALANCED")
-    unbal = sum(1 for m in rows if str(m.get("status")) == "UNBALANCED")
-    stomped = sum(1 for m in rows if str(m.get("status")) == "STOMPED")
-    active = sum(1 for m in rows if m["active"])
+def matches_stats_html(summary: dict[str, Any], recent: int) -> str:
     return (
-        f'<span class="stat"><b>{len(rows)}</b> tracked</span>'
-        f'<span class="stat"><b>{active}</b> live</span>'
-        f'<span class="stat ok"><b>{balanced}</b> balanced</span>'
-        f'<span class="stat warn"><b>{unbal}</b> unbalanced</span>'
-        f'<span class="stat bad"><b>{stomped}</b> stomped</span>'
+        f'<span class="stat"><b>{summary["tracked"]}</b> tracked</span>'
+        f'<span class="stat"><b>{recent}</b> scored last {state.MATCH_RECENT_SECONDS}s</span>'
+        f'<span class="stat ok"><b>{summary["balanced"]}</b> balanced</span>'
+        f'<span class="stat warn"><b>{summary["unbalanced"]}</b> unbalanced</span>'
+        f'<span class="stat bad"><b>{summary["stomped"]}</b> stomped</span>'
     )
 
 
-def tournament_html() -> str:
-    snap = state.tournament_snapshot()
+def tournament_html(snap: dict[str, Any]) -> str:
     srv, mt, pl, al = snap["servers"], snap["matches"], snap["players"], snap["alerts"]
     worst = mt["worst"]
-    worst_html = (f'Worst match: <a class="mono" href="/matches/{E(worst["match_id"])}">'
-                  f'{E(worst["match_id"])}</a> · score {worst["score"]:.1f}'
-                  if worst else "No matches scored yet.")
+    if worst:
+        wid = E(str(worst["match_id"]))
+        worst_html = (f'Worst match: <a class="mono" href="/matches/{wid}">{wid}</a>'
+                      f' · score {worst["score"]:.1f}')
+    else:
+        worst_html = "No matches scored yet."
+    avg = srv["avg_health"] if srv["avg_health"] is not None else "—"
     cards = [
-        ("Servers", f'{srv["active"]} active',
-         f'avg health {srv["avg_health"] if srv["avg_health"] is not None else "—"} · '
-         f'{srv["degraded"]} degraded'),
+        ("Servers", f'{srv["active"]} active', f'avg health {avg} · {srv["degraded"]} degraded'),
         ("Matches", f'{mt["scored_total"]} scored', worst_html),
         ("Players", f'{pl["cheat_flagged"]} flagged',
          f'{pl["smurf"]} smurf · {pl["behavior_anomalies"]} behavior shifts'),
@@ -357,73 +304,85 @@ def tournament_html() -> str:
     ]
     return "".join(
         f'<div class="kpi"><div class="kpi-label">{E(label)}</div>'
-        f'<div class="kpi-value">{value}</div>'
-        f'<div class="kpi-sub">{sub}</div></div>'
+        f'<div class="kpi-value">{E(value)}</div>'
+        f'<div>{sub}</div></div>'
         for label, value, sub in cards)
 
 
-def _fmt_event(item: str) -> Optional[str]:
-    """Kafka envelope JSON → one live-stream <tr>; None = not displayable."""
+def _event_clock(env: dict[str, Any], ev: dict[str, Any]) -> str:
+    """Event time (event_time / server-metric timestamp, else Kafka record
+    time) — not the time the row was rendered."""
+    ms = as_float(ev.get("event_time") or ev.get("timestamp") or env.get("timestamp"))
+    return state.clock(ms / 1000) if ms > 0 else "—"
+
+
+def _fmt_event(item: str) -> str | None:
+    """Kafka envelope JSON → one live-stream <tr>; None = not displayable.
+    Parts are built raw and escaped exactly once on output."""
     try:
         env = json.loads(item)
-        ev = env.get("event") or {}
     except (ValueError, TypeError):
         return None
-    topic = str(env.get("topic", ""))
+    ev = env.get("event") if isinstance(env, dict) else None
+    if not isinstance(ev, dict):
+        return None
+    topic = env.get("topic")
     kind = str(ev.get("event_type") or "?")
-    when = time.strftime("%H:%M:%S")
 
     if topic == "gameplay_events":
-        if kind == "SHOT_FIRED":          # far too noisy for humans
+        # One SHOT per trigger pull. Misses are far too noisy for humans;
+        # hits render as damage, lethal hits as kills.
+        if not ev.get("hit"):
             return None
-        actor = E(str(ev.get("player_id") or "?"))
-        match_id = E(str(ev.get("match_id") or ""))
-        if kind in ("KILL", "DAMAGE"):
-            tgt = E(str(ev.get("target_player_id") or "?"))
-            wep = E(str(ev.get("weapon_id") or ""))
-            desc = f"{actor} → {tgt}"
-            if kind == "KILL":
-                detail = wep + (" · HS" if ev.get("is_headshot") else "")
-            else:
-                detail = f"{wep} · {int(_float(ev.get('damage')))} dmg"
+        desc = f'{ev.get("player_id") or "?"} → {ev.get("target_player_id") or "?"}'
+        wep = str(ev.get("weapon_id") or "")
+        headshot = " · HS" if ev.get("is_headshot") else ""
+        place = str(ev.get("match_id") or "")
+        if ev.get("is_kill"):
+            kind, cls = "KILL", "k-kill"
+            assist = ev.get("assister_id")
+            detail = wep + headshot + (f" · assist {assist}" if assist else "")
         else:
-            desc, detail = actor, ""
-        cls = "k-kill" if kind == "KILL" else "k-dmg" if kind == "DAMAGE" else ""
+            kind, cls = "DAMAGE", "k-dmg"
+            detail = f"{wep} · {int(as_float(ev.get('damage')))} dmg{headshot}"
     elif topic == "player_events":
-        pid = E(str(ev.get("player_id") or "?"))
-        desc = pid
-        detail = E(str((ev.get("metadata") or {}).get("rank", "")))
-        match_id = E(str(ev.get("match_id") or ""))
+        desc = str(ev.get("player_id") or "?")
+        md = ev.get("metadata")
+        md = md if isinstance(md, dict) else {}
+        detail = " · ".join(f"{k}={str(v)[:24]}" for k, v in list(md.items())[:4])
+        place = str(ev.get("match_id") or "")
         cls = "k-player"
-        if kind == "SHOT_FIRED":
-            return None
     elif topic == "server_metrics":
-        kind = "SERVER"
-        desc = E(str(ev.get("server_id") or "?"))
-        detail = (f"cpu {_float(ev.get('cpu_percent')):.0f}% · "
-                  f"lat {_float(ev.get('avg_latency_ms')):.0f}ms · "
-                  f"{int(_float(ev.get('active_players')))}p")
-        match_id = E(str(ev.get("region") or ""))
-        cls = "k-server"
+        kind, cls = "SERVER", "k-server"
+        desc = str(ev.get("server_id") or "?")
+        detail = (f"cpu {as_float(ev.get('cpu_percent')):.0f}% · "
+                  f"lat {as_float(ev.get('avg_latency_ms')):.0f}ms · "
+                  f"{int(as_float(ev.get('active_players')))}p")
+        place = str(ev.get("region") or "")
     else:
         return None
 
-    return (f'<tr class="{cls}"><td class="mono dim">{when}</td>'
+    return (f'<tr class="{cls}"><td class="mono dim">{E(_event_clock(env, ev))}</td>'
             f'<td><span class="chip kind {cls}">{E(kind)}</span></td>'
-            f'<td class="evt-desc">{desc}</td>'
+            f'<td class="evt-desc">{E(desc)}</td>'
             f'<td class="dim">{E(detail)}</td>'
-            f'<td class="mono dim">{match_id}</td></tr>')
+            f'<td class="mono dim">{E(place)}</td></tr>')
+
+
+def _latest_rows(raw_events: list[str], n: int = LIVE_ROWS) -> list[str]:
+    """Newest-first displayable rows from oldest-first raw envelopes."""
+    rows = []
+    for raw in reversed(raw_events):
+        row = _fmt_event(raw)
+        if row:
+            rows.append(row)
+            if len(rows) >= n:
+                break
+    return rows
 
 
 def initial_event_rows_html() -> str:
-    recent_raw = state.feed.recent_events()
-    recent = []
-    for raw in reversed(recent_raw):
-        row = _fmt_event(raw)
-        if row:
-            recent.append(row)
-        if len(recent) >= 12:
-            break
+    recent = _latest_rows(state.feed.recent_events())
     if recent:
         return "".join(recent)
     return ('<tr class="empty"><td colspan="5">'
@@ -432,157 +391,124 @@ def initial_event_rows_html() -> str:
 
 
 # ─── Pages ──────────────────────────────────────────────────────────────────
+# Redis/PostgreSQL errors propagate to main.py's handler (503 page).
 
 @router.get("/")
 async def view_overview(request: Request):
     return _page(request, "overview.html", "overview", sse="/sse/overview",
-                  kpis=kpis_html(),
-                  alerts=alerts_html(6),
-                  flagged=flagged_html(6),
-                  event_rows=initial_event_rows_html(),
-                  initial_timeline=json.dumps(state.throughput_timeline()))
+                 kpis=kpis_html(await _kpi_dict()),
+                 alerts=alerts_html(6),
+                 flagged=flagged_html(await state.read_flagged_players(), 6),
+                 event_rows=initial_event_rows_html(),
+                 initial_timeline=state.throughput_timeline())
 
 
 @router.get("/servers")
 async def view_servers(request: Request):
-    rows = _servers()
+    rows = await state.read_servers()
     return _page(request, "servers.html", "servers", sse="/sse/servers",
-                  stats=servers_stats_html(rows), rows=server_rows_html(rows))
+                 stats=servers_stats_html(rows), rows=server_rows_html(rows))
 
 
 @router.get("/anticheat")
 async def view_anticheat(request: Request):
     return _page(request, "anticheat.html", "anticheat", sse="/sse/anticheat",
-                  rows=cheat_rows_html())
+                 rows=cheat_rows_html(await state.read_flagged_players()))
 
 
 @router.get("/matches")
 async def view_matches(request: Request):
-    rows = _matches()
+    recent = await state.read_recent_matches()
+    summary = await state.read_match_summary()
     return _page(request, "matches.html", "matches", sse="/sse/matches",
-                  stats=matches_stats_html(rows), rows=match_rows_html(rows),
-                  histogram=histogram_html(),
-                  initial_buckets=json.dumps(_histogram_buckets()))
+                 stats=matches_stats_html(summary, recent["recent"]),
+                 rows=match_rows_html(recent["rows"]),
+                 histogram=histogram_html(summary["histogram"]),
+                 initial_buckets=summary["histogram"])
 
 
 @router.get("/matches/{match_id}")
 async def view_match_detail(request: Request, match_id: str):
-    r = get_redis_client()
-    try:
-        data = r.hgetall(f"match:{match_id}")
-        if not data:
-            return _page(request, "notfound.html", "matches",
-                          what="match", ident=match_id)
-        score = _float(data.get("quality_score"), _float(r.zscore("matches:quality", match_id)))
-    except Exception as e:
-        logger.warning(f"Error reading match detail {match_id}: {e}")
-        return _page(request, "notfound.html", "matches",
-                      what="match", ident=match_id)
+    data = await state.read_match(match_id)
+    if not data:
+        return _not_found(request, "matches", "match", match_id)
     return _page(request, "match_detail.html", "matches",
-                  m=data, match_id=match_id, score=score)
+                 m=data, match_id=match_id, score=data["quality_score"])
 
 
 @router.get("/players/{player_id}")
 async def view_player_detail(request: Request, player_id: str):
-    r = get_redis_client()
-    try:
-        profile = r.hgetall(f"player:{player_id}")
-        smurf = r.hgetall(f"player:smurf:{player_id}")
-        behavior = r.hgetall(f"player:behavior:{player_id}")
-        if not profile and not smurf and not behavior:
-            return _page(request, "notfound.html", "anticheat",
-                          what="player", ident=player_id)
-        flags = {
-            "cheat": r.sismember("players:flagged", player_id),
-            "smurf": r.sismember("players:smurf", player_id),
-            "behavior": r.sismember("behavior:anomalies", player_id),
-        }
-        base = _float(profile.get("suspicion_score"))
-        eff = _float(profile.get("suspicion_effective"), base)
-    except Exception as e:
-        logger.warning(f"Error reading player detail {player_id}: {e}")
-        return _page(request, "notfound.html", "anticheat",
-                      what="player", ident=player_id)
+    p = await state.read_player(player_id)
+    if p is None:
+        return _not_found(request, "anticheat", "player", player_id)
+    profile = p["combat"] or {}
+    base = as_float(profile.get("suspicion_score"))
     return _page(request, "player_detail.html", "anticheat",
-                  player_id=player_id, profile=profile, smurf=smurf,
-                  behavior=behavior, flags=flags, base=base, eff=eff)
+                 player_id=player_id, profile=profile,
+                 smurf=p["smurf_evaluation"] or {}, behavior=p["behavior"] or {},
+                 cusum=p["cusum"] or {}, flags=p["flags"],
+                 base=base, eff=state.effective_suspicion(profile))
 
 
 @router.get("/behavior")
 async def view_behavior(request: Request):
-    r = get_redis_client()
-    anomalies = []
-    smurfs = []
-    try:
-        for pid in sorted(r.smembers("behavior:anomalies")):
-            data = r.hgetall(f"player:behavior:{pid}")
-            if data:
-                data["player_id"] = pid
-                anomalies.append(data)
-        for pid in sorted(r.smembers("players:smurf")):
-            data = r.hgetall(f"player:smurf:{pid}")
-            if data:
-                data["player_id"] = pid
-                smurfs.append(data)
-        smurfs.sort(key=lambda s: _float(s.get("probability")), reverse=True)
-    except Exception as e:
-        logger.warning(f"Error reading behavior data: {e}")
     return _page(request, "behavior.html", "behavior",
-                  anomalies=anomalies, smurfs=smurfs)
+                 anomalies=await state.read_behavior_anomalies(),
+                 smurfs=await state.read_smurfs())
 
 
 @router.get("/tournament")
 async def view_tournament(request: Request):
     return _page(request, "tournament.html", "tournament", sse="/sse/tournament",
-                  cards=tournament_html())
+                 cards=tournament_html(await state.tournament_snapshot()))
+
+
+_KEEP = object()   # qs() sentinel: keep the current value (None = clear it)
 
 
 @router.get("/alerts")
-async def view_alerts(request: Request):
-    q = request.query_params
-    alert_type = q.get("alert_type") or None
-    severity = q.get("severity") or None
-    page = max(0, int(q.get("page", "0") or 0))
-    PAGE = 20
+async def view_alerts(request: Request, alert_type: str | None = None,
+                      severity: str | None = None, page: int = 0):
+    alert_type = alert_type or None
+    severity = severity or None
+    page = max(0, page)
+    hist = {"alerts": [], "total": 0}
+    hist_error = False
     try:
-        hist = await state.fetch_alert_history(limit=PAGE, offset=page * PAGE,
-                                               alert_type=alert_type,
-                                               severity=severity)
-        hist_error = None
-    except Exception as e:
-        hist, hist_error = {"alerts": [], "total": 0, "limit": PAGE, "offset": 0}, str(e)
+        hist = await state.fetch_alert_history(ALERTS_PAGE_SIZE, page * ALERTS_PAGE_SIZE,
+                                               alert_type, severity)
+        last = max(0, (hist["total"] + ALERTS_PAGE_SIZE - 1) // ALERTS_PAGE_SIZE - 1)
+        if page > last:                       # clamp past-the-end pages
+            page = last
+            hist = await state.fetch_alert_history(ALERTS_PAGE_SIZE, page * ALERTS_PAGE_SIZE,
+                                                   alert_type, severity)
+    except state.UNAVAILABLE_ERRORS as e:
+        log.warning("alert history unavailable: %r", e)
+        hist_error = True
+    max_page = max(0, (hist["total"] + ALERTS_PAGE_SIZE - 1) // ALERTS_PAGE_SIZE - 1)
+    cur_type, cur_sev, cur_page = alert_type, severity, page
 
-    def _qs(**kw) -> str:
-        merged = {"alert_type": alert_type, "severity": severity, "page": 0}
-        merged.update({k: v for k, v in kw.items() if v is not None})
-        if merged.get("alert_type") is None:
-            merged.pop("alert_type")
-        if merged.get("severity") is None:
-            merged.pop("severity")
-        if merged.get("page") in (0, "0", None):
-            merged.pop("page", None)
-        return "/alerts" + ("?" + "&".join(f"{k}={v}" for k, v in merged.items()) if merged else "")
+    def qs(alert_type: Any = _KEEP, severity: Any = _KEEP, page: Any = _KEEP) -> str:
+        params = {
+            "alert_type": cur_type if alert_type is _KEEP else alert_type,
+            "severity": cur_sev if severity is _KEEP else severity,
+            "page": cur_page if page is _KEEP else page,
+        }
+        params = {k: v for k, v in params.items() if v not in (None, "", 0)}
+        return "/alerts" + ("?" + urlencode(params) if params else "")
 
-    total = hist["total"]
-    max_page = max(0, (total + PAGE - 1) // PAGE - 1)
     return _page(request, "alerts.html", "alerts", sse="/sse/alerts",
-                  live=alerts_html(10),
-                  history=hist, hist_error=hist_error,
-                  alert_type=alert_type, severity=severity, page=page,
-                  max_page=max_page, qs=_qs)
+                 status_code=503 if hist_error else 200,
+                 live=alerts_html(10), history=hist, hist_error=hist_error,
+                 alert_type=alert_type, severity=severity, page=page,
+                 max_page=max_page, qs=qs)
 
 
-# ─── SSE streams (one per live view) ────────────────────────────────────────
+# ─── SSE streams (one shared publisher per view) ────────────────────────────
 
-def _stream(gen):
-    return DatastarResponse(gen())
-
-
-def _sse(name: str, factory):
+def _sse(bus: state.Broadcaster) -> DatastarResponse:
     """Subscriber side of a shared broadcast: paint cached frames instantly,
     then yield every frame the single publisher produces from now on."""
-    bus = state.sse_bus(name, factory)
-
     async def gen():
         q = bus.subscribe()
         try:
@@ -593,163 +519,115 @@ def _sse(name: str, factory):
         finally:
             bus.unsubscribe(q)
 
-    return _stream(gen)
+    return DatastarResponse(gen())
 
 
 async def _pub_overview(bus: state.Broadcaster):
     """ONE task for all windows: batches feed rows every 1 s and rebuilds the
     KPI/alerts/flagged panels every 5 s — each frame computed once, then the
-    identical bytes go to every subscriber."""
+    identical bytes go to every subscriber. A Redis outage only pauses the
+    Redis-backed panels; the Kafka rows keep streaming."""
     q = state.feed.register()
-    recent: List[str] = []
-    for raw in reversed(state.feed.recent_events()):
-        row = _fmt_event(raw)
-        if row:
-            recent.append(row)
-        if len(recent) >= 12:
-            break
+    streak = state.FailureStreak("overview KPI panels")
+    recent = _latest_rows(state.feed.recent_events())
     if recent:
-        bus.publish("rows", SSE.patch_elements("".join(recent),
-                                               selector="#event-rows",
-                                               mode=PatchMode.INNER))
+        bus.publish("rows", _patch("".join(recent), "#event-rows"))
     tick = 0
+    loop = asyncio.get_running_loop()
     try:
         while True:
-            batch: List[str] = []
-            deadline = time.monotonic() + 1.0
-            while True:
-                left = deadline - time.monotonic()
-                if left <= 0:
-                    break
+            batch: list[str] = []
+            deadline = loop.time() + POLL["rows"]
+            while (left := deadline - loop.time()) > 0:
                 try:
                     item = await asyncio.wait_for(q.get(), timeout=left)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     break
                 row = _fmt_event(item)
                 if row:
                     batch.append(row)
             if batch:
-                recent = list(reversed(batch)) + recent
-                recent = recent[:12]
-                bus.publish("rows", SSE.patch_elements("".join(recent),
-                                                       selector="#event-rows",
-                                                       mode=PatchMode.INNER))
+                recent = (batch[::-1] + recent)[:LIVE_ROWS]
+                bus.publish("rows", _patch("".join(recent), "#event-rows"))
             tick += 1
-            if tick % 5 == 0:
-                bus.publish("kpi", SSE.patch_elements(kpis_html(),
-                                                      selector="#kpis",
-                                                      mode=PatchMode.INNER))
-                bus.publish("alerts", SSE.patch_elements(alerts_html(6),
-                                                         selector="#recent-alerts",
-                                                         mode=PatchMode.INNER))
-                bus.publish("flagged", SSE.patch_elements(flagged_html(6),
-                                                          selector="#flagged-mini",
-                                                          mode=PatchMode.INNER))
+            if tick % (POLL["kpi"] // POLL["rows"]) == 0:
+                bus.publish("alerts", _patch(alerts_html(6), "#recent-alerts"))
+                try:
+                    kpis = kpis_html(await _kpi_dict())
+                    flagged = flagged_html(await state.read_flagged_players(), 6)
+                except state.UNAVAILABLE_ERRORS as e:
+                    streak.fail(e)
+                    continue
+                streak.ok()
+                bus.publish("kpi", _patch(kpis, "#kpis"))
+                bus.publish("flagged", _patch(flagged, "#flagged-mini"))
     finally:
         state.feed.unregister(q)
 
 
-@router.get("/sse/overview")
-async def sse_overview():
-    return _sse("overview", _pub_overview)
-
-
 async def _pub_servers(bus: state.Broadcaster):
     while True:
-        rows = _servers()
-        bus.publish("rows", SSE.patch_elements(server_rows_html(rows),
-                                               selector="#server-rows",
-                                               mode=PatchMode.INNER))
-        bus.publish("stats", SSE.patch_elements(servers_stats_html(rows),
-                                                selector="#servers-stats",
-                                                mode=PatchMode.INNER))
-        await asyncio.sleep(2)
-
-
-@router.get("/sse/servers")
-async def sse_servers():
-    return _sse("servers", _pub_servers)
+        rows = await state.read_servers()
+        bus.publish("rows", _patch(server_rows_html(rows), "#server-rows"))
+        bus.publish("stats", _patch(servers_stats_html(rows), "#servers-stats"))
+        await asyncio.sleep(POLL["servers"])
 
 
 async def _pub_anticheat(bus: state.Broadcaster):
     while True:
-        bus.publish("rows", SSE.patch_elements(cheat_rows_html(),
-                                               selector="#cheat-rows",
-                                               mode=PatchMode.INNER))
-        await asyncio.sleep(2)
-
-
-@router.get("/sse/anticheat")
-async def sse_anticheat():
-    return _sse("anticheat", _pub_anticheat)
+        rows = await state.read_flagged_players()
+        bus.publish("rows", _patch(cheat_rows_html(rows), "#cheat-rows"))
+        await asyncio.sleep(POLL["anticheat"])
 
 
 async def _pub_matches(bus: state.Broadcaster):
     while True:
-        rows = _matches()
-        bus.publish("rows", SSE.patch_elements(match_rows_html(rows),
-                                               selector="#match-rows",
-                                               mode=PatchMode.INNER))
-        bus.publish("hist", SSE.patch_elements(histogram_html(),
-                                               selector="#histogram",
-                                               mode=PatchMode.INNER))
-        bus.publish("stats", SSE.patch_elements(matches_stats_html(rows),
-                                                selector="#matches-stats",
-                                                mode=PatchMode.INNER))
-        await asyncio.sleep(2)
-
-
-@router.get("/sse/matches")
-async def sse_matches():
-    return _sse("matches", _pub_matches)
+        recent = await state.read_recent_matches()
+        summary = await state.read_match_summary()
+        bus.publish("rows", _patch(match_rows_html(recent["rows"]), "#match-rows"))
+        bus.publish("hist", _patch(histogram_html(summary["histogram"]), "#histogram"))
+        bus.publish("stats", _patch(matches_stats_html(summary, recent["recent"]),
+                                    "#matches-stats"))
+        await asyncio.sleep(POLL["matches"])
 
 
 async def _pub_tournament(bus: state.Broadcaster):
     while True:
-        bus.publish("cards", SSE.patch_elements(tournament_html(),
-                                                selector="#tournament-cards",
-                                                mode=PatchMode.INNER))
-        await asyncio.sleep(3)
-
-
-@router.get("/sse/tournament")
-async def sse_tournament():
-    return _sse("tournament", _pub_tournament)
+        snap = await state.tournament_snapshot()
+        bus.publish("cards", _patch(tournament_html(snap), "#tournament-cards"))
+        await asyncio.sleep(POLL["tournament"])
 
 
 async def _pub_alerts(bus: state.Broadcaster):
-    """One Redis pubsub for all windows: every subscriber gets the same
-    alert-table frame the moment one arrives on `alerts:stream`."""
-    r = aioredis.Redis(host=state.REDIS_HOST, port=state.REDIS_PORT,
-                       decode_responses=True)
-    pubsub = r.pubsub()
-    await pubsub.subscribe("alerts:stream")
-    idle = 0
+    """Re-render the live alert list whenever the engine publishes (via the
+    process-wide alert listener), plus a keepalive re-patch when idle."""
+    q = state.alert_bus.subscribe()
     try:
         while True:
-            msg = await pubsub.get_message(ignore_subscribe_messages=True,
-                                            timeout=1.0)
-            if msg and msg.get("type") == "message":
-                idle = 0
-                bus.publish("rows", SSE.patch_elements(alerts_html(10),
-                                                       selector="#alert-rows",
-                                                       mode=PatchMode.INNER))
-            else:
-                idle += 1
-                if idle >= 15:        # keepalive re-patch
-                    idle = 0
-                    bus.publish("rows", SSE.patch_elements(alerts_html(10),
-                                                           selector="#alert-rows",
-                                                           mode=PatchMode.INNER))
+            bus.publish("rows", _patch(alerts_html(10), "#alert-rows"))
+            try:
+                await asyncio.wait_for(q.get(), timeout=POLL["alerts_keepalive"])
+            except TimeoutError:
+                continue
+            while not q.empty():              # coalesce bursts into one frame
+                q.get_nowait()
     finally:
-        try:
-            await pubsub.unsubscribe("alerts:stream")
-            await pubsub.aclose()
-            await r.aclose()
-        except Exception:
-            pass
+        state.alert_bus.unsubscribe(q)
 
 
-@router.get("/sse/alerts")
-async def sse_alerts():
-    return _sse("alerts", _pub_alerts)
+BUSES = {name: state.Broadcaster(name, pub) for name, pub in (
+    ("overview", _pub_overview),
+    ("servers", _pub_servers),
+    ("anticheat", _pub_anticheat),
+    ("matches", _pub_matches),
+    ("tournament", _pub_tournament),
+    ("alerts", _pub_alerts),
+)}
+
+
+@router.get("/sse/{view}")
+async def sse_view(view: str):
+    bus = BUSES.get(view)
+    if bus is None:
+        raise HTTPException(status_code=404, detail=f"no stream {view!r}")
+    return _sse(bus)

@@ -22,7 +22,7 @@
   <link href="https://fonts.googleapis.com/css2?family=Geist:wght@300;400;500;600;700&family=Geist+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/static/dashboard.css">
   <script type="module" src="https://cdn.jsdelivr.net/gh/starfederation/datastar@v1.0.4/bundles/datastar.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.2/dist/chart.umd.min.js"></script>
+  {% block head %}{% endblock %}
 </head>
 <body>
 <header class="topbar">
@@ -33,7 +33,7 @@
       </svg>
     </div>
     <span>Gaming Intelligence</span>
-    <span class="badge-sub">v1.4</span>
+    <span class="badge-sub">v{{ VERSION }}</span>
   </a>
   <nav>
     {% for key, label, href in nav %}
@@ -44,7 +44,11 @@
     <button id="theme-toggle" class="theme-toggle" type="button" title="Toggle Black / White mode">
       <span id="theme-label">MODE: BLACK</span>
     </button>
-    <div class="telemetry-badge" id="live-indicator"><span class="status-marker live"></span>STREAM ACTIVE</div>
+    {% if sse %}
+    <div class="telemetry-badge idle" id="live-indicator"><span class="status-marker"></span><span id="live-label">STREAM CONNECTING</span></div>
+    {% else %}
+    <div class="telemetry-badge idle" id="live-indicator"><span class="status-marker"></span>SNAPSHOT VIEW</div>
+    {% endif %}
   </div>
 </header>
 
@@ -77,6 +81,25 @@
 
 {% if sse %}
 <script type="module">
+  /* Stream indicator follows the real Datastar stream state: ACTIVE once
+     patches arrive, RECONNECTING on error/retry, OFFLINE when it gives up. */
+  const indicator = document.getElementById("live-indicator");
+  const indicatorLabel = document.getElementById("live-label");
+  const marker = indicator.querySelector(".status-marker");
+  const setStream = (text, state, live) => {
+    if (indicatorLabel.textContent === text) return;
+    indicatorLabel.textContent = text;
+    indicator.classList.remove("idle", "warn", "bad");
+    if (state) indicator.classList.add(state);
+    marker.classList.toggle("live", live);
+  };
+  document.addEventListener("datastar-fetch", (e) => {
+    const t = e.detail && e.detail.type;
+    if (t === "datastar-patch-elements") setStream("STREAM ACTIVE", "", true);
+    else if (t === "error" || t === "retrying") setStream("STREAM RECONNECTING", "warn", false);
+    else if (t === "retries-failed" || t === "finished") setStream("STREAM OFFLINE", "bad", false);
+  });
+
   /* Open this view's Datastar SSE stream on load */
   window.addEventListener("load", () => {
     const d = document.createElement("div");

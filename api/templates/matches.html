@@ -1,5 +1,6 @@
 {% extends "base.html" %}
 {% block title %}Match Quality{% endblock %}
+{% block head %}<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.2/dist/chart.umd.min.js"></script>{% endblock %}
 {% block content %}
 <div class="stats-row" id="matches-stats">{{ stats|safe }}</div>
 
@@ -14,22 +15,22 @@
     </div>
     <p class="legend">
       <span>TIERS:</span>
-      <span class="chip bad">STOMPED &lt;40</span>
-      <span class="chip warn">UNBALANCED 40–69</span>
-      <span class="chip ok">BALANCED ≥70</span>
+      <span class="chip bad">STOMPED &lt;{{ MATCH_UNBALANCED_MIN|int }}</span>
+      <span class="chip warn">UNBALANCED {{ MATCH_UNBALANCED_MIN|int }}–{{ MATCH_BALANCED_MIN|int - 1 }}</span>
+      <span class="chip ok">BALANCED ≥{{ MATCH_BALANCED_MIN|int }}</span>
     </p>
   </section>
 
   <section class="panel">
     <div class="panel-header">
-      <h2>// ACTIVE SESSIONS <span class="hint">Streaming Session Windows</span></h2>
+      <h2>// RECENTLY SCORED SESSIONS <span class="hint">Streaming Session Windows · scored when a session closes</span></h2>
       <span class="hint">Select match for breakdown</span>
     </div>
-    <div class="table-wrap scroll-y max-h-360">
+    <div class="table-wrap max-h-360">
       <table>
         <thead>
           <tr>
-            <th>Match</th><th class="w-20">Quality</th><th>Status</th>
+            <th>Match</th><th>Quality</th><th>Status</th>
             <th class="num">Kills</th><th class="num">Imbal</th><th class="num">DC</th><th class="num">Time</th>
           </tr>
         </thead>
@@ -44,30 +45,30 @@
 
 {% block scripts %}
 <script>
-  const initialBuckets = {{ initial_buckets|safe or '[0,0,0,0,0,0,0,0,0,0]' }};
+  const initialBuckets = {{ initial_buckets|tojson }};
   const bucketLabels = ['0-9', '10-19', '20-29', '30-39', '40-49', '50-59', '60-69', '70-79', '80-89', '90-100'];
   
+  /* Colours come from the active theme's CSS variables (dashboard.css). */
+  const cssVar = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  const stompedBelow = {{ (MATCH_UNBALANCED_MIN / 10)|int }};    // deciles < 40 -> STOMPED
+  const unbalancedBelow = {{ (MATCH_BALANCED_MIN / 10)|int }};   // deciles < 70 -> UNBALANCED
+
   function getBarColors(data) {
-    return data.map((_, idx) => {
-      if (idx < 4) return '#ef4444';   // Stomped (<40)
-      if (idx < 7) return '#f59e0b';  // Unbalanced (40-69)
-      return '#10b981';              // Balanced (>=70)
-    });
+    const bad = cssVar('--bad'), warn = cssVar('--warn'), ok = cssVar('--ok');
+    return data.map((_, idx) => idx < stompedBelow ? bad : idx < unbalancedBelow ? warn : ok);
   }
 
-  function getMqThemeColors(theme) {
-    const isLight = theme === 'light';
+  function getMqThemeColors() {
     return {
-      grid: isLight ? 'rgba(0, 0, 0, 0.06)' : 'rgba(255, 255, 255, 0.03)',
-      tick: isLight ? '#64748b' : '#545462',
-      tooltipBg: isLight ? '#f8fafc' : '#0a0a0d',
-      tooltipBorder: isLight ? '#bac2cf' : '#1e1e24',
-      tooltipText: isLight ? '#09090b' : '#eaedf2',
+      grid: cssVar('--chart-grid'),
+      tick: cssVar('--chart-tick'),
+      tooltipBg: cssVar('--chart-tooltip-bg'),
+      tooltipBorder: cssVar('--chart-tooltip-border'),
+      tooltipText: cssVar('--chart-tooltip-text'),
     };
   }
 
-  const initialMqTheme = document.documentElement.getAttribute('data-theme') || 'dark';
-  const mqC = getMqThemeColors(initialMqTheme);
+  const mqC = getMqThemeColors();
 
   const mqCtx = document.getElementById('matchQualityChart').getContext('2d');
   const mqChart = new Chart(mqCtx, {
@@ -126,8 +127,9 @@
     }
   });
 
-  function applyMqChartTheme(theme) {
-    const colors = getMqThemeColors(theme);
+  function applyMqChartTheme() {
+    const colors = getMqThemeColors();
+    mqChart.data.datasets[0].backgroundColor = getBarColors(mqChart.data.datasets[0].data);
     mqChart.options.scales.y.grid.color = colors.grid;
     mqChart.options.scales.x.ticks.color = colors.tick;
     mqChart.options.scales.y.ticks.color = colors.tick;
@@ -138,9 +140,7 @@
     mqChart.update();
   }
 
-  window.addEventListener('theme-changed', (e) => {
-    applyMqChartTheme(e.detail.theme);
-  });
+  window.addEventListener('theme-changed', applyMqChartTheme);
 
   const histContainer = document.getElementById('histogram');
   if (histContainer) {
