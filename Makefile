@@ -1,4 +1,4 @@
-.PHONY: up down restart logs ps clean kafka-topics kafka-console-consumer simulator-build simulator-run simulator-dry-run spark-submit train-model api-up api-run test-go test-streaming help
+.PHONY: up down restart logs ps clean kafka-topics kafka-console-consumer simulator-build simulator-run simulator-dry-run spark-submit spark-batch train-model api-up test-go test-streaming benchmark benchmark-plot help
 
 # ─── Docker Infrastructure ────────────────────────────────────────────────
 up:
@@ -31,10 +31,10 @@ simulator-build:
 	cd simulator && go build -o bin/simulator ./cmd/simulator
 
 simulator-run: simulator-build
-	cd simulator && ./bin/simulator --players 500 --events-per-sec 2000 --duration 5m
+	cd simulator && ./bin/simulator --events-per-sec 2000 --duration 5m
 
 simulator-dry-run: simulator-build
-	cd simulator && ./bin/simulator --dry-run --players 200 --events-per-sec 1000 --duration 10s
+	cd simulator && ./bin/simulator --dry-run --events-per-sec 1000 --duration 10s
 
 # ─── Spark Jobs ───────────────────────────────────────────────────────────
 spark-submit:
@@ -44,7 +44,7 @@ spark-submit:
 	fi
 	# JAVA_TOOL_OPTIONS: host has broken IPv6 — without preferring IPv4 the Ivy
 	# --packages resolution hangs on dead IPv6 routes and reports "not found".
-	# Resource caps: each job gets exactly 1 core / 768MB so all 3 streaming
+	# Resource caps: each job gets exactly 1 core / 768MB so all 4 streaming
 	# jobs coexist on the 2-worker (4 cores / 4G) cluster — without them the
 	# first app claims every core and the rest wait forever.
 	docker exec -e JAVA_TOOL_OPTIONS=-Djava.net.preferIPv4Stack=true gaming-spark-master /opt/spark/bin/spark-submit \
@@ -57,21 +57,21 @@ spark-submit:
 		/opt/spark-apps/src/jobs/$(JOB).py
 
 # ─── ML Model ─────────────────────────────────────────────────────────────
-# streaming/models/ is untracked, so a fresh clone has no directory for the
-# container (uid 185, the Spark user) to write the .joblib artifact into.
-# Recreate it world-writable here before training — otherwise the train script
-# dies with PermissionError on os.makedirs.
+# Only streaming/models/.gitkeep is tracked, so the directory exists in a
+# fresh clone but is owned by the host user; the container runs as uid 185
+# (the Spark user) and cannot write the .joblib artifact into it. Make it
+# world-writable before training — otherwise the train script dies with
+# PermissionError.
 train-model:
 	mkdir -p streaming/models
 	chmod 777 streaming/models
 	docker exec -w /opt/spark-apps gaming-spark-master python3 src/ml/train_isolation_forest.py
 
 # ─── API Service ──────────────────────────────────────────────────────────
+# `make up` already starts the API at :8000; this rebuilds/restarts it alone
+# (needed after any change under api/ — the sources are COPY'd, not mounted).
 api-up:
 	docker compose up -d --build api
-
-api-run:
-	uvicorn api.main:app --reload --host 0.0.0.0 --port 8000
 
 # ─── Tests ────────────────────────────────────────────────────────────────
 test-go:
@@ -96,20 +96,25 @@ spark-batch:
 benchmark:
 	bash benchmarks/run_benchmark.sh
 
+# plot_results.py picks the newest benchmarks/results/*/tiers.jsonl itself;
+# pass TIERS=<path> to plot an older run.
 benchmark-plot:
-	uv run --with matplotlib python3 benchmarks/plot_results.py $$(ls -t benchmarks/results/*/tiers.jsonl 2>/dev/null | head -1)
+	uv run --with matplotlib python3 benchmarks/plot_results.py $(TIERS)
 
 # ─── Cleanup ──────────────────────────────────────────────────────────────
+# Streaming checkpoints live in ./data/checkpoints (owned by uid 185) and are
+# deliberately NOT removed here — deleting them resets every query's offsets.
 clean:
-	rm -rf /tmp/spark-checkpoints/*
 	rm -rf simulator/bin/
 	find . -type d -name "__pycache__" -exec rm -rf {} +
 
 # ─── Help ─────────────────────────────────────────────────────────────────
 help:
 	@echo "🎮 Gaming Intelligence Platform - Commands:"
-	@echo "  make up                     Start Kafka, Spark, Redis, Postgres (builds images)"
+	@echo "  make up                     Start Kafka, Spark, Redis, Postgres, API, alert engine (builds images)"
 	@echo "  make down                   Stop all containers"
+	@echo "  make restart                down + up"
+	@echo "  make ps                     Show container status"
 	@echo "  make logs                   Tail container logs"
 	@echo "  make kafka-topics           List all Kafka topics"
 	@echo "  make kafka-console-consumer TOPIC=<name> Read stream in console"
@@ -117,9 +122,11 @@ help:
 	@echo "  make simulator-run          Execute Go simulator against Kafka"
 	@echo "  make simulator-dry-run      Execute Go simulator in dry-run mode (no Kafka)"
 	@echo "  make spark-submit JOB=<job> Submit a PySpark streaming job (server_health, cheat_detection, match_quality, advanced_analytics)"
-	@echo "  make train-model            Train the IsolationForest artifact (creates streaming/models/)"
-	@echo "  make api-up                 Start FastAPI backend in Docker on port 8000"
-	@echo "  make api-run                Start FastAPI backend on host (needs local Python deps)"
+	@echo "  make spark-batch JOB=<job>  Historical batch analysis on the Parquet archive (all, skill, weapon, cheat, quality, servers, peak)"
+	@echo "  make train-model            Train the IsolationForest artifact into streaming/models/"
+	@echo "  make api-up                 Rebuild + restart the FastAPI container (port 8000)"
 	@echo "  make test-go                Run Go simulator unit tests"
 	@echo "  make test-streaming         Run PySpark pipeline tests in the Spark container"
-	@echo "  make clean                  Clean temp caches and binaries"
+	@echo "  make benchmark              Tiered load benchmark (RATES=, DURATION=, DRAIN_MAX=)"
+	@echo "  make benchmark-plot         Plot the newest benchmark run to docs/benchmarks.png (TIERS=<file> for another)"
+	@echo "  make clean                  Remove simulator binary and __pycache__ dirs"
