@@ -110,7 +110,7 @@ def write_server_health(r, spark, rows):
                 server_data,
             ))
     pipe.execute()
-    alerts.flush(spark)
+    alerts.flush()
 
 
 def write_server_health_batch(batch_df, batch_id):

@@ -9,6 +9,8 @@ Every alert goes to BOTH:
 import json
 import time
 
+from kafka import KafkaProducer
+
 from src.common.config import KAFKA_BOOTSTRAP_SERVERS, KAFKA_TOPICS
 from src.common.runtime import warn
 
@@ -16,6 +18,22 @@ ALERTS_TOPIC = KAFKA_TOPICS["alerts"]
 DEDUP_TTL_SECONDS = 300
 RECENT_KEY = "alerts:recent"
 RECENT_MAX = 100
+_producer = None
+
+
+def _kafka_producer():
+    """Reuse one driver-side producer per streaming process."""
+    global _producer
+    if _producer is None:
+        _producer = KafkaProducer(
+            bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
+            value_serializer=lambda value: json.dumps(value).encode("utf-8"),
+            acks="all",
+            retries=3,
+            max_block_ms=10_000,
+            request_timeout_ms=10_000,
+        )
+    return _producer
 
 
 def make_alert(alert_type, severity, entity_type, entity_id, message, details):
@@ -42,8 +60,8 @@ class AlertBatch:
 
     emit() claims the dedup key (SET NX EX: at most one alert per type and
     entity per TTL, or every micro-batch would re-alert the same entity) and
-    pushes the Redis copy. flush() publishes everything to Kafka in ONE Spark
-    write; a per-alert write would launch a distributed job per alert.
+    pushes the Redis copy. flush() publishes directly from the driver with a
+    reusable Kafka producer, without scheduling a Spark job.
 
     A failed Kafka write never kills the micro-batch. It releases the dedup
     claims, so the next batch that still sees the condition publishes again
@@ -64,18 +82,15 @@ class AlertBatch:
         pipe.execute()
         self.pending.append(payload)
 
-    def flush(self, spark):
+    def flush(self):
         if not self.pending:
             return
         pending, self.pending = self.pending, []
         try:
-            spark.createDataFrame([(json.dumps(p),) for p in pending],
-                                  schema="value string") \
-                .write \
-                .format("kafka") \
-                .option("kafka.bootstrap.servers", KAFKA_BOOTSTRAP_SERVERS) \
-                .option("topic", ALERTS_TOPIC) \
-                .save()
-        except Exception as e:  # noqa: BLE001 - any Spark/Kafka failure; the batch survives
+            producer = _kafka_producer()
+            futures = [producer.send(ALERTS_TOPIC, payload) for payload in pending]
+            for future in futures:
+                future.get(timeout=15)
+        except Exception as e:  # noqa: BLE001 - any Kafka failure; the batch survives
             warn(f"alert Kafka flush failed ({len(pending)} alerts): {e}")
             self.r.delete(*(_dedup_key(p) for p in pending))

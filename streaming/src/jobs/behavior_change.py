@@ -42,6 +42,8 @@ WARMUP_STEPS = 10 # baseline-only steps before the detector judges
 BEHAVIOR_BOOST = 0.15  # suspicion add-on applied by cheat_detection
 MIN_STEP_SHOTS = 3
 BEHAVIOR_FLAG_TTL_SECONDS = 600
+BEHAVIOR_EXPIRY_KEY = "behavior:anomalies:expiry"
+BEHAVIOR_MIGRATION_KEY = "behavior:anomalies:expiry:migrated:v1"
 
 
 def cusum_step(state, x, k=CUSUM_K, h=CUSUM_H):
@@ -64,11 +66,17 @@ def cusum_step(state, x, k=CUSUM_K, h=CUSUM_H):
         s_neg = min(0.0, float(state["s_neg"]) + z + k)
         anomaly = s_pos > h or s_neg < -h
 
-    # Welford update of the baseline
-    n1 = n + 1
-    prev_mean = float(state.get("mean", 0.0)) if n else float(x)
-    mean = prev_mean + (float(x) - prev_mean) / n1
-    m2 = float(state.get("m2", 0.0)) + (float(x) - mean) * (float(x) - prev_mean)
+    # Alarm observations are out of control; feeding them into Welford would
+    # move the baseline toward a sustained cheat and eventually hide it.
+    if anomaly:
+        n1 = n
+        mean = float(state.get("mean", 0.0))
+        m2 = float(state.get("m2", 0.0))
+    else:
+        n1 = n + 1
+        prev_mean = float(state.get("mean", 0.0)) if n else float(x)
+        mean = prev_mean + (float(x) - prev_mean) / n1
+        m2 = float(state.get("m2", 0.0)) + (float(x) - mean) * (float(x) - prev_mean)
 
     new_state = {
         "n": n1,
@@ -114,6 +122,40 @@ def update_behavior(r, alerts, steps):
 
     steps: rows with player_id, shots, mean_accuracy (see player_steps).
     """
+    now = int(time.time())
+    # One-time migration for anomaly IDs written before the expiry index
+    # existed. Recover their remaining hash TTL or drop entries whose flag
+    # hash has already expired.
+    if not r.exists(BEHAVIOR_MIGRATION_KEY):
+        members = r.smembers("behavior:anomalies")
+        migration = r.pipeline()
+        keep = []
+        for player_id in members:
+            key = f"player:behavior:{player_id}"
+            migration.ttl(key)
+            migration.hget(key, "anomaly")
+        values = migration.execute() if members else []
+        migration = r.pipeline()
+        for player_id, ttl, anomaly in zip(members, values[::2], values[1::2]):
+            if ttl > 0 and anomaly == "1":
+                keep.append((player_id, now + ttl))
+            else:
+                migration.srem("behavior:anomalies", player_id)
+        if keep:
+            migration.zadd(BEHAVIOR_EXPIRY_KEY, dict(keep))
+        migration.set(BEHAVIOR_MIGRATION_KEY, "1")
+        migration.execute()
+
+    # The behavior hash has a TTL, but Redis set members do not. Keep an
+    # expiry index and reap stale IDs on each batch, including players who
+    # have gone offline and will never produce another step.
+    expired = r.zrangebyscore(BEHAVIOR_EXPIRY_KEY, "-inf", now)
+    if expired:
+        cleanup = r.pipeline()
+        cleanup.srem("behavior:anomalies", *expired)
+        cleanup.zremrangebyscore(BEHAVIOR_EXPIRY_KEY, "-inf", now)
+        cleanup.execute()
+
     pipe = r.pipeline()
     for row in steps:
         pipe.hgetall(f"behavior:cusum:{row['player_id']}")
@@ -148,6 +190,8 @@ def update_behavior(r, alerts, steps):
             pipe.hset(f"player:behavior:{player_id}", mapping=info)
             pipe.expire(f"player:behavior:{player_id}", BEHAVIOR_FLAG_TTL_SECONDS)
             pipe.sadd("behavior:anomalies", player_id)
+            pipe.zadd(BEHAVIOR_EXPIRY_KEY,
+                      {player_id: now + BEHAVIOR_FLAG_TTL_SECONDS})
             alerts.emit(make_alert(
                 "BEHAVIOR_ANOMALY", "WARNING", "PLAYER", player_id,
                 f"CUSUM detected sustained accuracy shift for {player_id} "
@@ -156,6 +200,7 @@ def update_behavior(r, alerts, steps):
             ))
         elif not flag_alive:
             pipe.srem("behavior:anomalies", player_id)
+            pipe.zrem(BEHAVIOR_EXPIRY_KEY, player_id)
     pipe.execute()
 
 
@@ -166,7 +211,7 @@ def write_behavior_batch(batch_df, batch_id):
         r = redis_client()
         alerts = AlertBatch(r)
         update_behavior(r, alerts, player_steps(batch_df).collect())
-        alerts.flush(batch_df.sparkSession)
+        alerts.flush()
     except Exception as e:  # noqa: BLE001 - keep the stream alive; next batch retries
         warn(f"behavior batch {batch_id}: {e}")
     # Raw SHOT rows: the batch jobs (skill, weapon, peak) read this archive.

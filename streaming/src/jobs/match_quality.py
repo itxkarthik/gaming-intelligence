@@ -178,6 +178,7 @@ def write_matches(r, spark, rows):
         }
         pipe.hset(f"match:{match_id}", mapping=match_data)
         pipe.zadd("matches:quality", {match_id: score})
+        pipe.zadd("matches:timeline", {match_id: int(match_data["updated_at"])})
         if row["status"] == "STOMPED":
             alerts.emit(make_alert(
                 "MATCH_QUALITY_LOW", "WARNING", "MATCH", match_id,
@@ -185,7 +186,7 @@ def write_matches(r, spark, rows):
                 match_data,
             ))
     pipe.execute()
-    alerts.flush(spark)
+    alerts.flush()
 
 
 def write_matches_batch(batch_df, batch_id):

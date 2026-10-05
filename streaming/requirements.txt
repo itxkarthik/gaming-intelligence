@@ -3,6 +3,7 @@
 # /opt/spark/python. Every version is exact and has a cp38 / py3 wheel.
 # scikit-learn must stay 1.3.x: streaming/models/*.joblib is pickled by 1.3.2.
 redis==5.0.4
+kafka-python==2.0.2
 numpy==1.24.4
 pandas==2.0.3
 scipy==1.10.1

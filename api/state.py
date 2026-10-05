@@ -268,27 +268,30 @@ async def read_recent_matches(limit: int = 40,
                               recent_seconds: int = MATCH_RECENT_SECONDS) -> dict[str, Any]:
     """Most recently scored matches (newest first).
 
-    Match ids come from the `matches:quality` zset (no SCAN); one pipelined
-    HGET of `updated_at` per id orders them, one more fetches the top rows.
+    Match ids come from the `matches:timeline` zset ordered by update time.
     Each row's `recent` = rewritten within `recent_seconds` (the session
     window closed and was scored then — not a live match).
     """
     r = redis_client()
-    ids = await r.zrange("matches:quality", 0, -1)
-    stamps = await _pipeline(lambda p: [p.hget(f"match:{i}", "updated_at") for i in ids]) if ids else []
+    if limit <= 0:
+        tracked = await r.zcard("matches:quality")
+        return {"rows": [], "tracked": tracked, "recent": 0}
     now = time.time()
-    dated = sorted(((as_float(u), i) for i, u in zip(ids, stamps, strict=True) if u is not None),
-                   reverse=True)
-    recent = sum(1 for u, _ in dated if 0 <= now - u <= recent_seconds)
-    top = dated[:limit]
+    recent_since = now - recent_seconds
+    top, tracked, recent = await _pipeline(lambda p: (
+        p.zrevrange("matches:timeline", 0, max(0, limit - 1), withscores=True),
+        p.zcard("matches:quality"),
+        p.zcount("matches:timeline", recent_since, now),
+    ))
     rows = []
-    for (updated, _), data in zip(top, await _hgetall_many([f"match:{i}" for _, i in top]),
-                                  strict=True):
+    ids = [match_id for match_id, _ in top]
+    for (match_id, updated), data in zip(top,
+                                         await _hgetall_many([f"match:{i}" for i in ids]), strict=True):
         if data:
             data["quality_score"] = as_float(data.get("quality_score"))
-            data["recent"] = 0 <= now - updated <= recent_seconds
+            data["recent"] = updated is not None and 0 <= now - updated <= recent_seconds
             rows.append(data)
-    return {"rows": rows, "tracked": len(dated), "recent": recent}
+    return {"rows": rows, "tracked": tracked, "recent": recent}
 
 
 async def read_match_summary() -> dict[str, Any]:

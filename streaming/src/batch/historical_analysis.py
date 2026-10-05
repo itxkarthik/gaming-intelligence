@@ -94,14 +94,18 @@ def latest_per_key(df, keys):
     """Keep the last archived row per key.
 
     Update-mode queries re-archive a window each micro-batch until the
-    watermark closes it; the final row is the complete one. Every micro-batch
-    writes its own file (coalesce(1)), so the source file's modification time
-    orders the versions. Call on a DataFrame straight from read() — the
-    hidden _metadata column only exists on the file source.
+    watermark closes it; the final row is the complete one. The persisted
+    archive timestamp orders versions after compaction; old archives fall
+    back to source file modification time. Call on a DataFrame straight from
+    read() — the hidden _metadata column only exists on the file source.
     """
-    w = Window.partitionBy(*keys).orderBy(
-        F.col("_metadata.file_modification_time").desc()
-    )
+    # The persisted timestamp survives Parquet compaction; legacy archives
+    # fall back to each source file's modification time.
+    archived_at = (F.coalesce(F.col("archive_written_at"),
+                              F.col("_metadata.file_modification_time"))
+                   if "archive_written_at" in df.columns
+                   else F.col("_metadata.file_modification_time"))
+    w = Window.partitionBy(*keys).orderBy(archived_at.desc())
     return (
         df.withColumn("_rn", F.row_number().over(w))
         .filter(F.col("_rn") == 1)

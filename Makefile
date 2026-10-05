@@ -1,7 +1,11 @@
-.PHONY: up down restart logs ps clean kafka-topics kafka-console-consumer simulator-build simulator-run simulator-dry-run spark-submit spark-batch train-model api-up test-go test-streaming benchmark benchmark-plot help
+.PHONY: init-dirs up down restart logs ps clean kafka-topics kafka-console-consumer simulator-build simulator-run simulator-dry-run spark-submit spark-batch spark-compact train-model api-up test-go test-streaming benchmark benchmark-plot help
 
 # ─── Docker Infrastructure ────────────────────────────────────────────────
-up:
+init-dirs:
+	mkdir -p data/checkpoints data/parquet streaming/models
+	chmod -R 777 data streaming/models
+
+up: init-dirs
 	docker compose up -d --build
 
 down:
@@ -42,8 +46,6 @@ spark-submit:
 		echo "Usage: make spark-submit JOB=server_health (or cheat_detection, match_quality, advanced_analytics)"; \
 		exit 1; \
 	fi
-	# JAVA_TOOL_OPTIONS: host has broken IPv6 — without preferring IPv4 the Ivy
-	# --packages resolution hangs on dead IPv6 routes and reports "not found".
 	# Resource caps: each job gets exactly 1 core / 768MB so all 4 streaming
 	# jobs coexist on the 2-worker (4 cores / 4G) cluster — without them the
 	# first app claims every core and the rest wait forever.
@@ -53,7 +55,6 @@ spark-submit:
 		--conf spark.executor.cores=1 \
 		--conf spark.executor.memory=512m \
 		--conf spark.executor.memoryOverhead=256m \
-		--packages org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1 \
 		/opt/spark-apps/src/jobs/$(JOB).py
 
 # ─── ML Model ─────────────────────────────────────────────────────────────
@@ -93,6 +94,18 @@ spark-batch:
 		--master 'local[1]' \
 		/opt/spark-apps/src/batch/historical_analysis.py --job $(JOB)
 
+# Run only after stopping every streaming job; the command swaps each archive
+# directory after its compacted copy has been written successfully.
+spark-compact:
+	@if [ "$(STREAMS_STOPPED)" != "1" ]; then \
+		echo "Stop all streaming jobs, then run: make spark-compact STREAMS_STOPPED=1 [JOB=all] [FILES=4]"; \
+		exit 1; \
+	fi
+	docker exec -w /opt/spark-apps gaming-spark-master /opt/spark/bin/spark-submit \
+		--master 'local[1]' \
+		/opt/spark-apps/src/batch/compact_parquet.py \
+		--job $(if $(JOB),$(JOB),all) --files $(if $(FILES),$(FILES),4) --streams-stopped
+
 benchmark:
 	bash benchmarks/run_benchmark.sh
 
@@ -112,6 +125,7 @@ clean:
 help:
 	@echo "🎮 Gaming Intelligence Platform - Commands:"
 	@echo "  make up                     Start Kafka, Spark, Redis, Postgres, API, alert engine (builds images)"
+	@echo "  make init-dirs              Create writable Spark bind-mount directories"
 	@echo "  make down                   Stop all containers"
 	@echo "  make restart                down + up"
 	@echo "  make ps                     Show container status"
@@ -123,6 +137,7 @@ help:
 	@echo "  make simulator-dry-run      Execute Go simulator in dry-run mode (no Kafka)"
 	@echo "  make spark-submit JOB=<job> Submit a PySpark streaming job (server_health, cheat_detection, match_quality, advanced_analytics)"
 	@echo "  make spark-batch JOB=<job>  Historical batch analysis on the Parquet archive (all, skill, weapon, cheat, quality, servers, peak)"
+	@echo "  make spark-compact STREAMS_STOPPED=1 [JOB=<archive|all>] [FILES=4] Compact Parquet archives after stopping streaming jobs"
 	@echo "  make train-model            Train the IsolationForest artifact into streaming/models/"
 	@echo "  make api-up                 Rebuild + restart the FastAPI container (port 8000)"
 	@echo "  make test-go                Run Go simulator unit tests"

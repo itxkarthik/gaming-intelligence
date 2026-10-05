@@ -199,7 +199,7 @@ def write_player_scores(r, spark, rows):
                 pipe.srem("players:flagged", player_id)
         pipe.hset(f"player:{player_id}", mapping=profile)
     pipe.execute()
-    alerts.flush(spark)
+    alerts.flush()
 
 
 def write_player_scores_batch(batch_df, batch_id):
