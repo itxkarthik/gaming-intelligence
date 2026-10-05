@@ -109,11 +109,11 @@ func TestParseAlertRejectsMissingRequiredFields(t *testing.T) {
 // ─── keys ──────────────────────────────────────────────────────────────────
 
 func TestKeyFormats(t *testing.T) {
-	a := Alert{AlertType: "SMURF_DETECTED", EntityType: "PLAYER", EntityID: "player_0007"}
+	a := Alert{AlertType: "SMURF_DETECTED", Severity: "WARNING", EntityType: "PLAYER", EntityID: "player_0007"}
 	if got, want := dedupKey(a), "engine:dedup:SMURF_DETECTED:player_0007"; got != want {
 		t.Errorf("dedupKey = %q, want %q", got, want)
 	}
-	if got, want := rateKey(a), "engine:ratelimit:PLAYER:player_0007"; got != want {
+	if got, want := rateKey(a), "engine:ratelimit:PLAYER:player_0007:WARNING"; got != want {
 		t.Errorf("rateKey = %q, want %q", got, want)
 	}
 }
@@ -148,6 +148,22 @@ func TestShouldForwardRateLimitsAcrossTypes(t *testing.T) {
 	// "max 1 alert per player per 5 min".
 	if shouldForward(context.Background(), g, second, time.Minute, time.Minute) {
 		t.Error("second alert for same entity within window must be rate limited")
+	}
+}
+
+func TestShouldForwardWarningDoesNotMaskCritical(t *testing.T) {
+	g := newFakeGate()
+	warning := Alert{AlertID: "a1", AlertType: "BEHAVIOR_ANOMALY", Severity: "WARNING", EntityType: "PLAYER", EntityID: "p1"}
+	critical := Alert{AlertID: "a2", AlertType: "CHEAT_DETECTED", Severity: "CRITICAL", EntityType: "PLAYER", EntityID: "p1"}
+	another := Alert{AlertID: "a3", AlertType: "SMURF_DETECTED", Severity: "WARNING", EntityType: "PLAYER", EntityID: "p1"}
+	if !shouldForward(context.Background(), g, warning, time.Minute, time.Minute) {
+		t.Fatal("first warning must be forwarded")
+	}
+	if !shouldForward(context.Background(), g, critical, time.Minute, time.Minute) {
+		t.Error("a CRITICAL alert must not be rate limited by an earlier WARNING")
+	}
+	if shouldForward(context.Background(), g, another, time.Minute, time.Minute) {
+		t.Error("a second WARNING for the same entity within the window must be rate limited")
 	}
 }
 

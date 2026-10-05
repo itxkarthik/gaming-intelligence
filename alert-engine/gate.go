@@ -34,10 +34,11 @@ func dedupKey(a Alert) string {
 	return dedupKeyPrefix + a.AlertType + ":" + a.EntityID
 }
 
-// rateKey: at most ONE alert per entity per window regardless of type —
-// the "max 1 alert per player per 5 min" roadmap requirement.
+// rateKey: at most ONE alert per entity per window per severity, regardless
+// of type — the roadmap's "max 1 alert per player per 5 min", applied per
+// severity so a routine WARNING can never mask a CRITICAL that follows it.
 func rateKey(a Alert) string {
-	return rateLimitKeyPrefix + a.EntityType + ":" + a.EntityID
+	return rateLimitKeyPrefix + a.EntityType + ":" + a.EntityID + ":" + a.Severity
 }
 
 // shouldForward applies the dedup gate first, then the entity-wide rate
