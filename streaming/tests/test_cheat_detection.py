@@ -16,9 +16,11 @@ from pyspark.sql import functions as F
 
 from src.common.schemas import GAMEPLAY_EVENT_SCHEMA, SHOT_EVENT
 from src.jobs.cheat_detection import (
+    FOREST_PERSIST_SECONDS,
     best_window_per_player,
     build_suspicion_pipeline,
     cheat_verdict,
+    forest_persistence,
 )
 from src.ml.iforest import HS_PRIOR, HS_PRIOR_HITS
 
@@ -188,3 +190,17 @@ def test_smurf_who_trips_the_heuristic_is_still_a_cheat():
     assert cheat_verdict(0.75, iforest_flag=True, smurf=True) == (True, False)
     assert cheat_verdict(0.90, iforest_flag=False, smurf=True) == (True, True)
     assert cheat_verdict(0.50, iforest_flag=False, smurf=False) == (False, False)
+
+
+def test_single_forest_window_does_not_count_until_it_persists():
+    since, persistent = forest_persistence(None, True, now=1000.0)
+    assert (since, persistent) == (1000.0, False)
+    since, persistent = forest_persistence(since, True, now=1000.0 + FOREST_PERSIST_SECONDS - 1)
+    assert persistent is False
+    assert forest_persistence(since, True, now=1000.0 + FOREST_PERSIST_SECONDS) == (1000.0, True)
+
+
+def test_clean_window_resets_forest_persistence():
+    assert forest_persistence(1000.0, False, now=2000.0) == (None, False)
+    # a new outlier run starts from scratch
+    assert forest_persistence(None, True, now=2001.0) == (2001.0, False)

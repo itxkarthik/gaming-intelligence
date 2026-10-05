@@ -31,6 +31,9 @@ from src.ml.iforest import (
 
 FLAG_THRESHOLD = 0.70     # effective suspicion that flags a player
 CRITICAL_THRESHOLD = 0.85
+# An IsolationForest outlier must persist this long before it counts: one
+# lucky 30 s window trips the model, a cheater stays an outlier window after window.
+FOREST_PERSIST_SECONDS = 30
 
 
 def _ramp(col, zero, full):
@@ -118,9 +121,23 @@ def best_window_per_player(rows):
     return [row for _, row in best.values()]
 
 
+def forest_persistence(since, iforest_flag, now):
+    """(new_since, persistent) for one judged window. Pure, unit-testable.
+
+    `since` is when the model first flagged the player in the current
+    unbroken run of flagged windows (None when the last judged window was
+    clean). A clean window resets it.
+    """
+    if not iforest_flag:
+        return None, False
+    since = now if since is None else since
+    return since, now - since >= FOREST_PERSIST_SECONDS
+
+
 def cheat_verdict(suspicion_eff, iforest_flag, smurf):
     """(flagged, critical) for one judged window. Pure, unit-testable.
 
+    `iforest_flag` is the PERSISTENT model flag (see forest_persistence).
     The heuristic flags on its own. An IsolationForest-only flag on a
     confirmed smurf is explained by the smurf verdict (a fresh account
     playing far above its rank IS a statistical outlier) and is left to
@@ -145,11 +162,13 @@ def write_player_scores(r, spark, rows):
     for row in rows:
         pipe.hget(f"player:behavior:{row['player_id']}", "anomaly")
         pipe.hget(f"player:smurf:{row['player_id']}", "status")
+        pipe.hget(f"player:{row['player_id']}", "iforest_since")
     reads = pipe.execute()
+    now = time.time()
 
     pipe = r.pipeline()
-    for row, iforest_score, behavior, smurf_status in zip(
-            rows, iforest_scores, reads[::2], reads[1::2]):
+    for row, iforest_score, behavior, smurf_status, since in zip(
+            rows, iforest_scores, reads[::3], reads[1::3], reads[2::3]):
         player_id = row["player_id"]
         behavior_anomaly = behavior == "1"
         suspicion = round(float(row["suspicion_score"]), 3)
@@ -160,7 +179,10 @@ def write_player_scores(r, spark, rows):
 
         # Too few shots to judge: refresh the stats, keep the previous verdict.
         if int(row["total_shots"]) >= MIN_SHOTS:
-            flagged, critical = cheat_verdict(suspicion_eff, iforest_flag,
+            since, persistent = forest_persistence(
+                float(since) if since else None, iforest_flag, now)
+            profile["iforest_since"] = f"{since:.0f}" if since is not None else ""
+            flagged, critical = cheat_verdict(suspicion_eff, persistent,
                                               smurf_status == "SMURF")
             profile["flagged"] = "true" if flagged else "false"
             if flagged:
@@ -170,7 +192,7 @@ def write_player_scores(r, spark, rows):
                     f"Cheat anomaly for {player_id} in {row['match_id']}: "
                     f"suspicion {suspicion_eff * 100:.1f}%"
                     f"{' + CUSUM behavior' if behavior_anomaly else ''}"
-                    f"{' + IsolationForest' if iforest_flag else ''}",
+                    f"{' + IsolationForest' if persistent else ''}",
                     profile,
                 ))
             else:
