@@ -1,54 +1,39 @@
-# Binaries & Executables
+# Go binaries
 simulator/bin/
+alert-engine/bin/
+simulator/vendor/
+
+# Native artifacts
 *.exe
 *.exe~
 *.dll
 *.so
 *.dylib
 
-# Go
-simulator/vendor/
-
 # Python
 __pycache__/
 *.py[cod]
-*$py.class
-*.so
-.Python
-env/
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
 *.egg-info/
-.installed.cfg
-*.egg
-.env
+.venv/
 venv/
-ENV/
+.env
 .pytest_cache/
+.ruff_cache/
 
-# Spark & Checkpoints
-# Trained ML artifacts (reproduce: src/ml/train_isolation_forest.py)
+# Trained ML artifacts (reproduce: make train-model)
 streaming/models/*.joblib
+
+# Spark local-mode leftovers
 metastore_db/
 derby.log
 spark-warehouse/
 
-# Agent scratch dirs
-.agents/
-
-# Docker & Storage volumes
+# Runtime data: checkpoints + Parquet archive (bind-mounted into Spark)
 data/
 *.log
+
+# Benchmark raw output (make benchmark-plot renders docs/benchmarks.png)
+benchmarks/results/
 
 # IDEs & Editors
 .idea/
@@ -57,6 +42,3 @@ data/
 *.swo
 *~
 .DS_Store
-
-# Benchmark raw output (distilled results live in docs/benchmarks.md)
-benchmarks/results/
