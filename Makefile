@@ -3,7 +3,8 @@
 # ─── Docker Infrastructure ────────────────────────────────────────────────
 init-dirs:
 	mkdir -p data/checkpoints data/parquet streaming/models
-	chmod -R 777 data streaming/models
+	chmod 777 data data/checkpoints data/parquet streaming/models 2>/dev/null || true
+	-chmod -R 777 data streaming/models 2>/dev/null || true
 
 up: init-dirs
 	docker compose up -d --build
