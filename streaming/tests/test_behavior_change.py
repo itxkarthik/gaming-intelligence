@@ -48,10 +48,13 @@ def test_single_spike_does_not_flag():
 
 
 def test_cusum_state_roundtrip():
-    state, _ = _run([0.10, 0.12] * 6 + [0.45] * 8)
+    series = [0.10, 0.12] * 6 + [0.45] * 8
+    state, _ = _run(series)
     restored = load_state({k: str(v) for k, v in state.items()})
     assert restored == state
-    assert restored["n"] == 20
+    # Alarm observations are counted as detections but excluded from the
+    # in-control baseline sample count.
+    assert restored["n"] == len(series) - restored["anomalies"]
 
 
 def test_behavior_boost_clamps_and_applies():
