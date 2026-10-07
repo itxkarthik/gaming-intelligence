@@ -1,10 +1,10 @@
-# 🎮 Real-Time Competitive Gaming Intelligence Platform
+# Real-Time Competitive Gaming Intelligence Platform
 
-A high-throughput, distributed streaming platform designed to monitor game server infrastructure, score match quality, profile player behavior, and detect anomalies (aimbots, wallhacks, smurfs) in real time using **Apache Kafka**, **Apache Spark Structured Streaming**, **Go**, and **PySpark**.
+A high-throughput, distributed streaming platform designed to monitor game server infrastructure, score match quality, profile player behavior, and detect anomalies (aimbots, smurfs) in real time using **Apache Kafka**, **Apache Spark Structured Streaming**, **Go**, and **PySpark**.
 
 ---
 
-## 🏗️ Architecture
+## Architecture
 
 ```text
                               SIMULATOR (Go)
@@ -38,7 +38,7 @@ A high-throughput, distributed streaming platform designed to monitor game serve
 
 ---
 
-## 🛠️ Technology Stack
+## Technology Stack
 
 | Layer | Technology |
 |---|---|
@@ -54,7 +54,7 @@ A high-throughput, distributed streaming platform designed to monitor game serve
 
 ---
 
-## 📁 Project Structure
+## Project Structure
 
 ```text
 gaming-intelligence-platform/
@@ -115,7 +115,7 @@ gaming-intelligence-platform/
 
 ---
 
-## 📸 Screenshots
+## Screenshots
 
 **Overview** — live KPIs, event stream, alerts, flagged players:
 
@@ -142,7 +142,7 @@ PostgreSQL `alert_history`:
 
 ---
 
-## 🚀 Quick Start
+## Quick Start
 
 ### 1. Launch the Infrastructure
 ```bash
@@ -218,7 +218,7 @@ jobs hold every cluster core. It reads the Parquet archive the jobs write to
 
 ---
 
-## ⚙️ Configuration
+## Configuration
 
 ### Alert engine (environment variables)
 
@@ -267,7 +267,7 @@ failure, `2` on a usage error.
 
 ---
 
-## 📄 License
+## License
 
 Released under the **MIT License** — see [LICENSE](LICENSE) for the full text.
 
