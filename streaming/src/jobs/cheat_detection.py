@@ -32,6 +32,8 @@ from src.common.runtime import (
 )
 from src.common.schemas import SHOT_EVENT, parse_stream
 from src.common.sinks import safe_parquet_archive
+
+PLAYER_STATE_TTL_SECONDS = 30 * 24 * 60 * 60
 from src.jobs.behavior_change import apply_behavior_boost
 from src.jobs.smurf_detection import evaluate_smurfs
 from src.ml.iforest import (
@@ -269,6 +271,7 @@ def write_player_scores(r, spark, rows, checkpoint_id=None, batch_id=None):
                 "match_id": row["match_id"],
                 "run_id": run_id,
             })
+            pipe.expire(evidence_key, PLAYER_STATE_TTL_SECONDS)
             flagged, critical = cheat_verdict(suspicion_eff, persistent, is_smurf)
             profile = _profile(row, suspicion, suspicion_eff, behavior_anomaly,
                                iforest_score, persistent)
@@ -287,6 +290,7 @@ def write_player_scores(r, spark, rows, checkpoint_id=None, batch_id=None):
             else:
                 pipe.srem("players:flagged", player_id)
             pipe.hset(f"player:{player_id}", mapping=profile)
+            pipe.expire(f"player:{player_id}", PLAYER_STATE_TTL_SECONDS)
         else:
             persistent = False
             flagged = False

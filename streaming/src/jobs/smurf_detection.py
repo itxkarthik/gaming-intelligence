@@ -38,6 +38,7 @@ SMURF_PROB_THRESHOLD = 0.85
 MIN_COMBAT_SHOTS = 8
 ACCOUNT_FIELDS = ("account_age_days", "games_played", "rank", "archetype")
 PIPELINE_CHUNK_SIZE = 200
+PLAYER_STATE_TTL_SECONDS = 30 * 24 * 60 * 60
 
 _WRITE_ACCOUNT = """
 local stored_login = tonumber(redis.call('HGET', KEYS[1], 'login_at'))
@@ -184,8 +185,9 @@ def evaluate_smurfs(r, alerts, rows):
             with r.pipeline() as pipe:
                 alerts.stage(pipe)
                 pipe.execute()
-        return
+        return []
 
+    emitted = []
     buffered = list(alerts.pending)
     alerts.pending.clear()
     for start in range(0, len(rows), PIPELINE_CHUNK_SIZE):
@@ -212,13 +214,12 @@ def evaluate_smurfs(r, alerts, rows):
 
             buffered = []
             eval_results = results[:len(pending_rows)]
-            if hasattr(alerts, "emitted"):
-                for alert, ok in zip(staged_alerts, eval_results):
-                    if ok and alert is not None:
-                        alerts.emitted.append(alert)
+            emitted.extend(alert for alert, ok in zip(staged_alerts, eval_results)
+                           if ok and alert is not None)
             pending_rows = [
                 row for row, ok in zip(pending_rows, eval_results) if not ok
             ]
+    return emitted
 
 
 def _queue_smurf_evaluation(pipe, row, raw):
@@ -302,6 +303,8 @@ def _queue_smurf_evaluation(pipe, row, raw):
         json.dumps(alert) if alert is not None else "",
         str(alerts_mod.DEDUP_TTL_SECONDS),
     )
+    pipe.expire(f"player:account:{player_id}", PLAYER_STATE_TTL_SECONDS)
+    pipe.expire(f"player:smurf:{player_id}", PLAYER_STATE_TTL_SECONDS)
     return alert
 
 
@@ -346,6 +349,7 @@ def write_accounts(r, rows):
                     str(CANDIDATE_MAX_GAMES),
                     *flat_update,
                 )
+                pipe.expire(f"player:account:{player_id}", PLAYER_STATE_TTL_SECONDS)
             pipe.execute()
 
 

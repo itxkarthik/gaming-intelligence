@@ -128,6 +128,19 @@ func serve(ctx context.Context, cfg Config) error {
 	}
 	if cfg.WebhookURL != "" {
 		h.notifier = webhookNotifier{client: &http.Client{Timeout: webhookTimeout}, url: cfg.WebhookURL}
+		h.webhookQueue = make(chan Alert, 128)
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case alert := <-h.webhookQueue:
+					if err := h.notifier.Notify(context.Background(), alert); err != nil {
+						log.Printf("[WARN] webhook %s: %v", alert.AlertID, err)
+					}
+				}
+			}
+		}()
 	}
 
 	log.Printf("alert-engine up: brokers=%v group=%s topic=%s redis=%s postgres=%s webhook=%s dedup_ttl=%s rate_limit_ttl=%s",

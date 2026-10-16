@@ -100,7 +100,7 @@ def make_alert(alert_type, severity, entity_type, entity_id, message, details):
     """Payload matching schemas/alert.avsc (details values must be strings)."""
     now_ms = int(time.time() * 1000)
     return {
-        "alert_id": f"{alert_type.lower()}_{entity_id}_{now_ms}",
+        "alert_id": str(uuid.uuid4()),
         "alert_type": alert_type,
         "severity": severity,
         "entity_type": entity_type,

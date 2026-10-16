@@ -30,6 +30,7 @@ type gateClaim struct {
 // of the same alertID after a crash before Kafka offset commit.
 type Gate interface {
 	Admit(ctx context.Context, alertID string, claims ...gateClaim) (bool, error)
+	Release(ctx context.Context, alertID string, claims ...gateClaim) error
 }
 
 // dedupKey: one alert per (type, entity) per window — the engine's own
@@ -85,6 +86,13 @@ end
 return 1
 `)
 
+var releaseScript = redis.NewScript(`
+for i = 1, #KEYS do
+  if redis.call('GET', KEYS[i]) == ARGV[1] then redis.call('DEL', KEYS[i]) end
+end
+return 1
+`)
+
 // redisGate implements Gate atomically via a server-side Lua script.
 type redisGate struct {
 	rdb *redis.Client
@@ -106,4 +114,12 @@ func (g redisGate) Admit(ctx context.Context, alertID string, claims ...gateClai
 		return false, err
 	}
 	return res == 1, nil
+}
+
+func (g redisGate) Release(ctx context.Context, alertID string, claims ...gateClaim) error {
+	keys := make([]string, len(claims))
+	for i, c := range claims {
+		keys[i] = c.key
+	}
+	return releaseScript.Run(ctx, g.rdb, keys, alertID).Err()
 }

@@ -25,7 +25,7 @@ services:
       # Host clients (simulator, benchmarks) use EXTERNAL on 9094. PLAINTEXT
       # 9092 advertises kafka:9092 — only reachable on the compose network —
       # so it is not published.
-      - "9094:9094"
+      - "127.0.0.1:9094:9094"
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
@@ -92,7 +92,7 @@ services:
     container_name: gaming-spark-master
     command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master --host spark-master --port 7077 --webui-port 8080
     ports:
-      - "8080:8080" # Spark Master Web UI
+      - "127.0.0.1:8080:8080" # Spark Master Web UI
 
   # ─── Spark Workers ──────────────────────────────────────────────────────
   spark-worker-1:
@@ -117,7 +117,7 @@ services:
     container_name: gaming-redis
     command: ["redis-server", "--appendonly", "yes", "--appendfsync", "always"]
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     volumes:
       - redis_data:/data
     networks:
@@ -137,7 +137,7 @@ services:
       - POSTGRES_USER=gaming
       - POSTGRES_PASSWORD=gaming_dev
     ports:
-      - "5433:5432" # Mapped host port 5433 -> container 5432 to avoid host collision
+      - "127.0.0.1:5433:5432" # Mapped host port 5433 -> container 5432 to avoid host collision
     volumes:
       - postgres_data:/var/lib/postgresql/data
     networks:
@@ -155,7 +155,7 @@ services:
       dockerfile: Dockerfile
     container_name: gaming-api
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     environment:
       - REDIS_HOST=redis
       - REDIS_PORT=6379

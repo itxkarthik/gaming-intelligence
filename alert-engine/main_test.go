@@ -38,6 +38,18 @@ func (g *fakeGate) Admit(_ context.Context, alertID string, claims ...gateClaim)
 	return true, nil
 }
 
+func (g *fakeGate) Release(_ context.Context, alertID string, claims ...gateClaim) error {
+	if g.err != nil {
+		return g.err
+	}
+	for _, c := range claims {
+		if g.holders[c.key] == alertID {
+			delete(g.holders, c.key)
+		}
+	}
+	return nil
+}
+
 // ─── classify ──────────────────────────────────────────────────────────────
 
 func TestClassifyPassesValidSeverity(t *testing.T) {

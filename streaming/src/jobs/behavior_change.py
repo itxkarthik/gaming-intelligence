@@ -49,6 +49,7 @@ STEP_WINDOW = "5 seconds"
 STEP_WATERMARK = "30 seconds"  # simulator shots can arrive up to 19 seconds late
 BEHAVIOR_STATE_VERSION = "2"  # baseline/cursor built only from completed windows
 BEHAVIOR_FLAG_TTL_SECONDS = 600
+BEHAVIOR_STATE_TTL_SECONDS = 30 * 24 * 60 * 60
 BEHAVIOR_EXPIRY_KEY = "behavior:anomalies:expiry"
 BEHAVIOR_MIGRATION_KEY = "behavior:anomalies:expiry:migrated:v1"
 
@@ -252,6 +253,7 @@ def update_behavior(r, alerts, steps):
         if "last_window_end_ms" in state:
             mapping["last_window_end_ms"] = str(state["last_window_end_ms"])
         pipe.hset(f"behavior:cusum:{pid}", mapping=mapping)
+        pipe.expire(f"behavior:cusum:{pid}", BEHAVIOR_STATE_TTL_SECONDS)
 
         if any_anomaly and last_anomaly_info is not None:
             batch_mean, z, snap_state = last_anomaly_info

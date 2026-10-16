@@ -91,6 +91,9 @@ class FakePipe:
     def srem(self, k, v):
         self.ops.append(("srem", k, v))
 
+    def expire(self, k, seconds):
+        self.ops.append(("expire", k, seconds))
+
     def eval(self, script, numkeys, *args):
         if numkeys == 2:
             _, _, _, payload, _ = args
@@ -124,6 +127,8 @@ class FakePipe:
                 res.append(1)
             elif op[0] == "srem":
                 self.r.sets.setdefault(op[1], set()).discard(op[2])
+                res.append(1)
+            elif op[0] == "expire":
                 res.append(1)
             elif op[0] == "outbox":
                 self.r.outbox.append(op[1])
@@ -270,7 +275,7 @@ def test_login_only_established_account_clears_stale_smurf(metadata):
     assert r.hashes["player:account:p1"]["login_at"] == "1700000001000"
     # Metadata, evaluation, and membership are committed together in one atomic Lua call.
     assert len(r.transactions) == 1
-    assert [op[0] for op in r.transactions[0]] == ["write_account"]
+    assert [op[0] for op in r.transactions[0]] == ["write_account", "expire"]
 
 
 @pytest.mark.parametrize("metadata", [
@@ -355,11 +360,11 @@ def test_write_accounts_deduplicates_and_batches_in_pipeline_chunks():
 def test_smurf_alert_is_staged_in_state_transaction_not_flushed():
     r = FakeRedis(age=3, games=12)
     alerts = DummyAlerts()
-    evaluate_smurfs(r, alerts, [{"player_id": "p1", **_combat()}])
-    assert len(alerts.emitted) == 1
-    assert r.outbox == alerts.emitted
-    assert [op[0] for op in alerts.staged_ops] == ["evaluate_smurf"]
-    assert [op[0] for op in r.transactions[-1]] == ["evaluate_smurf"]
+    emitted = evaluate_smurfs(r, alerts, [{"player_id": "p1", **_combat()}])
+    assert len(emitted) == 1
+    assert r.outbox == emitted
+    assert [op[0] for op in alerts.staged_ops] == ["evaluate_smurf", "expire", "expire"]
+    assert [op[0] for op in r.transactions[-1]] == ["evaluate_smurf", "expire", "expire"]
 
 
 def test_staging_failure_does_not_commit_smurf_state():
@@ -383,10 +388,10 @@ def test_staging_failure_does_not_commit_smurf_state():
 def test_clean_candidate_combat_still_removes_stale_smurf():
     r = FakeRedis(age=3, games=12)
     alerts = DummyAlerts()
-    evaluate_smurfs(r, alerts, [{"player_id": "p1", **_combat(acc=0.19, rxn=395)}])
+    emitted = evaluate_smurfs(r, alerts, [{"player_id": "p1", **_combat(acc=0.19, rxn=395)}])
     assert r.hashes["player:smurf:p1"]["status"] == "CLEAN"
     assert "p1" not in r.sets["players:smurf"]
-    assert alerts.emitted == []
+    assert emitted == []
 
 
 @pytest.mark.parametrize("alerts_factory", [lambda r: DummyAlerts(), AlertBatch])
@@ -414,7 +419,7 @@ def test_established_login_between_combat_read_and_exec_cannot_restore_smurf(ale
     assert alerts.pending == []
     # The obsolete SMURF intent was rejected by the per-player CAS check on pass 1.
     assert [op[0] for op in r.attempts[0]] == ["evaluate_smurf", "outbox"]
-    assert [op[0] for op in r.transactions[-1]] == ["evaluate_smurf"]
+    assert [op[0] for op in r.transactions[-1]] == ["evaluate_smurf", "expire", "expire"]
 
 
 def test_watch_retry_uses_new_rank_and_retains_only_matching_smurf_intent():

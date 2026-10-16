@@ -72,6 +72,7 @@ type handler struct {
 	store        AlertStore
 	publisher    Publisher
 	notifier     Notifier // nil when the webhook is disabled
+	webhookQueue chan Alert
 	dedupTTL     time.Duration
 	rateLimitTTL time.Duration
 	storeRetry   retryPolicy
@@ -110,6 +111,9 @@ func (h *handler) handle(ctx context.Context, msg kafka.Message) (outcome, error
 		func(ctx context.Context) error { return h.store.Store(ctx, alert) })
 	if err != nil {
 		if isPermanentStoreError(err) {
+			_ = h.gate.Release(ctx, alert.AlertID,
+				gateClaim{key: dedupKey(alert), ttl: h.dedupTTL},
+				gateClaim{key: rateKey(alert), ttl: h.rateLimitTTL})
 			log.Printf("[ERROR] reject partition=%d offset=%d: %v", msg.Partition, msg.Offset, err)
 			return outcomeRejected, nil
 		}
@@ -120,7 +124,13 @@ func (h *handler) handle(ctx context.Context, msg kafka.Message) (outcome, error
 		log.Printf("[WARN] live publish %s: %v", alert.AlertID, err)
 	}
 	if h.notifier != nil {
-		if err := h.notifier.Notify(ctx, alert); err != nil {
+		if h.webhookQueue != nil {
+			select {
+			case h.webhookQueue <- alert:
+			default:
+				log.Printf("[WARN] webhook queue full; dropping notification %s", alert.AlertID)
+			}
+		} else if err := h.notifier.Notify(ctx, alert); err != nil {
 			log.Printf("[WARN] webhook %s: %v", alert.AlertID, err)
 		}
 	}

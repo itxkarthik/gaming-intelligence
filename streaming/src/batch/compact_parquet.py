@@ -21,6 +21,18 @@ from src.common.config import HDFS_OUTPUT_DIR
 
 def compact(spark, name, target_files):
     source = os.path.join(HDFS_OUTPUT_DIR, name)
+    # Recover the only destructive-looking crash interval: source was moved
+    # aside, but the compacted replacement was not yet published.
+    backups = sorted(os.path.join(HDFS_OUTPUT_DIR, entry)
+                     for entry in os.listdir(HDFS_OUTPUT_DIR)
+                     if entry.startswith(f".{name}.backup-"))
+    if not os.path.exists(source) and backups:
+        os.rename(backups[0], source)
+        backups = backups[1:]
+    # A published replacement means any leftover backup is safe to discard.
+    if os.path.isdir(source):
+        for backup in backups:
+            shutil.rmtree(backup)
     if not os.path.isdir(source):
         print(f"Skipping {name}: archive directory not found")
         return

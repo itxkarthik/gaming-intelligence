@@ -16,6 +16,7 @@ import logging
 import os
 import threading
 import time
+from urllib.parse import quote
 from collections import deque
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
@@ -48,7 +49,7 @@ POSTGRES_PORT = int(os.getenv("POSTGRES_PORT", "5432"))
 POSTGRES_USER = os.getenv("POSTGRES_USER", "gaming")
 POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "gaming_dev")
 POSTGRES_DB = os.getenv("POSTGRES_DB", "gaming_platform")
-PG_DSN = (f"postgresql://{POSTGRES_USER}:{POSTGRES_PASSWORD}"
+PG_DSN = (f"postgresql://{quote(POSTGRES_USER, safe='')}:{quote(POSTGRES_PASSWORD, safe='')}"
           f"@{POSTGRES_HOST}:{POSTGRES_PORT}/{POSTGRES_DB}")
 
 HEARTBEAT_SECONDS = 15
@@ -83,7 +84,7 @@ RATE_WINDOW_SECONDS = 60
 SAMPLER_STALE_SECONDS = 3 * SAMPLE_INTERVAL_SECONDS
 
 # Errors that mean "a backing service is unavailable" (-> HTTP 503).
-UNAVAILABLE_ERRORS = (redis.RedisError, OSError, asyncpg.PostgresError)
+UNAVAILABLE_ERRORS = (redis.RedisError, asyncpg.PostgresError)
 
 
 def as_float(value: Any, default: float = 0.0) -> float:
@@ -186,8 +187,12 @@ async def read_server(server_id: str) -> dict[str, str]:
 async def read_flagged_players() -> list[dict[str, str]]:
     """Players whose latest cheat evaluation is flagged, worst first."""
     ids = sorted(await redis_client().smembers("players:flagged"))
-    rows = [d for d in await _hgetall_many([f"player:{i}" for i in ids])
-            if _is_flagged(d)]
+    profiles = await _hgetall_many([f"player:{i}" for i in ids])
+    stale = [pid for pid, profile in zip(ids, profiles, strict=True)
+             if not _is_flagged(profile)]
+    if stale:
+        await redis_client().srem("players:flagged", *stale)
+    rows = [d for d in profiles if _is_flagged(d)]
     rows.sort(key=effective_suspicion, reverse=True)
     return rows
 
@@ -196,8 +201,12 @@ async def read_smurfs() -> list[dict[str, str]]:
     """Players whose latest smurf evaluation says SMURF, most likely first."""
     ids = sorted(await redis_client().smembers("players:smurf"))
     rows = []
-    for pid, data in zip(ids, await _hgetall_many([f"player:smurf:{i}" for i in ids]),
-                         strict=True):
+    profiles = await _hgetall_many([f"player:smurf:{i}" for i in ids])
+    stale = [pid for pid, profile in zip(ids, profiles, strict=True)
+             if not _is_smurf(profile)]
+    if stale:
+        await redis_client().srem("players:smurf", *stale)
+    for pid, data in zip(ids, profiles, strict=True):
         if _is_smurf(data):
             rows.append({**data, "player_id": pid})
     rows.sort(key=lambda s: as_float(s.get("probability")), reverse=True)
@@ -224,6 +233,9 @@ async def _count_current(set_key: str, hash_fmt: str, field: str, value: str) ->
     if not ids:
         return 0
     vals = await _pipeline(lambda p: [p.hget(hash_fmt.format(i), field) for i in ids])
+    stale = [pid for pid, item in zip(ids, vals, strict=True) if item != value]
+    if stale:
+        await redis_client().srem(set_key, *stale)
     return sum(1 for v in vals if v == value)
 
 

@@ -40,6 +40,8 @@ from src.common.sinks import safe_parquet_archive
 SESSION_GAP_SECONDS = 120
 SESSION_GAP = f"{SESSION_GAP_SECONDS} seconds"
 FULL_MATCH_SECONDS = 180
+MAX_TRACKED_MATCHES = 5000
+MATCH_STATE_TTL_SECONDS = 30 * 24 * 60 * 60
 
 # skill_tier label -> numeric rank used for team imbalance
 TIER_VALUES = {
@@ -183,6 +185,7 @@ def write_matches(r, spark, rows):
             "updated_at": str(int(time.time())),
         }
         pipe.hset(f"match:{match_id}", mapping=match_data)
+        pipe.expire(f"match:{match_id}", MATCH_STATE_TTL_SECONDS)
         pipe.zadd("matches:quality", {match_id: score})
         pipe.zadd("matches:timeline", {match_id: int(match_data["updated_at"])})
         if row["status"] == "STOMPED":
@@ -193,6 +196,15 @@ def write_matches(r, spark, rows):
             ))
     alerts.stage(pipe)
     pipe.execute()
+    excess = max(0, r.zcard("matches:timeline") - MAX_TRACKED_MATCHES)
+    if excess:
+        stale = r.zrange("matches:timeline", 0, excess - 1)
+        if stale:
+            cleanup = r.pipeline()
+            cleanup.zrem("matches:timeline", *stale)
+            cleanup.zrem("matches:quality", *stale)
+            cleanup.delete(*(f"match:{match_id}" for match_id in stale))
+            cleanup.execute()
     alerts.flush()
 
 
