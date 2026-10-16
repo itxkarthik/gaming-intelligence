@@ -16,20 +16,20 @@
 
     <div class="filters">
       <a class="chip {{ 'sel' if not alert_type and not severity }}"
-         href="{{ qs(alert_type=None, severity=None) }}">ALL</a>
-      {% for t in ['SERVER_DEGRADED', 'CHEAT_DETECTED', 'MATCH_QUALITY_LOW', 'SMURF_DETECTED', 'BEHAVIOR_ANOMALY'] %}
+         href="{{ qs(alert_type=None, severity=None, page=None) }}">ALL</a>
+      {% for t in ALERT_TYPES %}
       <a class="chip {{ 'sel' if alert_type == t }}"
-         href="{{ qs(alert_type=t, severity=None, page=None) }}">{{ t }}</a>
+         href="{{ qs(alert_type=None if alert_type == t else t, page=None) }}">{{ t }}</a>
       {% endfor %}
       <span class="sep"></span>
-      {% for s in ['CRITICAL', 'WARNING'] %}
+      {% for s in ALERT_SEVERITIES %}
       <a class="chip {{ 'sel' if severity == s }}"
-         href="{{ qs(severity=s, alert_type=None, page=None) }}">{{ s }}</a>
+         href="{{ qs(severity=None if severity == s else s, page=None) }}">{{ s }}</a>
       {% endfor %}
     </div>
 
     {% if hist_error %}
-    <p class="error">PostgreSQL unavailable: {{ hist_error }}</p>
+    <p class="error">PostgreSQL alert history is currently unavailable.</p>
     {% else %}
     <div class="table-wrap scroll-y max-h-480">
       <table>
@@ -38,7 +38,7 @@
           {% for a in history.alerts %}
           <tr>
             <td class="mono dim">{{ a.ts.strftime('%Y-%m-%d %H:%M:%S') if a.ts else '—' }}</td>
-            <td><span class="chip {{ 'bad' if a.severity == 'CRITICAL' else 'warn' }}">{{ a.severity }}</span></td>
+            <td><span class="chip {{ 'bad' if a.severity == 'CRITICAL' else ('warn' if a.severity == 'WARNING' else 'ok') }}">{{ a.severity }}</span></td>
             <td class="mono">{{ a.alert_type }}</td>
             <td class="mono dim">{{ a.entity_type }}/{{ a.entity_id }}</td>
             <td>{{ a.message }}</td>

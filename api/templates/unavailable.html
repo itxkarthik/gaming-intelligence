@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% block title %}Service unavailable{% endblock %}
+{% block content %}
+<section class="panel">
+  <div class="panel-header">
+    <h2>Service unavailable</h2>
+  </div>
+  <p class="legend">{{ service }} is temporarily unavailable. Live data could not be loaded.
+    Please try again shortly or return to <a href="/">OVERVIEW</a>.</p>
+</section>
+{% endblock %}

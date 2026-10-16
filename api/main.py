@@ -71,7 +71,7 @@ async def _service_unavailable(request: Request, exc: Exception):
     """Redis / PostgreSQL failures -> 503 (JSON for the API, a page for the
     dashboard). Details go to the log, never to the client."""
     service = ("Redis" if isinstance(exc, redis.RedisError)
-               else "PostgreSQL" if isinstance(exc, asyncpg.PostgresError | OSError)
+               else "PostgreSQL" if isinstance(exc, asyncpg.PostgresError)
                else "backing service")
     log.warning("%s %s -> 503 (%s): %r", request.method, request.url.path, service, exc)
     if request.url.path.startswith("/api/") or request.url.path == "/health":
@@ -213,6 +213,15 @@ async def get_player_suspicion(player_id: str):
     }
 
 
+# ─── Economy ────────────────────────────────────────────────────────────────
+
+@app.get("/api/v1/economy")
+async def get_economy():
+    """Returns the latest weapon kill share and item purchase patterns
+    computed by the economy_analytics streaming pipeline."""
+    return await state.read_economy()
+
+
 # ─── Alerts ─────────────────────────────────────────────────────────────────
 
 @app.get("/api/v1/alerts/recent")
@@ -231,7 +240,7 @@ async def alert_history(limit: int = 50, offset: int = 0,
     """Paginated alert history from PostgreSQL (written by the Go alert
     engine) — complements /alerts/recent (in-memory, latest 100 only).
     Filters: alert_type (SERVER_DEGRADED, CHEAT_DETECTED, ...) and
-    severity (WARNING, CRITICAL)."""
+    severity (INFO, WARNING, CRITICAL)."""
     limit = max(1, min(limit, 200))
     offset = max(0, offset)
     return await state.fetch_alert_history(limit, offset, alert_type, severity)

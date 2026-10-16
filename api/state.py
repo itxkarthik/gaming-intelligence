@@ -71,7 +71,7 @@ MATCH_RECENT_SECONDS = 90
 LIVE_MATCH_MAX_AGE_SECONDS = 30
 ALERT_TYPES = ("SERVER_DEGRADED", "CHEAT_DETECTED", "MATCH_QUALITY_LOW",
                "SMURF_DETECTED", "BEHAVIOR_ANOMALY")
-ALERT_SEVERITIES = ("CRITICAL", "WARNING")
+ALERT_SEVERITIES = ("CRITICAL", "WARNING", "INFO")
 ALERTS_CHANNEL = "alerts:stream"
 ALERT_LOG_SIZE = 100
 
@@ -311,6 +311,39 @@ async def read_match_summary() -> dict[str, Any]:
     res = await _pipeline(build)
     return {"tracked": res[0], "balanced": res[1], "unbalanced": res[2],
             "stomped": res[3], "histogram": res[4:]}
+
+
+def _parse_economy_bucket(raw: dict[str, str], info: dict[str, str]) -> dict[str, Any]:
+    items = []
+    for weapon, val in raw.items():
+        count_s, _, share_s = val.partition(":")
+        items.append({
+            "weapon_id": weapon,
+            "count": int(as_float(count_s)),
+            "share_pct": as_float(share_s),
+        })
+    items.sort(key=lambda w: (-w["count"], w["weapon_id"]))
+    out: dict[str, Any] = {
+        "window_end": info.get("window_end"),
+        "total": int(as_float(info.get("total"))),
+        "top_weapon": info.get("top_weapon") or None,
+        "weapons": items,
+    }
+    if "total_spend" in info:
+        out["total_spend"] = int(as_float(info.get("total_spend")))
+    return out
+
+
+async def read_economy() -> dict[str, Any]:
+    """Latest weapon kill share and purchase patterns from economy_analytics."""
+    weapons, weapons_info, purchases, purchases_info = await _hgetall_many([
+        "economy:weapons", "economy:weapons:info",
+        "economy:purchases", "economy:purchases:info",
+    ])
+    return {
+        "kills": _parse_economy_bucket(weapons, weapons_info) if weapons_info else None,
+        "purchases": _parse_economy_bucket(purchases, purchases_info) if purchases_info else None,
+    }
 
 
 async def tournament_snapshot() -> dict[str, Any]:
@@ -707,8 +740,8 @@ async def run_alert_listener():
 class EventFeed:
     """Single shared Kafka consumer broadcasting processed events to every
     connected /ws/live and dashboard SSE client. Retains a rolling buffer
-    of the most recent events so new connections and initial page renders
-    are immediately populated, and the latest server_metrics per server
+    of the most recent displayable events so new connections and initial page
+    renders are immediately populated, and the latest server_metrics per server
     (live active-match count).
 
     ASSIGN-ONLY: partitions are assigned manually (seeded at tail-25) and
@@ -789,8 +822,11 @@ class EventFeed:
             "timestamp": rec.timestamp,   # Kafka record time (ms)
             "event": event,
         })
+        displayable = (rec.topic != "gameplay_events"
+                       or (isinstance(event, dict) and bool(event.get("hit"))))
         with self._lock:
-            self._history.append(text)
+            if displayable:
+                self._history.append(text)
             if rec.topic == "server_metrics" and isinstance(event, dict) and event.get("server_id"):
                 ts_ms = as_float(event.get("timestamp"), as_float(rec.timestamp))
                 self._server_matches[str(event["server_id"])] = (

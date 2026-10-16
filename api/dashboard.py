@@ -112,7 +112,7 @@ ALERT_LABEL = {
     "SERVER_DEGRADED": "Server degraded",
     "MATCH_QUALITY_LOW": "Low-quality match",
 }
-SEVERITY_CLASS = {"CRITICAL": "bad", "WARNING": "warn"}
+SEVERITY_CLASS = {"CRITICAL": "bad", "WARNING": "warn", "INFO": "ok"}
 
 
 def _alerts_last_minute() -> int:
@@ -686,9 +686,8 @@ async def _pub_behavior(bus: state.Broadcaster):
         smurfs = await state.read_smurfs()
         bus.publish("rows", _patch(behavior_rows_html(anomalies), "#behavior-rows"))
         bus.publish("smurfs", _patch(smurf_rows_html(smurfs), "#smurf-rows"))
-        counts = (f'<span id="behavior-counts" class="hint">'
-                  f'{_top_note(min(len(anomalies), BEHAVIOR_ROWS), len(anomalies))} shifts · '
-                  f'{_top_note(min(len(smurfs), BEHAVIOR_ROWS), len(smurfs))} smurfs</span>')
+        counts = (f'{_top_note(min(len(anomalies), BEHAVIOR_ROWS), len(anomalies))} shifts · '
+                  f'{_top_note(min(len(smurfs), BEHAVIOR_ROWS), len(smurfs))} smurfs')
         bus.publish("counts", _patch(counts, "#behavior-counts"))
         await asyncio.sleep(POLL["behavior"])
 

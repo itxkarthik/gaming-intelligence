@@ -204,11 +204,14 @@
     const observer = new MutationObserver(() => {
       const carrier = document.getElementById('telemetry-carrier');
       if (carrier) {
-        const eps = parseFloat(carrier.getAttribute('data-eps') || '0');
+        const rawEps = carrier.getAttribute('data-eps');
         const timeStr = carrier.getAttribute('data-time') || '';
-        if (timeStr && timeStr !== lastHandledTime) {
-          lastHandledTime = timeStr;
-          pushThroughputPoint(eps, timeStr);
+        if (rawEps !== null && rawEps !== '' && timeStr && timeStr !== lastHandledTime) {
+          const eps = parseFloat(rawEps);
+          if (!isNaN(eps)) {
+            lastHandledTime = timeStr;
+            pushThroughputPoint(eps, timeStr);
+          }
         }
       }
     });
