@@ -282,6 +282,31 @@ def test_slow_chunk_renews_leases_and_skips_reclaimed_unsent_alerts(outbox, monk
     assert not r.exists(alerts._lease_key(third_id))
 
 
+def test_stale_scan_skips_alert_deleted_before_claim(outbox, monkeypatch):
+    r, _ = outbox
+    batch = alerts.AlertBatch(r)
+    batch.emit(payload("first"))
+    pipe = r.pipeline()
+    batch.stage(pipe)
+    pipe.execute()
+
+    original_hscan = r.hscan_iter
+
+    def hscan_then_concurrent_ack(*args, **kwargs):
+        entries = list(original_hscan(*args, **kwargs))
+        # Another flusher finishes Kafka ACK + HDEL + lease release after this
+        # flusher's HSCAN snapshot was taken, before _CLAIM_LEASE executes.
+        r.hdel(alerts.OUTBOX_KEY, "first")
+        return iter(entries)
+
+    monkeypatch.setattr(r, "hscan_iter", hscan_then_concurrent_ack)
+    producer = Producer()
+    monkeypatch.setattr(alerts, "_kafka_producer", lambda: producer)
+    alerts.AlertBatch(r).flush()
+    assert producer.sent == []
+    assert not r.exists(alerts._lease_key("first"))
+
+
 def test_flush_pipelines_sends_per_chunk_and_batches_hdel(monkeypatch):
     events = []
     hdels = []
@@ -301,20 +326,21 @@ def test_flush_pipelines_sends_per_chunk_and_batches_hdel(monkeypatch):
     class FakeClaimPipe:
         def __init__(self, r):
             self.r = r
-            self.keys = []
+            self.claims = []
 
-        def set(self, key, value, nx=False, ex=None):
-            self.keys.append((key, value, nx))
+        def eval(self, script, numkeys, *keys_and_args):
+            _, lease_key, alert_id, token, _ = keys_and_args
+            self.claims.append((alert_id, lease_key, token))
 
         def execute(self):
             res = []
-            for key, value, nx in self.keys:
-                if nx and key in self.r.leases:
-                    res.append(False)
+            for alert_id, lease_key, token in self.claims:
+                if alert_id not in self.r.items or lease_key in self.r.leases:
+                    res.append(0)
                 else:
-                    self.r.leases[key] = value
-                    res.append(True)
-            self.keys.clear()
+                    self.r.leases[lease_key] = token
+                    res.append(1)
+            self.claims.clear()
             return res
 
     class FakeOutboxRedis:

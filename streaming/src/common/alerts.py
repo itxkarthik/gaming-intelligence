@@ -43,15 +43,28 @@ end
 return 1
 """
 
+_CLAIM_LEASE = """
+if redis.call('HEXISTS', KEYS[1], ARGV[1]) == 0 then
+    return 0
+end
+if redis.call('SET', KEYS[2], ARGV[2], 'NX', 'EX', tonumber(ARGV[3])) then
+    return 1
+end
+return 0
+"""
+
 _RENEW_LEASES = """
 local status = {}
+local outbox = KEYS[1]
+local token = ARGV[1]
 local ttl = tonumber(ARGV[2])
-for i = 1, #KEYS do
-    if redis.call('GET', KEYS[i]) == ARGV[1] then
+for i = 2, #KEYS do
+    local aid = ARGV[i + 1]
+    if redis.call('HEXISTS', outbox, aid) == 1 and redis.call('GET', KEYS[i]) == token then
         redis.call('EXPIRE', KEYS[i], ttl)
-        status[i] = 1
+        status[i - 1] = 1
     else
-        status[i] = 0
+        status[i - 1] = 0
     end
 end
 return status
@@ -130,9 +143,15 @@ class AlertBatch:
             )
         self.pending.clear()
 
-    def _renew_leases(self, lease_keys, token):
+    def _renew_leases(self, alert_ids, lease_keys, token):
         return self.r.eval(
-            _RENEW_LEASES, len(lease_keys), *lease_keys, token, LEASE_TTL_SECONDS
+            _RENEW_LEASES,
+            1 + len(lease_keys),
+            OUTBOX_KEY,
+            *lease_keys,
+            token,
+            LEASE_TTL_SECONDS,
+            *alert_ids,
         )
 
     def flush(self):
@@ -140,10 +159,10 @@ class AlertBatch:
             pipe = self.r.pipeline()
             self.stage(pipe)
             pipe.execute()
-        # Claim per-alert leases before sending to Kafka so concurrent drivers
-        # skip in-flight entries; renew during slow chunks and verify token
-        # ownership before deleting so an expired flusher never removes a new
-        # owner's reclaimed lease.
+        # Claim per-alert leases atomically with HEXISTS on the outbox before
+        # sending to Kafka so concurrent drivers skip in-flight or already-acked
+        # entries; renew during slow chunks and verify token ownership before
+        # deleting so an expired flusher never removes a new owner's lease.
         token = uuid.uuid4().hex
         it = self.r.hscan_iter(OUTBOX_KEY, count=FLUSH_CHUNK_SIZE)
         while True:
@@ -152,7 +171,15 @@ class AlertBatch:
                 break
             claim_pipe = self.r.pipeline()
             for alert_id, _ in chunk:
-                claim_pipe.set(_lease_key(alert_id), token, nx=True, ex=LEASE_TTL_SECONDS)
+                claim_pipe.eval(
+                    _CLAIM_LEASE,
+                    2,
+                    OUTBOX_KEY,
+                    _lease_key(alert_id),
+                    alert_id,
+                    token,
+                    LEASE_TTL_SECONDS,
+                )
             claims = claim_pipe.execute()
             leased = [
                 (alert_id, encoded)
@@ -161,8 +188,9 @@ class AlertBatch:
             ]
             if not leased:
                 continue
-            lease_keys = [_lease_key(alert_id) for alert_id, _ in leased]
-            owned = {alert_id for alert_id, _ in leased}
+            alert_ids = [alert_id for alert_id, _ in leased]
+            lease_keys = [_lease_key(alert_id) for alert_id in alert_ids]
+            owned = set(alert_ids)
             last_renewed = time.monotonic()
             renew_after = LEASE_TTL_SECONDS / 3
             producer = _kafka_producer()
@@ -171,10 +199,10 @@ class AlertBatch:
                 in_flight = []
                 for alert_id, encoded in leased:
                     if time.monotonic() - last_renewed >= renew_after:
-                        statuses = self._renew_leases(lease_keys, token)
+                        statuses = self._renew_leases(alert_ids, lease_keys, token)
                         owned = {
                             aid
-                            for (aid, _), ok in zip(leased, statuses)
+                            for aid, ok in zip(alert_ids, statuses)
                             if ok
                         }
                         last_renewed = time.monotonic()
@@ -185,7 +213,7 @@ class AlertBatch:
                     )
                 for alert_id, future in in_flight:
                     if time.monotonic() - last_renewed >= renew_after:
-                        self._renew_leases(lease_keys, token)
+                        self._renew_leases(alert_ids, lease_keys, token)
                         last_renewed = time.monotonic()
                     future.get(timeout=SEND_TIMEOUT_SECONDS)
                     acked.append(alert_id)
