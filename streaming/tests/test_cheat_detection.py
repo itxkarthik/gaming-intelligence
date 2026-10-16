@@ -347,6 +347,10 @@ class StateRedis:
     def hset(self, key, mapping):
         self.hashes.setdefault(key, {}).update(mapping)
 
+    def expire(self, key, seconds):
+        # Expiry timing is not relevant to these state transition tests.
+        return key in self.hashes
+
     def get(self, key):
         return self.kv.get(key)
 
@@ -433,7 +437,7 @@ def test_cached_decisions_share_profile_transaction_and_flush_on_replay(detector
         detector.write_player_scores(redis, None, [decision_row()], "checkpoint-a", 0)
     assert redis.hashes["player:p"]["flagged"] == "true"
     assert redis.outbox
-    assert redis.transactions[-1][-4:] == ["hset", "set", "set", "stage_alerts"]
+    assert redis.transactions[-1][-5:] == ["hset", "expire", "set", "set", "stage_alerts"]
     monkeypatch.setattr(detector, "score_rows", lambda *args: pytest.fail("recomputed cached verdict"))
     redis.fail_flush = False
     replay = detector.write_player_scores(redis, None, [decision_row(suspicion=0)], "checkpoint-a", 0)

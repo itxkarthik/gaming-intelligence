@@ -301,7 +301,7 @@ def test_out_of_order_logins_keep_newest_established_metadata():
     assert r.hashes["player:account:p1"]["rank"] == "diamond"
     assert r.hashes["player:account:p1"]["account_age_days"] == "100"
     assert len(r.transactions) == 1
-    assert len(r.transactions[0]) == 1
+    assert len(r.transactions[0]) == 2
 
 
 def test_login_candidate_does_not_clear_existing_combat_flag():
@@ -352,7 +352,8 @@ def test_write_accounts_deduplicates_and_batches_in_pipeline_chunks():
         rows.append({"player_id": pid, "event_time": 2000, "metadata": {"rank": "gold"}})
     write_accounts(r, rows)
     assert len(r.transactions) == 3
-    assert [len(tx) for tx in r.transactions] == [PIPELINE_CHUNK_SIZE, PIPELINE_CHUNK_SIZE, 5]
+    assert [len(tx) for tx in r.transactions] == [2 * PIPELINE_CHUNK_SIZE,
+                                                    2 * PIPELINE_CHUNK_SIZE, 10]
     assert r.hashes["player:account:p0"]["rank"] == "gold"
     assert r.hashes["player:account:p0"]["login_at"] == "2000"
 
@@ -418,7 +419,7 @@ def test_established_login_between_combat_read_and_exec_cannot_restore_smurf(ale
     assert r.outbox == [unrelated]
     assert alerts.pending == []
     # The obsolete SMURF intent was rejected by the per-player CAS check on pass 1.
-    assert [op[0] for op in r.attempts[0]] == ["evaluate_smurf", "outbox"]
+    assert [op[0] for op in r.attempts[0]] == ["evaluate_smurf", "expire", "expire", "outbox"]
     assert [op[0] for op in r.transactions[-1]] == ["evaluate_smurf", "expire", "expire"]
 
 

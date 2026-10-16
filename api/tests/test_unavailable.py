@@ -48,7 +48,6 @@ class OutageTests(unittest.IsolatedAsyncioTestCase):
             (redis.ConnectionError("private Redis connection details"), "Redis"),
             (redis.TimeoutError("private Redis timeout details"), "Redis"),
             (asyncpg.PostgresError("private PostgreSQL connection details"), "PostgreSQL"),
-            (OSError("private backing service details"), "backing service"),
         ):
             with self.subTest(service=service, error=type(error).__name__):
                 with patch("state.read_servers", new=AsyncMock(side_effect=error)):
@@ -68,7 +67,6 @@ class OutageTests(unittest.IsolatedAsyncioTestCase):
         for error, service in (
             (redis.ConnectionError("private connection details"), "Redis"),
             (asyncpg.PostgresError("private connection details"), "PostgreSQL"),
-            (OSError("private connection details"), "backing service"),
         ):
             with self.subTest(service=service):
                 with patch("state.read_servers", new=AsyncMock(side_effect=error)):
@@ -77,6 +75,14 @@ class OutageTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn(b"application/json", headers[b"content-type"])
                 self.assertEqual(json.loads(body), {"detail": f"{service} unavailable"})
                 self.assertNotIn(str(error), body)
+
+    async def test_unrelated_oserror_is_not_reported_as_service_unavailable(self):
+        error = OSError("private filesystem details")
+        for path in ("/servers", "/api/v1/servers"):
+            with self.subTest(path=path):
+                with patch("state.read_servers", new=AsyncMock(side_effect=error)):
+                    with self.assertRaisesRegex(OSError, "private filesystem details"):
+                        await request(path)
 
 
 if __name__ == "__main__":

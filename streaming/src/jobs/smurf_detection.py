@@ -213,7 +213,9 @@ def evaluate_smurfs(r, alerts, rows):
                     alerts.pending[:] = buffered
 
             buffered = []
-            eval_results = results[:len(pending_rows)]
+            # Each player queues EVAL plus two TTL commands. Select only each
+            # EVAL result; the remaining pipeline results are not CAS status.
+            eval_results = results[0:3 * len(pending_rows):3]
             emitted.extend(alert for alert, ok in zip(staged_alerts, eval_results)
                            if ok and alert is not None)
             pending_rows = [
