@@ -10,7 +10,7 @@ import (
 
 // ─── fakeGate ──────────────────────────────────────────────────────────────
 
-// fakeGate is an in-memory Gate with the same idempotent semantics as
+// fakeGate is an in-memory Gate with the same atomic, idempotent semantics as
 // redisGate (TTL is not modelled). Setting err makes every call fail.
 type fakeGate struct {
 	holders map[string]string
@@ -21,16 +21,21 @@ func newFakeGate() *fakeGate {
 	return &fakeGate{holders: map[string]string{}}
 }
 
-func (g *fakeGate) Admit(_ context.Context, key, alertID string, _ time.Duration) (bool, error) {
+func (g *fakeGate) Admit(_ context.Context, alertID string, claims ...gateClaim) (bool, error) {
 	if g.err != nil {
 		return false, g.err
 	}
-	holder, held := g.holders[key]
-	if !held {
-		g.holders[key] = alertID
-		return true, nil
+	for _, c := range claims {
+		if holder, held := g.holders[c.key]; held && holder != alertID {
+			return false, nil
+		}
 	}
-	return holder == alertID, nil
+	for _, c := range claims {
+		if _, held := g.holders[c.key]; !held {
+			g.holders[c.key] = alertID
+		}
+	}
+	return true, nil
 }
 
 // ─── classify ──────────────────────────────────────────────────────────────
@@ -139,15 +144,18 @@ func TestShouldForwardDeduplicatesSameTypeAndEntity(t *testing.T) {
 	}
 }
 
-func TestShouldForwardRateLimitsAcrossTypes(t *testing.T) {
+func TestShouldForwardRateLimitsAcrossTypesWithoutClaimingDedupKey(t *testing.T) {
 	g := newFakeGate()
-	first := Alert{AlertID: "a1", AlertType: "CHEAT_DETECTED", EntityType: "PLAYER", EntityID: "p1"}
-	second := Alert{AlertID: "a2", AlertType: "BEHAVIOR_ANOMALY", EntityType: "PLAYER", EntityID: "p1"}
+	first := Alert{AlertID: "a1", AlertType: "BEHAVIOR_ANOMALY", Severity: "WARNING", EntityType: "PLAYER", EntityID: "p1"}
+	second := Alert{AlertID: "a2", AlertType: "SMURF_DETECTED", Severity: "WARNING", EntityType: "PLAYER", EntityID: "p1"}
 	shouldForward(context.Background(), g, first, time.Minute, time.Minute)
-	// Same entity, different type: dedup key passes but rate limit blocks —
-	// "max 1 alert per player per 5 min".
+	// Same entity, different type: rate limit blocks it, and must NOT claim
+	// the suppressed alert's dedupKey.
 	if shouldForward(context.Background(), g, second, time.Minute, time.Minute) {
 		t.Error("second alert for same entity within window must be rate limited")
+	}
+	if _, held := g.holders[dedupKey(second)]; held {
+		t.Errorf("rate-limited alert must not claim %s", dedupKey(second))
 	}
 }
 
