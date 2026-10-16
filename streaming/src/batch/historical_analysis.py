@@ -24,7 +24,10 @@ in the smurf_detection archive's `metadata` map — labels never touch Redis.
 Archive semantics this job has to undo:
   * server_health and cheat_detection stream in UPDATE mode, so a window is
     archived again by every micro-batch that touched it (partial results).
-    `latest_per_key` keeps only the last archived row per (entity, window).
+    `latest_per_key` keeps the last row for final-window feature analysis;
+    exact online cheat evaluation retains every judged update.
+  * behavior_change archives append-mode gameplay rows under at-least-once
+    delivery; `dedup_events` deduplicates by `event_id`.
   * economy_purchases uses 60 s windows sliding by 30 s, so every purchase
     sits in two windows; only the minute-aligned windows are summed.
   * economy_weapon_kills is not read here: weapon kill stats come from the
@@ -64,7 +67,8 @@ def read(spark, name):
         print(f"\n── {name}: archive not found at {path} (skipped)")
         return None
     # mergeSchema: the archive holds files written before and after columns
-    # were added (e.g. is_kill); without it Spark may take one file's schema.
+    # were added (e.g. is_kill, suspicion_effective, flagged); without it
+    # Spark may take one file's schema.
     df = spark.read.option("mergeSchema", "true").parquet(path)
     if df.isEmpty():
         print(f"\n── {name}: archive empty (skipped)")
@@ -75,16 +79,22 @@ def read(spark, name):
 # The gameplay archive spans two wire formats. Legacy runs emitted a
 # SHOT_FIRED row per shot plus separate DAMAGE and KILL rows that repeated
 # the shot's accuracy and reaction time; current runs emit a single SHOT row
-# with the outcome inline. These selectors return one row per shot and one
-# row per kill under either format, so history is never double-counted.
+# with the outcome inline. These selectors deduplicate by event_id (absorbing
+# replayed micro-batches) and return one row per shot and one row per kill
+# under either format, so history is never double-counted.
 LEGACY_SHOT, LEGACY_KILL = "SHOT_FIRED", "KILL"
 
 
+def dedup_events(df):
+    return df.dropDuplicates(["event_id"]) if "event_id" in df.columns else df
+
+
 def shot_rows(df):
-    return df.filter(F.col("event_type").isin(SHOT_EVENT, LEGACY_SHOT))
+    return dedup_events(df).filter(F.col("event_type").isin(SHOT_EVENT, LEGACY_SHOT))
 
 
 def kill_rows(df):
+    df = dedup_events(df)
     current = (F.col("event_type") == SHOT_EVENT) & F.col("is_kill") \
         if "is_kill" in df.columns else F.lit(False)
     return df.filter(current | (F.col("event_type") == LEGACY_KILL))
@@ -99,8 +109,6 @@ def latest_per_key(df, keys):
     back to source file modification time. Call on a DataFrame straight from
     read() — the hidden _metadata column only exists on the file source.
     """
-    # The persisted timestamp survives Parquet compaction; legacy archives
-    # fall back to each source file's modification time.
     archived_at = (F.coalesce(F.col("archive_written_at"),
                               F.col("_metadata.file_modification_time"))
                    if "archive_written_at" in df.columns
@@ -280,6 +288,51 @@ def job_weapon(spark):
 
 
 # ── cheat ─────────────────────────────────────────────────────────────────
+def cheat_evaluation_frames(cheat, lab):
+    """Raw final-window sweep and exact online decisions have different inputs.
+
+    Never collapse online updates: a later clean/unevaluated update cannot
+    erase a positive decision that actually raised an alert. Legacy rows can
+    supply heuristic evidence, but cannot supply an invented online verdict.
+    """
+    def scoped(df):
+        df = df.join(lab.select("player_id", "since"), "player_id")
+        run_start = (F.col("since") / 1000).cast("timestamp")
+        if {"source_event_min", "source_event_max"}.issubset(df.columns):
+            known = F.col("source_event_min").isNotNull() & F.col("source_event_max").isNotNull()
+            current = ((F.col("source_event_min") >= F.col("since"))
+                       & (F.col("source_event_max") >= F.col("source_event_min")))
+        else:
+            known, current = F.lit(False), F.lit(False)
+        # No source bounds in old archives: only fully in-run windows are
+        # safe. Unknown boundary windows are reported, not silently assigned.
+        return df.filter(F.when(known, current).otherwise(F.col("window.start") >= run_start))
+
+    raw = (
+        scoped(latest_per_key(cheat, ["player_id", "match_id", "window"]))
+        .filter(F.col("total_shots") >= MIN_SHOTS)
+        .groupBy("player_id")
+        .agg(F.max("suspicion_score").alias("max_suspicion"))
+    )
+    decisions = scoped(cheat)
+    exact = ((F.col("judged") == True) & F.col("flagged").isNotNull()
+             if {"judged", "flagged"}.issubset(cheat.columns) else F.lit(False))
+    legacy = ((F.col("judged").isNull() | F.col("flagged").isNull())
+              if {"judged", "flagged"}.issubset(cheat.columns) else F.lit(True))
+    online_flag = F.col("flagged") if "flagged" in cheat.columns else F.lit(False)
+    online = decisions.groupBy("player_id").agg(
+        F.max(F.when(exact, online_flag)).alias("online_flagged"),
+        F.max((legacy & (F.col("total_shots") >= MIN_SHOTS)).cast("int")).alias("legacy_scored"),
+    )
+    return (
+        lab.join(raw, "player_id", "left").join(online, "player_id", "left")
+        .withColumn("scored", F.col("max_suspicion").isNotNull())
+        .withColumn("online_covered", F.col("online_flagged").isNotNull())
+        .withColumn("max_suspicion", F.coalesce(F.col("max_suspicion"), F.lit(0.0)))
+        .withColumn("actual", F.col("archetype").startswith("cheater"))
+    )
+
+
 def job_cheat(spark):
     banner("CHEAT DETECTION ACCURACY vs ARCHETYPE LABELS")
     lab = labels(spark)
@@ -287,29 +340,7 @@ def job_cheat(spark):
     if lab is None or cheat is None:
         note("missing labels or cheat archive — skipped")
         return
-    # Final row per window (the archive holds every update-mode partial),
-    # then production's flag gate: a window needs >= MIN_SHOTS shots
-    # (cheat_detection.py: flagged = (... >= 0.70 or iforest) and
-    # total_shots >= MIN_SHOTS). Judge each player only on windows from their latest
-    # labelled run.
-    run_start = (F.col("since") / 1000).cast("timestamp")
-    pred = (
-        latest_per_key(cheat, ["player_id", "match_id", "window"])
-        .filter(F.col("total_shots") >= MIN_SHOTS)
-        .join(lab.select("player_id", "since"), "player_id")
-        .filter(F.col("window.start") >= run_start)
-        .groupBy("player_id")
-        .agg(F.max("suspicion_score").alias("max_suspicion"))
-    )
-    ev = (
-        lab.join(pred, "player_id", "left")
-        # coverage BEFORE the coalesce: a scored window with suspicion 0.0
-        # still counts as covered
-        .withColumn("scored", F.col("max_suspicion").isNotNull())
-        .withColumn("max_suspicion", F.coalesce(F.col("max_suspicion"), F.lit(0.0)))
-        .withColumn("actual", F.col("archetype").startswith("cheater"))
-        .cache()
-    )
+    ev = cheat_evaluation_frames(cheat, lab).cache()
     total = ev.count()
     positives = ev.filter(F.col("actual")).count()
     covered = ev.filter(F.col("scored")).count()
@@ -317,34 +348,43 @@ def job_cheat(spark):
         f"labeled players: {total} · actual cheaters: {positives} · "
         f"scored in a >= {MIN_SHOTS}-shot window: {covered}"
     )
-    table(
-        ["THRESHOLD", "PRED+", "TP", "FP", "FN", "PRECISION", "RECALL", "F1"],
-        _sweep(ev, [0.50, 0.60, 0.70, 0.80, 0.90]),
-        ["<", ">", ">", ">", ">", ">", ">", ">"],
-    )
-    note("primary operating point = 0.70 (matches the alerting threshold)")
+    online = ev.filter(F.col("online_covered"))
+    note(f"exact online coverage: {online.count()}/{total} labeled players; "
+         f"legacy >= {MIN_SHOTS}-shot coverage: {ev.filter(F.col('legacy_scored') == 1).count()}")
+    note("Legacy/missing decisions are unknown, not clean. Online metrics use only judged coverage.")
+    note("Source-event bounds retain initial windows and exclude previous-run evidence; "
+         "legacy windows crossing the latest LOGIN boundary are excluded (run identity unknown).")
+    headers = ["DETECTOR", "PRED+", "TP", "FP", "FN", "PRECISION", "RECALL", "F1"]
+    aligns = ["<", ">", ">", ">", ">", ">", ">", ">"]
+    if not online.isEmpty():
+        table(headers, [_eval_row(online, "online (actual judged)", F.col("online_flagged"))], aligns)
+    else:
+        note("online metrics unavailable: no archived judged decisions")
+    note("Raw heuristic-only sweep (no behavior boost or IsolationForest; not online verdicts):")
+    table(headers, _sweep(ev.filter(F.col("scored")), [0.50, 0.60, 0.70, 0.80, 0.90]), aligns)
     ev.unpersist()
 
 
+def _eval_row(ev, label, pred_expr):
+    tp = ev.filter(F.col("actual") & pred_expr).count()
+    fp = ev.filter(~F.col("actual") & pred_expr).count()
+    fn = ev.filter(F.col("actual") & ~pred_expr).count()
+    pred_pos = tp + fp
+    precision = tp / pred_pos if pred_pos else 0.0
+    recall = tp / (tp + fn) if (tp + fn) else 0.0
+    f1 = (
+        2 * precision * recall / (precision + recall)
+        if (precision + recall)
+        else 0.0
+    )
+    return [label, pred_pos, tp, fp, fn, f"{precision:.3f}", f"{recall:.3f}", f"{f1:.3f}"]
+
+
 def _sweep(ev, thresholds):
-    rows = []
-    for thr in thresholds:
-        tp = ev.filter(F.col("actual") & (F.col("max_suspicion") >= thr)).count()
-        fp = ev.filter(~F.col("actual") & (F.col("max_suspicion") >= thr)).count()
-        fn = ev.filter(F.col("actual") & (F.col("max_suspicion") < thr)).count()
-        pred_pos = tp + fp
-        precision = tp / pred_pos if pred_pos else 0.0
-        recall = tp / (tp + fn) if (tp + fn) else 0.0
-        f1 = (
-            2 * precision * recall / (precision + recall)
-            if (precision + recall)
-            else 0.0
-        )
-        rows.append(
-            [f"{thr:.2f}", pred_pos, tp, fp, fn,
-             f"{precision:.3f}", f"{recall:.3f}", f"{f1:.3f}"]
-        )
-    return rows
+    return [
+        _eval_row(ev, f"{thr:.2f}", F.col("max_suspicion") >= thr)
+        for thr in thresholds
+    ]
 
 
 # ── quality ───────────────────────────────────────────────────────────────
