@@ -200,9 +200,12 @@ def _dedup_combat_rows(rows):
     """Pick one representative window per player (most shots, then newest end)."""
     best = {}
     for idx, row in enumerate(rows):
-        pid = row["player_id"]
-        shots = int(row.get("total_shots", 0))
-        end_ms = int(row.get("window_end_ms", 0))
+        # Spark Rows support item lookup, but not dict.get(). Convert only for
+        # ranking so downstream code can keep using either Row or dict inputs.
+        values = row.asDict(recursive=False) if hasattr(row, "asDict") else row
+        pid = values["player_id"]
+        shots = int(values.get("total_shots", 0))
+        end_ms = int(values.get("window_end_ms", 0))
         rank = (shots, end_ms, idx)
         prev = best.get(pid)
         if prev is None or rank > prev[0]:

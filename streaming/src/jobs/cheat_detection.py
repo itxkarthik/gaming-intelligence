@@ -280,7 +280,9 @@ def write_player_scores(r, spark, rows, checkpoint_id=None, batch_id=None):
         if login_at:
             try:
                 login_at_ms = int(login_at)
-                source_min = row.get("source_event_min")
+                # Rows returned by DataFrame.collect() are pyspark.sql.Row,
+                # which supports item access but not dict.get().
+                source_min = row.asDict(recursive=False).get("source_event_min")
                 pre_login = (
                     window_end_ms <= login_at_ms
                     or (source_min is not None and int(source_min) < login_at_ms)

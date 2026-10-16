@@ -4,7 +4,34 @@
    Theme Modes: Pure Black (Dark) & Crisp White (Light)
    ═══════════════════════════════════════════════════════════════════════════ */
 
-@import url('https://fonts.googleapis.com/css2?family=Geist:wght@300;400;500;600;700&family=Geist+Mono:wght@400;500;600;700&display=swap');
+/* Opt in to the browser's cross-document View Transition for dashboard links. */
+@view-transition {
+  navigation: auto;
+}
+
+::view-transition-old(root) {
+  animation: dashboard-page-out 140ms ease both;
+}
+
+::view-transition-new(root) {
+  animation: dashboard-page-in 200ms ease both;
+}
+
+@keyframes dashboard-page-out {
+  to { opacity: 0; }
+}
+
+@keyframes dashboard-page-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  ::view-transition-old(root),
+  ::view-transition-new(root) {
+    animation-duration: 1ms;
+  }
+}
 
 :root {
   /* Typography & Geometry Foundations */
