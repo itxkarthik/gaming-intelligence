@@ -1,4 +1,4 @@
-.PHONY: init-dirs up down restart logs ps clean kafka-topics kafka-console-consumer simulator-build simulator-run simulator-dry-run spark-submit spark-batch spark-compact train-model api-up test-go test-streaming benchmark benchmark-plot help
+.PHONY: init-dirs up down restart logs ps clean kafka-topics kafka-console-consumer simulator-build simulator-run simulator-dry-run spark-submit spark-batch spark-compact train-model api-up test-go test-streaming test-api test-benchmarks benchmark benchmark-plot help
 
 # ─── Docker Infrastructure ────────────────────────────────────────────────
 init-dirs:
@@ -83,6 +83,12 @@ test-go:
 test-streaming:
 	docker exec -w /opt/spark-apps -e PYTHONPATH=/opt/spark/python:/opt/spark/python/lib/py4j-0.10.9.7-src.zip gaming-spark-master python3 -m pytest tests -q -p no:cacheprovider
 
+test-api:
+	docker compose run --rm --no-deps -v "$(CURDIR)/api:/app" api python -m unittest discover -s tests -v
+
+test-benchmarks:
+	python3 -m unittest discover -s benchmarks/tests -v
+
 # ─── Phase 6: Benchmark & Batch Analysis ─────────────────────────────────
 # Batch analysis runs in local mode on the master ON PURPOSE: the 4-core
 # cluster is fully subscribed by the streaming jobs (spark.cores.max=1 each),
@@ -144,6 +150,8 @@ help:
 	@echo "  make api-up                 Rebuild + restart the FastAPI container (port 8000)"
 	@echo "  make test-go                Run Go simulator and alert-engine unit tests"
 	@echo "  make test-streaming         Run PySpark pipeline tests in the Spark container"
+	@echo "  make test-api               Run FastAPI outage regression tests in the API image"
+	@echo "  make test-benchmarks        Run benchmark collector unit tests"
 	@echo "  make benchmark              Tiered load benchmark (RATES=, DURATION=, DRAIN_MAX=)"
 	@echo "  make benchmark-plot         Plot the newest benchmark run to docs/benchmarks.png (TIERS=<file> for another)"
 	@echo "  make clean                  Remove simulator binary and __pycache__ dirs"

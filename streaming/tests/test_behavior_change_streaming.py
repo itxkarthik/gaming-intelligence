@@ -6,31 +6,15 @@ import sys
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from pyspark.sql import SparkSession
 from pyspark.sql.types import (
     DoubleType, StringType, StructField, StructType, TimestampType,
 )
 
+sys.path.insert(0, os.path.dirname(__file__))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from src.jobs import behavior_change
 from test_behavior_change import _DummyAlerts, _FakeRedis
-
-
-@pytest.fixture(scope="module")
-def spark():
-    session = (
-        SparkSession.builder.master("local[2]")
-        .appName("behavior-change-streaming-tests")
-        .config("spark.ui.enabled", "false")
-        .config("spark.sql.shuffle.partitions", "2")
-        .config("spark.sql.session.timeZone", "UTC")
-        .config("spark.sql.streaming.noDataMicroBatches.enabled", "true")
-        .getOrCreate()
-    )
-    session.sparkContext.setLogLevel("ERROR")
-    yield session
-    session.stop()
 
 
 def test_split_windows_late_shots_restart_and_replay(spark, tmp_path, monkeypatch):

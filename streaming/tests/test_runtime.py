@@ -1,5 +1,10 @@
 """Bounded driver retry behavior without external services."""
 
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
 import pytest
 import redis
 from kafka.errors import KafkaTimeoutError

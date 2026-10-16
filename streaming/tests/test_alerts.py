@@ -1,7 +1,11 @@
 """Outbox failure/replay regressions; use a disposable Redis, never serving state."""
 
+import json
 import os
+import sys
 import uuid
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import pytest
 import redis
@@ -27,8 +31,8 @@ def outbox(monkeypatch):
             client.delete(*keys)
 
 
-def payload(alert_id="first"):
-    return {"alert_id": alert_id, "alert_type": "BEHAVIOR_ANOMALY", "entity_id": "p1"}
+def payload(alert_id="first", entity_id="p1"):
+    return {"alert_id": alert_id, "alert_type": "BEHAVIOR_ANOMALY", "entity_id": entity_id}
 
 
 class Producer:
@@ -62,7 +66,7 @@ def test_state_and_delivery_intent_commit_together(outbox):
     batch = alerts.AlertBatch(r)
     batch.emit(payload())
     pipe = r.pipeline()
-    pipe.hset(prefix + "state", mapping={"last_window_end_ms": "5000"})
+    pipe.hset(prefix + "state", mapping={"n": "1", "last_window_end_ms": "5000"})
     batch.stage(pipe)
     pipe.execute()
     assert r.hget(prefix + "state", "last_window_end_ms") == "5000"
@@ -117,3 +121,48 @@ def test_ack_removal_failure_redelivers_same_id(outbox, monkeypatch):
     monkeypatch.setattr(r, "hdel", original)
     alerts.AlertBatch(r).flush()
     assert [p["alert_id"] for p in producer.sent] == ["first", "first"]
+
+
+def test_flush_pipelines_sends_per_chunk_and_batches_hdel(monkeypatch):
+    events = []
+    hdels = []
+
+    class FakeFuture:
+        def __init__(self, alert_id):
+            self.alert_id = alert_id
+
+        def get(self, timeout):
+            events.append(("get", self.alert_id))
+
+    class ChunkProducer:
+        def send(self, topic, value):
+            events.append(("send", value["alert_id"]))
+            return FakeFuture(value["alert_id"])
+
+    class FakeOutboxRedis:
+        def __init__(self):
+            self.items = {
+                f"a{i}": json.dumps(payload(f"a{i}", f"p{i}"))
+                for i in range(3)
+            }
+
+        def hscan_iter(self, key, count=100):
+            return iter(list(self.items.items()))
+
+        def hdel(self, key, *fields):
+            hdels.append(fields)
+            for field in fields:
+                self.items.pop(field, None)
+
+    monkeypatch.setattr(alerts, "_kafka_producer", lambda: ChunkProducer())
+    monkeypatch.setattr(alerts, "FLUSH_CHUNK_SIZE", 2)
+    r = FakeOutboxRedis()
+    alerts.AlertBatch(r).flush()
+    # Chunk 1 sends a0, a1 before waiting on either get(), then batches HDEL(a0, a1);
+    # Chunk 2 sends a2, waits on get(), then HDEL(a2).
+    assert events == [
+        ("send", "a0"), ("send", "a1"), ("get", "a0"), ("get", "a1"),
+        ("send", "a2"), ("get", "a2"),
+    ]
+    assert hdels == [("a0", "a1"), ("a2",)]
+    assert r.items == {}

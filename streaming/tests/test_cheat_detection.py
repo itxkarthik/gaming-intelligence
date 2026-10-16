@@ -11,11 +11,11 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import pytest
-from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 
 from src.common.schemas import GAMEPLAY_EVENT_SCHEMA, SHOT_EVENT
 from src.jobs.cheat_detection import (
+    FOREST_MAX_GAP_SECONDS,
     FOREST_PERSIST_SECONDS,
     best_window_per_player,
     build_suspicion_pipeline,
@@ -27,21 +27,6 @@ from src.ml.iforest import HS_PRIOR, HS_PRIOR_HITS
 
 # Fixed event time => every synthetic event lands in one window.
 EVENT_TIME = 1_700_000_000_000
-
-
-@pytest.fixture(scope="session")
-def spark():
-    session = (
-        SparkSession.builder
-        .master("local[2]")
-        .appName("cheat-detection-tests")
-        .config("spark.ui.enabled", "false")
-        .config("spark.sql.shuffle.partitions", "2")
-        .getOrCreate()
-    )
-    session.sparkContext.setLogLevel("ERROR")
-    yield session
-    session.stop()
 
 
 def _shot(idx, player_id, match_id, accuracy, reaction,
@@ -202,6 +187,16 @@ def test_single_forest_window_does_not_count_until_it_persists():
     assert persistent is False
     assert forest_persistence(since, True, now=1000.0 + FOREST_PERSIST_SECONDS,
                               last_judged=1015.0) == (1000.0, True)
+
+
+def test_contiguous_30s_window_preserves_streak_when_intermediate_slide_unselected():
+    assert FOREST_MAX_GAP_SECONDS == 30
+    since, persistent = forest_persistence(None, True, now=1000.0)
+    assert (since, persistent) == (1000.0, False)
+    # [0,30] -> [30,60] when [15,45] had fewer shots and wasn't selected:
+    assert forest_persistence(since, True, now=1030.0, last_judged=1000.0) == (1000.0, True)
+    # Gap > 30s (e.g. 45s) resets since:
+    assert forest_persistence(since, True, now=1045.0, last_judged=1000.0) == (1045.0, False)
 
 
 def test_isolated_outlier_an_hour_later_starts_over():

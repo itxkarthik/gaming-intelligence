@@ -7,28 +7,12 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import pytest
-from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 
 from src.common.schemas import GAMEPLAY_EVENT_SCHEMA, PLAYER_EVENT_SCHEMA
 from src.jobs.match_quality import build_match_quality_pipeline
 
 T0 = 1_700_000_000_000  # match start (ms)
-
-
-@pytest.fixture(scope="session")
-def spark():
-    session = (
-        SparkSession.builder
-        .master("local[2]")
-        .appName("match-quality-tests")
-        .config("spark.ui.enabled", "false")
-        .config("spark.sql.shuffle.partitions", "2")
-        .getOrCreate()
-    )
-    session.sparkContext.setLogLevel("ERROR")
-    yield session
-    session.stop()
 
 
 def _kill(idx, match_id, team, offset_s):

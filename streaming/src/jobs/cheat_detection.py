@@ -47,7 +47,7 @@ CRITICAL_THRESHOLD = 0.85
 # An IsolationForest outlier must persist this long before it counts: one
 # lucky 30 s window trips the model, a cheater stays an outlier window after window.
 FOREST_PERSIST_SECONDS = 30
-FOREST_MAX_GAP_SECONDS = 15
+FOREST_MAX_GAP_SECONDS = 30
 # Source-event bounds add aggregation state; never resume the pre-bounds schema.
 CHEAT_CHECKPOINT = "cheat_detection_v2"
 

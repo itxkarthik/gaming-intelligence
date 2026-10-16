@@ -6,28 +6,12 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import pytest
-from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
 
 from src.common.schemas import SERVER_METRIC_SCHEMA
 from src.jobs.server_health import build_health_pipeline
 
 TS = 1_700_000_000_000  # fixed metric time => single 10s window
-
-
-@pytest.fixture(scope="session")
-def spark():
-    session = (
-        SparkSession.builder
-        .master("local[2]")
-        .appName("server-health-tests")
-        .config("spark.ui.enabled", "false")
-        .config("spark.sql.shuffle.partitions", "2")
-        .getOrCreate()
-    )
-    session.sparkContext.setLogLevel("ERROR")
-    yield session
-    session.stop()
 
 
 def _metric(server_id, cpu, ram, loss, latency, tick, region="eu-west"):

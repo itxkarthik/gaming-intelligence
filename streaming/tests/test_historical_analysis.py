@@ -5,23 +5,11 @@ import sys
 from datetime import datetime
 
 import pytest
-from pyspark.sql import SparkSession
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from src.batch.historical_analysis import cheat_evaluation_frames, _eval_row
 from pyspark.sql import functions as F
-
-
-@pytest.fixture(scope="session")
-def spark():
-    session = (SparkSession.builder.master("local[2]")
-               .appName("historical-analysis-tests")
-               .config("spark.ui.enabled", "false")
-               .config("spark.sql.shuffle.partitions", "2").getOrCreate())
-    session.sparkContext.setLogLevel("ERROR")
-    yield session
-    session.stop()
 
 
 SCHEMA = (

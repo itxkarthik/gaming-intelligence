@@ -1,21 +1,14 @@
 """Real local-filesystem archive commit and replay regressions."""
 
 import json
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import pytest
-from pyspark.sql import SparkSession
 
 from src.common import sinks
-
-
-@pytest.fixture(scope="module")
-def spark():
-    session = (SparkSession.builder.master("local[2]").appName("archive-tests")
-               .config("spark.ui.enabled", "false")
-               .config("spark.sql.shuffle.partitions", "2").getOrCreate())
-    session.sparkContext.setLogLevel("ERROR")
-    yield session
-    session.stop()
 
 
 @pytest.fixture

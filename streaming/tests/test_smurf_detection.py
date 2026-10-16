@@ -11,6 +11,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from src.common.alerts import AlertBatch
 from src.jobs.smurf_detection import (
+    PIPELINE_CHUNK_SIZE,
     SMURF_PROB_THRESHOLD,
     evaluate_smurf,
     evaluate_smurfs,
@@ -104,8 +105,12 @@ class FakePipe:
     def srem(self, k, v):
         self.ops.append(("srem", k, v))
 
-    def eval(self, script, numkeys, dedup_key, outbox_key, alert_id, payload, ttl):
-        self.ops.append(("outbox", json.loads(payload)))
+    def eval(self, script, numkeys, *args):
+        if numkeys == 2:
+            _, _, _, payload, _ = args
+            self.ops.append(("outbox", json.loads(payload)))
+        elif numkeys == 3:
+            self.ops.append(("write_account", args))
 
     def execute(self):
         self.r.attempts.append(list(self.ops))
@@ -133,6 +138,34 @@ class FakePipe:
                 res.append(1)
             elif op[0] == "outbox":
                 self.r.outbox.append(op[1])
+                res.append(1)
+            elif op[0] == "write_account":
+                (account_key, smurf_key, smurf_set_key, player_id, login_at_str,
+                 updated_at_str, max_age_str, max_games_str, *flat_update) = op[1]
+                stored = self.r.hashes.get(account_key, {})
+                if stored.get("login_at") and int(login_at_str) < int(stored["login_at"]):
+                    res.append(0)
+                    continue
+                update = dict(zip(flat_update[::2], flat_update[1::2]))
+                update["login_at"] = login_at_str
+                self.r.hashes.setdefault(account_key, {}).update(update)
+                account = parse_account(self.r.hashes[account_key])
+                if account is not None and (
+                    account["age_days"] >= int(max_age_str)
+                    or account["games_played"] >= int(max_games_str)
+                ):
+                    self.r.hashes.setdefault(smurf_key, {}).update({
+                        "player_id": player_id,
+                        "probability": "0.000",
+                        "status": "CLEAN",
+                        "account_age_days": str(account["age_days"]),
+                        "games_played": str(account["games_played"]),
+                        "declared_rank": account["rank"],
+                        "archetype": account["archetype"],
+                        "reason": "established account",
+                        "updated_at": updated_at_str,
+                    })
+                    self.r.sets.setdefault(smurf_set_key, set()).discard(player_id)
                 res.append(1)
         self.ops.clear()
         self.watched.clear()
@@ -210,9 +243,9 @@ def test_login_only_established_account_clears_stale_smurf(metadata):
     write_accounts(r, [_login(**metadata)])
     _assert_clean(r)
     assert r.hashes["player:account:p1"]["login_at"] == "1700000001000"
-    # Metadata, evaluation, and membership are committed together.
+    # Metadata, evaluation, and membership are committed together in one atomic Lua call.
     assert len(r.transactions) == 1
-    assert [op[0] for op in r.transactions[0]] == ["hset", "hset", "srem"]
+    assert [op[0] for op in r.transactions[0]] == ["write_account"]
 
 
 @pytest.mark.parametrize("metadata", [
@@ -225,7 +258,7 @@ def test_old_login_cannot_regress_metadata_or_change_eligibility(metadata):
     write_accounts(r, [_login(event_time=1699999999999, **metadata)])
     assert r.hashes == saved
     assert r.sets["players:smurf"] == {"p1"}
-    assert r.transactions == []
+    assert len(r.transactions) == 1
 
 
 def test_out_of_order_logins_keep_newest_established_metadata():
@@ -237,6 +270,8 @@ def test_out_of_order_logins_keep_newest_established_metadata():
     _assert_clean(r)
     assert r.hashes["player:account:p1"]["rank"] == "diamond"
     assert r.hashes["player:account:p1"]["account_age_days"] == "100"
+    assert len(r.transactions) == 1
+    assert len(r.transactions[0]) == 1
 
 
 def test_login_candidate_does_not_clear_existing_combat_flag():
@@ -275,7 +310,21 @@ def test_concurrent_newer_login_is_not_overwritten_after_watch_retry():
     assert r.hashes["player:account:p1"]["rank"] == "diamond"
     assert r.hashes["player:account:p1"]["account_age_days"] == "3"
     assert r.hashes["player:smurf:p1"]["status"] == "SMURF"
-    assert r.transactions == []
+    assert len(r.transactions) == 1
+
+
+def test_write_accounts_deduplicates_and_batches_in_pipeline_chunks():
+    r = FakeRedis(age=3, games=12)
+    rows = []
+    for idx in range(PIPELINE_CHUNK_SIZE * 2 + 5):
+        pid = f"p{idx}"
+        rows.append({"player_id": pid, "event_time": 1000, "metadata": {"rank": "bronze"}})
+        rows.append({"player_id": pid, "event_time": 2000, "metadata": {"rank": "gold"}})
+    write_accounts(r, rows)
+    assert len(r.transactions) == 3
+    assert [len(tx) for tx in r.transactions] == [PIPELINE_CHUNK_SIZE, PIPELINE_CHUNK_SIZE, 5]
+    assert r.hashes["player:account:p0"]["rank"] == "gold"
+    assert r.hashes["player:account:p0"]["login_at"] == "2000"
 
 
 def test_smurf_alert_is_staged_in_state_transaction_not_flushed():
@@ -411,3 +460,45 @@ def test_repeated_watch_retries_do_not_lose_unrelated_or_duplicate_smurf_intents
     assert r.outbox[1]["details"]["declared_rank"] == "silver"
     assert r.outbox[1]["details"]["games_played"] == "13"
     assert alerts.pending == []
+
+
+def test_write_accounts_lua_script_against_real_redis():
+    import uuid
+    import redis
+
+    host = os.getenv("REDIS_TEST_HOST")
+    if not host:
+        pytest.skip("set REDIS_TEST_HOST to a disposable Redis for Lua integration tests")
+    client = redis.Redis(host=host, db=15, decode_responses=True)
+    pid = f"test_p_{uuid.uuid4().hex}"
+    acct_key = f"player:account:{pid}"
+    smurf_key = f"player:smurf:{pid}"
+    try:
+        client.hset(acct_key, mapping={
+            "account_age_days": "3", "games_played": "12", "rank": "bronze",
+            "archetype": "smurf", "login_at": "1000",
+        })
+        client.hset(smurf_key, mapping={"status": "SMURF", "probability": "0.950"})
+        client.sadd("players:smurf", pid)
+
+        # Older login is ignored by Lua script; newer established login reconciles state
+        write_accounts(client, [
+            {"player_id": pid, "event_time": 500, "metadata": {"account_age_days": "1"}},
+            {"player_id": pid, "event_time": 2000, "metadata": {"account_age_days": "14", "rank": "gold"}},
+            {"player_id": pid, "event_time": 1500, "metadata": {"account_age_days": "2", "rank": "silver"}},
+        ])
+        assert client.hget(acct_key, "account_age_days") == "14"
+        assert client.hget(acct_key, "rank") == "gold"
+        assert client.hget(acct_key, "login_at") == "2000"
+        assert client.hget(smurf_key, "status") == "CLEAN"
+        assert not client.sismember("players:smurf", pid)
+
+        # Subsequent older login in a separate batch cannot regress stored state
+        write_accounts(client, [
+            {"player_id": pid, "event_time": 1999, "metadata": {"account_age_days": "1", "rank": "bronze"}},
+        ])
+        assert client.hget(acct_key, "account_age_days") == "14"
+        assert client.hget(acct_key, "rank") == "gold"
+    finally:
+        client.delete(acct_key, smurf_key)
+        client.srem("players:smurf", pid)

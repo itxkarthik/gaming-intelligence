@@ -36,6 +36,39 @@ CANDIDATE_MAX_GAMES = 30
 SMURF_PROB_THRESHOLD = 0.85
 MIN_COMBAT_SHOTS = 8
 ACCOUNT_FIELDS = ("account_age_days", "games_played", "rank", "archetype")
+PIPELINE_CHUNK_SIZE = 200
+
+_WRITE_ACCOUNT = """
+local stored_login = tonumber(redis.call('HGET', KEYS[1], 'login_at'))
+local login_at = tonumber(ARGV[2])
+if stored_login and login_at < stored_login then
+    return 0
+end
+redis.call('HSET', KEYS[1], 'login_at', ARGV[2], unpack(ARGV, 6))
+local age = tonumber(redis.call('HGET', KEYS[1], 'account_age_days'))
+local games = tonumber(redis.call('HGET', KEYS[1], 'games_played'))
+if age and games and (age >= tonumber(ARGV[4]) or games >= tonumber(ARGV[5])) then
+    local rank = redis.call('HGET', KEYS[1], 'rank')
+    if not rank or rank == '' then
+        rank = 'gold'
+    end
+    local archetype = redis.call('HGET', KEYS[1], 'archetype') or ''
+    redis.call(
+        'HSET', KEYS[2],
+        'player_id', ARGV[1],
+        'probability', '0.000',
+        'status', 'CLEAN',
+        'account_age_days', tostring(age),
+        'games_played', tostring(games),
+        'declared_rank', rank,
+        'archetype', archetype,
+        'reason', 'established account',
+        'updated_at', ARGV[3]
+    )
+    redis.call('SREM', KEYS[3], ARGV[1])
+end
+return 1
+"""
 
 # Declared-rank population baselines (acc_mean, acc_std, rxn_mean, rxn_std),
 # mirroring the simulator's YAML profile distributions.
@@ -123,28 +156,30 @@ def evaluate_smurfs(r, alerts, rows):
     set (added on SMURF, removed on CLEAN or aged-out candidacy) and raises
     SMURF_DETECTED alerts.
     """
-    keys = [f"player:account:{row['player_id']}" for row in rows]
-    buffered = list(alerts.pending)
-    while True:
-        committed = False
-        try:
-            with r.pipeline() as pipe:
-                if keys:
-                    pipe.watch(*keys)
-                accounts = [pipe.hgetall(key) for key in keys]
-                pipe.multi()
-                _stage_smurf_evaluations(pipe, alerts, rows, accounts)
-                alerts.stage(pipe)
-                pipe.execute()
-                committed = True
-                return
-        except WatchError:
-            continue
-        finally:
-            if not committed:
-                # stage() consumes pending before EXEC. Preserve unrelated
-                # buffered intents, but never retry an obsolete smurf intent.
-                alerts.pending[:] = buffered
+    for start in range(0, max(len(rows), 1), PIPELINE_CHUNK_SIZE):
+        chunk = rows[start:start + PIPELINE_CHUNK_SIZE]
+        keys = [f"player:account:{row['player_id']}" for row in chunk]
+        buffered = list(alerts.pending)
+        while True:
+            committed = False
+            try:
+                with r.pipeline() as pipe:
+                    if keys:
+                        pipe.watch(*keys)
+                    accounts = [pipe.hgetall(key) for key in keys]
+                    pipe.multi()
+                    _stage_smurf_evaluations(pipe, alerts, chunk, accounts)
+                    alerts.stage(pipe)
+                    pipe.execute()
+                    committed = True
+                    break
+            except WatchError:
+                continue
+            finally:
+                if not committed:
+                    # stage() consumes pending before EXEC. Preserve unrelated
+                    # buffered intents, but never retry an obsolete smurf intent.
+                    alerts.pending[:] = buffered
 
 
 def _stage_smurf_evaluations(pipe, alerts, rows, accounts):
@@ -185,35 +220,48 @@ def _stage_smurf_evaluations(pipe, alerts, rows, accounts):
             pipe.srem("players:smurf", player_id)
 
 
-def write_accounts(r, rows):
-    """Apply LOGIN metadata in event-time order and reconcile candidacy immediately."""
+def _dedup_logins(rows):
+    """Deduplicate LOGIN rows per player_id, keeping max event_time."""
+    latest = {}
     for row in rows:
         metadata = row["metadata"] or {}
-        update = {k: metadata[k] for k in ACCOUNT_FIELDS if metadata.get(k) is not None}
+        update = {k: str(metadata[k]) for k in ACCOUNT_FIELDS if metadata.get(k) is not None}
         if not update:
             continue
         player_id = row["player_id"]
-        key = f"player:account:{player_id}"
         login_at = int(row["event_time"])
-        update["login_at"] = str(row["event_time"])
-        # Account metadata and eligibility must agree even on replay or when a
-        # concurrent LOGIN writer changes the hash between the read and commit.
+        prev = latest.get(player_id)
+        if prev is None or login_at >= prev[0]:
+            latest[player_id] = (login_at, update)
+    return latest
+
+
+def write_accounts(r, rows):
+    """Apply deduplicated LOGIN metadata and reconcile candidacy in pipeline chunks."""
+    latest = _dedup_logins(rows)
+    if not latest:
+        return
+    items = list(latest.items())
+    now_str = str(int(time.time()))
+    for start in range(0, len(items), PIPELINE_CHUNK_SIZE):
+        chunk = items[start:start + PIPELINE_CHUNK_SIZE]
         with r.pipeline() as pipe:
-            while True:
-                try:
-                    pipe.watch(key)
-                    stored = pipe.hgetall(key)
-                    if stored.get("login_at") and login_at < int(stored["login_at"]):
-                        break
-                    account = parse_account({**stored, **update})
-                    pipe.multi()
-                    pipe.hset(key, mapping=update)
-                    if account is not None and not is_candidate(account):
-                        _clear_established(pipe, player_id, account)
-                    pipe.execute()
-                    break
-                except WatchError:
-                    continue
+            for player_id, (login_at, update) in chunk:
+                flat_update = [item for pair in update.items() for item in pair]
+                pipe.eval(
+                    _WRITE_ACCOUNT,
+                    3,
+                    f"player:account:{player_id}",
+                    f"player:smurf:{player_id}",
+                    "players:smurf",
+                    player_id,
+                    str(login_at),
+                    now_str,
+                    str(CANDIDATE_MAX_AGE_DAYS),
+                    str(CANDIDATE_MAX_GAMES),
+                    *flat_update,
+                )
+            pipe.execute()
 
 
 def write_accounts_batch(batch_df, batch_id):

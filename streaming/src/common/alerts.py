@@ -6,6 +6,7 @@ dedup/rate-limit layer, PostgreSQL history, Redis `alerts:stream` pub/sub,
 and optional webhook).
 """
 
+import itertools
 import json
 import time
 
@@ -17,6 +18,7 @@ from src.common.config import KAFKA_BOOTSTRAP_SERVERS, KAFKA_TOPICS
 ALERTS_TOPIC = KAFKA_TOPICS["alerts"]
 DEDUP_TTL_SECONDS = 300
 OUTBOX_KEY = "alerts:outbox"
+FLUSH_CHUNK_SIZE = 100
 _producer = None
 
 # Run inside the same MULTI/EXEC as the serving-state update. A claim cannot
@@ -99,7 +101,21 @@ class AlertBatch:
             pipe.execute()
         # All drivers may drain the shared outbox. Concurrent delivery is safe
         # at-least-once; the engine recognizes redelivery by the original ID.
-        for alert_id, encoded in self.r.hscan_iter(OUTBOX_KEY, count=100):
-            payload = json.loads(encoded)
-            _kafka_producer().send(ALERTS_TOPIC, payload).get(timeout=15)
-            self.r.hdel(OUTBOX_KEY, alert_id)
+        it = self.r.hscan_iter(OUTBOX_KEY, count=FLUSH_CHUNK_SIZE)
+        while True:
+            chunk = list(itertools.islice(it, FLUSH_CHUNK_SIZE))
+            if not chunk:
+                break
+            producer = _kafka_producer()
+            in_flight = [
+                (alert_id, producer.send(ALERTS_TOPIC, json.loads(encoded)))
+                for alert_id, encoded in chunk
+            ]
+            acked = []
+            try:
+                for alert_id, future in in_flight:
+                    future.get(timeout=15)
+                    acked.append(alert_id)
+            finally:
+                if acked:
+                    self.r.hdel(OUTBOX_KEY, *acked)
