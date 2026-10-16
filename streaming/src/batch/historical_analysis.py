@@ -254,7 +254,8 @@ def job_weapon(spark):
                 r["weapon_id"],
                 f"{r['kills']:,}",
                 f"{100.0 * r['kills'] / total_kills:.1f}%",
-                f"{100.0 * r['hs_rate']:.1f}%",
+                (f"{100.0 * r['hs_rate']:.1f}%"
+                 if r["hs_rate"] is not None else "—"),
                 f"{r['avg_acc']:.3f}" if r["avg_acc"] is not None else "—",
                 f"{purch.get(r['weapon_id'], 0):,}",
             ]

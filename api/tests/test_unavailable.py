@@ -84,6 +84,22 @@ class OutageTests(unittest.IsolatedAsyncioTestCase):
                     with self.assertRaisesRegex(OSError, "private filesystem details"):
                         await request(path)
 
+    async def test_unreachable_postgres_closed_port_returns_503(self):
+        await main.state.close_pg_pool()
+        with patch.object(
+            main.state,
+            "PG_DSN",
+            "postgresql://gaming:gaming_dev@127.0.0.1:1/gaming_platform",
+        ):
+            status, headers, body = await request("/api/v1/alerts/history")
+            self.assertEqual(status, 503)
+            self.assertIn(b"application/json", headers[b"content-type"])
+            self.assertEqual(json.loads(body), {"detail": "PostgreSQL unavailable"})
+
+            status, headers, body = await request("/alerts")
+            self.assertEqual(status, 503)
+            self.assertIn(b"text/html", headers[b"content-type"])
+
 
 if __name__ == "__main__":
     unittest.main()

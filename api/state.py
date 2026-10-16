@@ -87,7 +87,7 @@ RATE_WINDOW_SECONDS = 60
 SAMPLER_STALE_SECONDS = 3 * SAMPLE_INTERVAL_SECONDS
 
 # Errors that mean "a backing service is unavailable" (-> HTTP 503).
-UNAVAILABLE_ERRORS = (redis.RedisError, asyncpg.PostgresError)
+UNAVAILABLE_ERRORS = (redis.RedisError, asyncpg.PostgresError, ConnectionError, TimeoutError)
 
 
 def as_float(value: Any, default: float = 0.0) -> float:
@@ -178,6 +178,34 @@ def effective_suspicion(profile: dict[str, str]) -> float:
     return as_float(profile.get("suspicion_effective"), base)
 
 
+_PRUNE_SET_BY_FIELD = """
+local set_key = KEYS[1]
+local prefix = ARGV[1]
+local field = ARGV[2]
+local active_val = ARGV[3]
+for i = 4, #ARGV do
+    local id = ARGV[i]
+    if redis.call('HGET', prefix .. id, field) ~= active_val then
+        redis.call('SREM', set_key, id)
+    end
+end
+return 1
+"""
+
+_PRUNE_SERVERS_BY_CUTOFF = """
+local set_key = KEYS[1]
+local cutoff = tonumber(ARGV[1])
+for i = 2, #ARGV do
+    local id = ARGV[i]
+    local ts = tonumber(redis.call('HGET', 'server:' .. id, 'updated_at'))
+    if not ts or ts < cutoff then
+        redis.call('SREM', set_key, id)
+    end
+end
+return 1
+"""
+
+
 async def read_servers() -> list[dict[str, str]]:
     r = redis_client()
     ids = sorted(await r.smembers("servers:active"))
@@ -191,7 +219,7 @@ async def read_servers() -> list[dict[str, str]]:
         else:
             stale.append(sid)
     if stale:
-        await r.srem("servers:active", *stale)
+        await r.eval(_PRUNE_SERVERS_BY_CUTOFF, 1, "servers:active", str(cutoff), *stale)
     return live
 
 
@@ -206,7 +234,8 @@ async def read_flagged_players() -> list[dict[str, str]]:
     stale = [pid for pid, profile in zip(ids, profiles, strict=True)
              if not _is_flagged(profile)]
     if stale:
-        await redis_client().srem("players:flagged", *stale)
+        await redis_client().eval(
+            _PRUNE_SET_BY_FIELD, 1, "players:flagged", "player:", "flagged", "true", *stale)
     rows = [d for d in profiles if _is_flagged(d)]
     rows.sort(key=effective_suspicion, reverse=True)
     return rows
@@ -220,7 +249,8 @@ async def read_smurfs() -> list[dict[str, str]]:
     stale = [pid for pid, profile in zip(ids, profiles, strict=True)
              if not _is_smurf(profile)]
     if stale:
-        await redis_client().srem("players:smurf", *stale)
+        await redis_client().eval(
+            _PRUNE_SET_BY_FIELD, 1, "players:smurf", "player:smurf:", "status", "SMURF", *stale)
     for pid, data in zip(ids, profiles, strict=True):
         if _is_smurf(data):
             rows.append({**data, "player_id": pid})
@@ -250,7 +280,9 @@ async def _count_current(set_key: str, hash_fmt: str, field: str, value: str) ->
     vals = await _pipeline(lambda p: [p.hget(hash_fmt.format(i), field) for i in ids])
     stale = [pid for pid, item in zip(ids, vals, strict=True) if item != value]
     if stale:
-        await redis_client().srem(set_key, *stale)
+        prefix = hash_fmt.format("")
+        await redis_client().eval(
+            _PRUNE_SET_BY_FIELD, 1, set_key, prefix, field, value, *stale)
     return sum(1 for v in vals if v == value)
 
 

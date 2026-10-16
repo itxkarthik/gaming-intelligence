@@ -127,18 +127,30 @@ func serve(ctx context.Context, cfg Config) error {
 		now: time.Now,
 	}
 	var webhookDone chan struct{}
+	var webhookCancel context.CancelFunc
 	if cfg.WebhookURL != "" {
 		h.notifier = webhookNotifier{client: &http.Client{Timeout: webhookTimeout}, url: cfg.WebhookURL}
 		h.webhookQueue = make(chan Alert, 128)
 		webhookDone = make(chan struct{})
+		var webhookCtx context.Context
+		webhookCtx, webhookCancel = context.WithCancel(ctx)
+		defer webhookCancel()
 		go func() {
 			defer close(webhookDone)
-			for alert := range h.webhookQueue {
-				notifyCtx, cancel := context.WithTimeout(context.Background(), webhookTimeout)
-				err := h.notifier.Notify(notifyCtx, alert)
-				cancel()
-				if err != nil {
-					log.Printf("[WARN] webhook %s: %v", alert.AlertID, err)
+			for {
+				select {
+				case <-webhookCtx.Done():
+					return
+				case alert, ok := <-h.webhookQueue:
+					if !ok {
+						return
+					}
+					notifyCtx, cancel := context.WithTimeout(webhookCtx, webhookTimeout)
+					err := h.notifier.Notify(notifyCtx, alert)
+					cancel()
+					if err != nil && webhookCtx.Err() == nil {
+						log.Printf("[WARN] webhook %s: %v", alert.AlertID, err)
+					}
 				}
 			}
 		}()
@@ -150,6 +162,9 @@ func serve(ctx context.Context, cfg Config) error {
 
 	stats, err := consume(ctx, reader, h)
 	if h.webhookQueue != nil {
+		// Do not drain queued notifications during shutdown: a dead webhook
+		// would otherwise delay process exit by up to webhookTimeout per alert.
+		webhookCancel()
 		close(h.webhookQueue)
 		<-webhookDone
 	}

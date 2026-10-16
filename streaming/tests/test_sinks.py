@@ -89,6 +89,14 @@ def test_compaction_preserves_published_batch_replay_identity(spark, archive, mo
     assert spark.read.parquet(str(output)).count() == 1
 
 
+def test_compaction_skips_when_output_root_is_missing(tmp_path, monkeypatch, capsys):
+    from src.batch import compact_parquet
+
+    monkeypatch.setattr(compact_parquet, "HDFS_OUTPUT_DIR", str(tmp_path / "missing"))
+    compact_parquet.compact(object(), "behavior_change", 1)
+    assert "Skipping behavior_change: archive directory not found" in capsys.readouterr().out
+
+
 def test_missing_checkpoint_identity_is_not_silently_ignored(spark, archive):
     _, metadata = archive
     metadata.unlink()
@@ -101,4 +109,3 @@ def test_checkpoint_mapping_matches_cheat_detection_job():
     from src.jobs.cheat_detection import CHEAT_CHECKPOINT
 
     assert sinks._CHECKPOINTS["cheat_detection"] == CHEAT_CHECKPOINT
-

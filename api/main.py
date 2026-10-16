@@ -72,7 +72,7 @@ async def _service_unavailable(request: Request, exc: Exception):
     """Redis / PostgreSQL failures -> 503 (JSON for the API, a page for the
     dashboard). Details go to the log, never to the client."""
     service = ("Redis" if isinstance(exc, redis.RedisError)
-               else "PostgreSQL" if isinstance(exc, asyncpg.PostgresError)
+               else "PostgreSQL" if isinstance(exc, (asyncpg.PostgresError, ConnectionError, TimeoutError))
                else "backing service")
     log.warning("%s %s -> 503 (%s): %r", request.method, request.url.path, service, exc)
     if request.url.path.startswith("/api/") or request.url.path == "/health":
