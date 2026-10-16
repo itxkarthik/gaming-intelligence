@@ -56,6 +56,13 @@
 {% block scripts %}
 <script>
   const rawTimeline = {{ initial_timeline|tojson }};
+  if (rawTimeline.length) {
+    const initialEps = rawTimeline[rawTimeline.length - 1].eps;
+    const badge = document.getElementById('chart-eps-badge');
+    if (badge && initialEps !== undefined && initialEps !== null) {
+      badge.textContent = `${Math.round(initialEps).toLocaleString()} EPS`;
+    }
+  }
   const ctx = document.getElementById('throughputChart').getContext('2d');
 
   /* Chart colours come from the active theme's CSS variables (dashboard.css). */

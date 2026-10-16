@@ -191,8 +191,8 @@ Each driver is capped at 1 core, so the four exactly fill the 4-core cluster.
 #### Recovery and checkpoint migration
 
 - Stop the existing drivers before deploying these changes. Cheat detection
-  uses the new `cheat_detection_v2` checkpoint because its aggregation schema
-  now includes source-event bounds. Finalized behavior steps use
+  uses the new `cheat_detection_v3` checkpoint because it finalizes event-time
+  windows before advancing persistence. Finalized behavior steps use
   `behavior_change_steps_v2`; the separate raw-shot archive retains the
   original `behavior_change` checkpoint. **Do not delete existing checkpoints.**
   New queries read retained Kafka history; their first catch-up can be large.

@@ -46,6 +46,24 @@ local login_at = tonumber(ARGV[2])
 if stored_login and login_at < stored_login then
     return 0
 end
+local legacy_state = not stored_login and (
+    redis.call('EXISTS', KEYS[2]) == 1
+    or redis.call('SISMEMBER', KEYS[3], ARGV[1]) == 1
+    or redis.call('EXISTS', KEYS[6]) == 1
+    or redis.call('EXISTS', KEYS[7]) == 1
+    or redis.call('SISMEMBER', KEYS[5], ARGV[1]) == 1
+    or redis.call('EXISTS', KEYS[10]) == 1
+)
+if legacy_state or (stored_login and login_at > stored_login) then
+    redis.call('DEL', KEYS[2], KEYS[6], KEYS[7], KEYS[10])
+    redis.call('SREM', KEYS[3], ARGV[1])
+    redis.call('SREM', KEYS[5], ARGV[1])
+    redis.call('SREM', KEYS[8], ARGV[1])
+    redis.call('ZREM', KEYS[9], ARGV[1])
+    if redis.call('EXISTS', KEYS[4]) == 1 then
+        redis.call('HSET', KEYS[4], 'flagged', 'false')
+    end
+end
 redis.call('HSET', KEYS[1], 'login_at', ARGV[2], unpack(ARGV, 6))
 local age = tonumber(redis.call('HGET', KEYS[1], 'account_age_days'))
 local games = tonumber(redis.call('HGET', KEYS[1], 'games_played'))
@@ -340,10 +358,17 @@ def write_accounts(r, rows):
                 flat_update = [item for pair in update.items() for item in pair]
                 pipe.eval(
                     _WRITE_ACCOUNT,
-                    3,
+                    10,
                     f"player:account:{player_id}",
                     f"player:smurf:{player_id}",
                     "players:smurf",
+                    f"player:{player_id}",
+                    "players:flagged",
+                    f"player:cheat:evidence:{player_id}",
+                    f"behavior:cusum:{player_id}",
+                    "behavior:anomalies",
+                    "behavior:anomalies:expiry",
+                    f"player:behavior:{player_id}",
                     player_id,
                     str(login_at),
                     now_str,

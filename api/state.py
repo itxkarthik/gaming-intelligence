@@ -49,8 +49,10 @@ POSTGRES_PORT = int(os.getenv("POSTGRES_PORT", "5432"))
 POSTGRES_USER = os.getenv("POSTGRES_USER", "gaming")
 POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "gaming_dev")
 POSTGRES_DB = os.getenv("POSTGRES_DB", "gaming_platform")
-PG_DSN = (f"postgresql://{quote(POSTGRES_USER, safe='')}:{quote(POSTGRES_PASSWORD, safe='')}"
-          f"@{POSTGRES_HOST}:{POSTGRES_PORT}/{POSTGRES_DB}")
+POSTGRES_URL = os.getenv("POSTGRES_URL")
+PG_DSN = POSTGRES_URL or (
+    f"postgresql://{quote(POSTGRES_USER, safe='')}:{quote(POSTGRES_PASSWORD, safe='')}"
+    f"@{POSTGRES_HOST}:{POSTGRES_PORT}/{POSTGRES_DB}")
 
 HEARTBEAT_SECONDS = 15
 
@@ -70,6 +72,7 @@ MATCH_UNBALANCED_MIN = 40.0
 MATCH_RECENT_SECONDS = 90
 # A server_metrics sample older than this no longer counts toward live matches.
 LIVE_MATCH_MAX_AGE_SECONDS = 30
+SERVER_STATE_MAX_AGE_SECONDS = 90
 ALERT_TYPES = ("SERVER_DEGRADED", "CHEAT_DETECTED", "MATCH_QUALITY_LOW",
                "SMURF_DETECTED", "BEHAVIOR_ANOMALY")
 ALERT_SEVERITIES = ("CRITICAL", "WARNING", "INFO")
@@ -176,8 +179,20 @@ def effective_suspicion(profile: dict[str, str]) -> float:
 
 
 async def read_servers() -> list[dict[str, str]]:
-    ids = sorted(await redis_client().smembers("servers:active"))
-    return [d for d in await _hgetall_many([f"server:{i}" for i in ids]) if d]
+    r = redis_client()
+    ids = sorted(await r.smembers("servers:active"))
+    profiles = await _hgetall_many([f"server:{i}" for i in ids])
+    cutoff = time.time() - SERVER_STATE_MAX_AGE_SECONDS
+    live = []
+    stale = []
+    for sid, profile in zip(ids, profiles, strict=True):
+        if profile and as_float(profile.get("updated_at")) >= cutoff:
+            live.append(profile)
+        else:
+            stale.append(sid)
+    if stale:
+        await r.srem("servers:active", *stale)
+    return live
 
 
 async def read_server(server_id: str) -> dict[str, str]:
@@ -387,6 +402,24 @@ async def tournament_snapshot() -> dict[str, Any]:
 
 _pg_pool: asyncpg.Pool | None = None
 _pg_pool_lock = asyncio.Lock()
+_ALERT_HISTORY_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS alert_history (
+    id BIGSERIAL PRIMARY KEY,
+    alert_id TEXT UNIQUE NOT NULL,
+    alert_type TEXT NOT NULL,
+    severity TEXT NOT NULL,
+    entity_type TEXT NOT NULL,
+    entity_id TEXT NOT NULL,
+    message TEXT NOT NULL,
+    details JSONB NOT NULL DEFAULT '{}'::jsonb,
+    ts TIMESTAMPTZ NOT NULL,
+    received_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS alert_history_type_id_desc_idx
+    ON alert_history (alert_type, id DESC);
+CREATE INDEX IF NOT EXISTS alert_history_severity_id_desc_idx
+    ON alert_history (severity, id DESC);
+"""
 
 
 async def get_pg_pool() -> asyncpg.Pool:
@@ -400,8 +433,15 @@ async def get_pg_pool() -> asyncpg.Pool:
     if _pg_pool is None:
         async with _pg_pool_lock:
             if _pg_pool is None:
-                _pg_pool = await asyncpg.create_pool(
+                pool = await asyncpg.create_pool(
                     PG_DSN, min_size=1, max_size=5, timeout=3, command_timeout=5)
+                try:
+                    async with pool.acquire() as conn:
+                        await conn.execute(_ALERT_HISTORY_SCHEMA_SQL)
+                except Exception:
+                    await pool.close()
+                    raise
+                _pg_pool = pool
     return _pg_pool
 
 

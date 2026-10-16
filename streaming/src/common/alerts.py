@@ -10,6 +10,7 @@ import contextlib
 import itertools
 import json
 import time
+import threading
 import uuid
 
 import redis
@@ -28,6 +29,7 @@ LEASE_TTL_SECONDS = 60
 OUTBOX_KEY = "alerts:outbox"
 FLUSH_CHUNK_SIZE = 100
 _producer = None
+_producer_lock = threading.Lock()
 
 # Run inside the same MULTI/EXEC as the serving-state update. A claim cannot
 # exist without a durable delivery intent, even if the connection dies at EXEC.
@@ -85,14 +87,16 @@ def _kafka_producer():
     """Reuse one driver-side producer per streaming process."""
     global _producer
     if _producer is None:
-        _producer = KafkaProducer(
-            bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
-            value_serializer=lambda value: json.dumps(value).encode("utf-8"),
-            acks="all",
-            retries=3,
-            max_block_ms=10_000,
-            request_timeout_ms=10_000,
-        )
+        with _producer_lock:
+            if _producer is None:
+                _producer = KafkaProducer(
+                    bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
+                    value_serializer=lambda value: json.dumps(value).encode("utf-8"),
+                    acks="all",
+                    retries=3,
+                    max_block_ms=10_000,
+                    request_timeout_ms=10_000,
+                )
     return _producer
 
 
@@ -194,11 +198,18 @@ class AlertBatch:
             owned = set(alert_ids)
             last_renewed = time.monotonic()
             renew_after = LEASE_TTL_SECONDS / 3
-            producer = _kafka_producer()
             acked = []
+            send_error = None
             try:
                 in_flight = []
+                try:
+                    producer = _kafka_producer()
+                except Exception as exc:
+                    producer = None
+                    send_error = exc
                 for alert_id, encoded in leased:
+                    if producer is None:
+                        break
                     if time.monotonic() - last_renewed >= renew_after:
                         statuses = self._renew_leases(alert_ids, lease_keys, token)
                         owned = {
@@ -209,15 +220,23 @@ class AlertBatch:
                         last_renewed = time.monotonic()
                     if alert_id not in owned:
                         continue
-                    in_flight.append(
-                        (alert_id, producer.send(ALERTS_TOPIC, json.loads(encoded)))
-                    )
+                    try:
+                        in_flight.append(
+                            (alert_id, producer.send(ALERTS_TOPIC, json.loads(encoded)))
+                        )
+                    except Exception as exc:
+                        if send_error is None:
+                            send_error = exc
                 for alert_id, future in in_flight:
                     if time.monotonic() - last_renewed >= renew_after:
                         self._renew_leases(alert_ids, lease_keys, token)
                         last_renewed = time.monotonic()
-                    future.get(timeout=SEND_TIMEOUT_SECONDS)
-                    acked.append(alert_id)
+                    try:
+                        future.get(timeout=SEND_TIMEOUT_SECONDS)
+                        acked.append(alert_id)
+                    except Exception as exc:
+                        if send_error is None:
+                            send_error = exc
             finally:
                 try:
                     if acked:
@@ -227,3 +246,5 @@ class AlertBatch:
                         self.r.eval(
                             _RELEASE_LEASES, len(lease_keys), *lease_keys, token
                         )
+            if send_error is not None:
+                raise send_error

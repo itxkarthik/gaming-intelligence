@@ -12,7 +12,7 @@ SPEC.loader.exec_module(collect)
 
 class CollectionTests(unittest.TestCase):
     def test_all_current_queries_are_required(self):
-        self.assertIn("cheat_detection_v2", collect.DIRS)
+        self.assertIn("cheat_detection_v3", collect.DIRS)
         self.assertIn("behavior_change_steps_v2", collect.DIRS)
         self.assertIn("behavior_change", collect.DIRS)
         self.assertEqual(len(collect.DIRS), 8)

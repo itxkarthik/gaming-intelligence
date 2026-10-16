@@ -51,7 +51,7 @@ CRITICAL_THRESHOLD = 0.85
 FOREST_PERSIST_SECONDS = 30
 FOREST_MAX_GAP_SECONDS = 30
 # Source-event bounds add aggregation state; never resume the pre-bounds schema.
-CHEAT_CHECKPOINT = "cheat_detection_v2"
+CHEAT_CHECKPOINT = "cheat_detection_v3"
 
 VERDICT_SCHEMA = StructType([
     StructField("player_id", StringType(), False),
@@ -140,12 +140,13 @@ def _profile(row, suspicion, suspicion_eff, behavior_anomaly, iforest_score, ifo
     }
 
 
-def best_window_per_player(rows):
-    """One row per player: the window with the most shots (newest on ties).
+def chronological_windows(rows):
+    """Keep every window and process each player's windows in event-time order."""
+    return sorted(rows, key=lambda row: (row["player_id"], int(row["window_end_ms"])))
 
-    Sliding windows overlap, and the newest one is the youngest and
-    smallest; judging it would mean judging on the least evidence.
-    """
+
+def best_window_per_player(rows):
+    """Legacy reporting helper; the live scorer deliberately does not use it."""
     best = {}
     for row in rows:
         rank = (int(row["total_shots"]), row["window"]["end"])
@@ -209,7 +210,7 @@ def checkpoint_identity(spark):
 
 
 def write_player_scores(r, spark, rows, checkpoint_id=None, batch_id=None):
-    """Score each player's best window; update profiles, flags and alerts.
+    """Score all windows; update profiles, flags and alerts in event-time order.
 
     Returns the list of enriched verdict dicts (one per judged/evaluated player
     window) so the Parquet archive can persist the online verdicts.
@@ -229,49 +230,102 @@ def write_player_scores(r, spark, rows, checkpoint_id=None, batch_id=None):
             return json.loads(cached)["verdicts"]
         if previous_batch == batch_id:
             raise RuntimeError("Retained cheat decisions are missing; refusing to recompute")
-    rows = best_window_per_player(rows)
+    rows = chronological_windows(rows)
     iforest_scores = score_rows(load_model(), rows)
     evaluate_smurfs(r, alerts, rows)  # first: the cheat verdict reads it
 
     pipe = r.pipeline()
-    for row in rows:
-        pipe.hget(f"player:behavior:{row['player_id']}", "anomaly")
-        pipe.hget(f"player:smurf:{row['player_id']}", "status")
-        pipe.hgetall(f"player:cheat:evidence:{row['player_id']}")
-        pipe.hget(f"player:account:{row['player_id']}", "login_at")
+    player_ids = list(dict.fromkeys(row["player_id"] for row in rows))
+    for player_id in player_ids:
+        pipe.hget(f"player:behavior:{player_id}", "anomaly")
+        pipe.hget(f"player:smurf:{player_id}", "status")
+        pipe.hgetall(f"player:cheat:evidence:{player_id}")
+        pipe.hget(f"player:account:{player_id}", "login_at")
     reads = pipe.execute()
+    player_state = {
+        player_id: {
+            "behavior": reads[i * 4], "smurf_status": reads[i * 4 + 1],
+            "evidence": dict(reads[i * 4 + 2] or {}), "login_at": reads[i * 4 + 3],
+        }
+        for i, player_id in enumerate(player_ids)
+    }
 
     verdicts = []
     pipe = r.pipeline()
-    for row, iforest_score, behavior, smurf_status, evidence, login_at in zip(
-            rows, iforest_scores, reads[::4], reads[1::4], reads[2::4], reads[3::4]):
+    for row, iforest_score in zip(rows, iforest_scores):
         player_id = row["player_id"]
+        state = player_state[player_id]
+        behavior = state["behavior"]
+        smurf_status = state["smurf_status"]
+        evidence = state["evidence"]
+        login_at = state["login_at"]
         behavior_anomaly = behavior == "1"
         is_smurf = smurf_status == "SMURF"
         suspicion = round(float(row["suspicion_score"]), 3)
         suspicion_eff = apply_behavior_boost(suspicion, behavior_anomaly)
         raw_iforest_flag = iforest_score is not None and iforest_score < IFOREST_THRESHOLD
-        judged = int(row["total_shots"]) >= MIN_SHOTS
+        enough_shots = int(row["total_shots"]) >= MIN_SHOTS
         window_end_ms = int(row["window_end_ms"])
         evidence_key = f"player:cheat:evidence:{player_id}"
         run_id = json.dumps([checkpoint_id, login_at])
+        last_judged = evidence.get("last_judged_window_end_ms")
+        # Older windows can arrive in a catch-up batch after newer ones.
+        # They remain in the archive but cannot rewind online state.
+        stale_window = bool(last_judged and window_end_ms < int(last_judged))
+        judged = enough_shots and not stale_window
 
-        if judged:
+        new_context = (evidence.get("match_id") != row["match_id"]
+                       or evidence.get("run_id") != run_id)
+        advances = (not last_judged or window_end_ms > int(last_judged) or new_context)
+        if judged and advances:
             win_ts = window_end_ms / 1000.0
             since = evidence.get("since")
-            last_judged = evidence.get("last_judged_window_end_ms")
             same_context = (evidence.get("match_id") == row["match_id"]
                             and evidence.get("run_id") == run_id)
             since, persistent = forest_persistence(
                 float(since) if since else None, raw_iforest_flag, win_ts,
                 float(last_judged) / 1000.0 if last_judged else None, same_context)
-            pipe.hset(evidence_key, mapping={
+            new_evidence = {
                 "since": str(since) if since is not None else "",
                 "last_judged_window_end_ms": str(window_end_ms),
                 "match_id": row["match_id"],
                 "run_id": run_id,
-            })
+            }
+            evidence.update(new_evidence)
+            pipe.hset(evidence_key, mapping=new_evidence)
             pipe.expire(evidence_key, PLAYER_STATE_TTL_SECONDS)
+        elif judged:
+            # Same window may be recomputed with more rows. Preserve the streak
+            # and do not count it as a second persistence interval.
+            raw_since = evidence.get("since")
+            since = float(raw_since) if raw_since else None
+            if since is None and raw_iforest_flag:
+                since = window_end_ms / 1000.0
+                evidence["since"] = str(since)
+                pipe.hset(evidence_key, mapping={"since": str(since)})
+                pipe.expire(evidence_key, PLAYER_STATE_TTL_SECONDS)
+            persistent = bool(since and
+                              window_end_ms / 1000.0 - float(since) >= FOREST_PERSIST_SECONDS)
+        elif enough_shots is False and not stale_window and advances:
+            # Append-mode rows are finalized windows. A completed window with
+            # too little evidence breaks continuity; an update-mode fragment
+            # never reaches this writer.
+            since = ""
+            new_evidence = {
+                "since": "",
+                "last_judged_window_end_ms": str(window_end_ms),
+                "match_id": row["match_id"],
+                "run_id": run_id,
+            }
+            evidence.update(new_evidence)
+            pipe.hset(evidence_key, mapping=new_evidence)
+            pipe.expire(evidence_key, PLAYER_STATE_TTL_SECONDS)
+            persistent = False
+        else:
+            since = None
+            persistent = False
+
+        if judged:
             flagged, critical = cheat_verdict(suspicion_eff, persistent, is_smurf)
             profile = _profile(row, suspicion, suspicion_eff, behavior_anomaly,
                                iforest_score, persistent)
@@ -292,13 +346,8 @@ def write_player_scores(r, spark, rows, checkpoint_id=None, batch_id=None):
             pipe.hset(f"player:{player_id}", mapping=profile)
             pipe.expire(f"player:{player_id}", PLAYER_STATE_TTL_SECONDS)
         else:
-            persistent = False
             flagged = False
             critical = False
-            # Break continuity without changing the last judged profile/flag.
-            # Never-judged low-shot players still get no fabricated profile.
-            if evidence:
-                pipe.hset(evidence_key, mapping={"since": ""})
 
         verdicts.append({
             "player_id": player_id,
@@ -361,8 +410,11 @@ def write_player_scores_batch(batch_df, batch_id):
 def main():
     spark = spark_session("Gaming-CheatDetection")
     parsed = parse_stream(kafka_source(spark, KAFKA_TOPICS["gameplay"]), "gameplay")
+    # Finalize each event-time window before advancing persistence; update
+    # mode exposes partial windows and can turn a low-shot fragment into a
+    # false clean verdict.
     build_suspicion_pipeline(parsed).writeStream \
-        .outputMode("update") \
+        .outputMode("append") \
         .foreachBatch(write_player_scores_batch) \
         .option("checkpointLocation", os.path.join(CHECKPOINT_DIR, CHEAT_CHECKPOINT)) \
         .trigger(processingTime=DEFAULT_PROCESSING_TIME) \

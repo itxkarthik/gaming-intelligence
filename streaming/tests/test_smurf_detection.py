@@ -98,7 +98,7 @@ class FakePipe:
         if numkeys == 2:
             _, _, _, payload, _ = args
             self.ops.append(("outbox", json.loads(payload)))
-        elif numkeys == 3:
+        elif numkeys == 10:
             self.ops.append(("write_account", args))
         elif numkeys == 5:
             self.ops.append(("evaluate_smurf", args))
@@ -134,12 +134,32 @@ class FakePipe:
                 self.r.outbox.append(op[1])
                 res.append(1)
             elif op[0] == "write_account":
-                (account_key, smurf_key, smurf_set_key, player_id, login_at_str,
-                 updated_at_str, max_age_str, max_games_str, *flat_update) = op[1]
+                (account_key, smurf_key, smurf_set_key, player_key, flagged_set_key,
+                 evidence_key, cusum_key, behavior_set_key, expiry_key, behavior_key,
+                 player_id, login_at_str, updated_at_str, max_age_str, max_games_str,
+                 *flat_update) = op[1]
                 stored = self.r.hashes.get(account_key, {})
                 if stored.get("login_at") and int(login_at_str) < int(stored["login_at"]):
                     res.append(0)
                     continue
+                legacy_state = not stored.get("login_at") and (
+                    smurf_key in self.r.hashes or player_key in self.r.hashes
+                    or evidence_key in self.r.hashes or cusum_key in self.r.hashes
+                    or behavior_key in self.r.hashes
+                    or player_id in self.r.sets.get(smurf_set_key, set())
+                    or player_id in self.r.sets.get(flagged_set_key, set())
+                    or player_id in self.r.sets.get(behavior_set_key, set())
+                )
+                if legacy_state or (stored.get("login_at") and int(login_at_str) > int(stored["login_at"])):
+                    self.r.hashes.pop(smurf_key, None)
+                    self.r.hashes.pop(evidence_key, None)
+                    self.r.hashes.pop(cusum_key, None)
+                    self.r.hashes.pop(behavior_key, None)
+                    self.r.sets.setdefault(smurf_set_key, set()).discard(player_id)
+                    self.r.sets.setdefault(flagged_set_key, set()).discard(player_id)
+                    self.r.sets.setdefault(behavior_set_key, set()).discard(player_id)
+                    if player_key in self.r.hashes:
+                        self.r.hashes[player_key]["flagged"] = "false"
                 update = dict(zip(flat_update[::2], flat_update[1::2]))
                 update["login_at"] = login_at_str
                 self.r.hashes.setdefault(account_key, {}).update(update)
@@ -304,11 +324,11 @@ def test_out_of_order_logins_keep_newest_established_metadata():
     assert len(r.transactions[0]) == 2
 
 
-def test_login_candidate_does_not_clear_existing_combat_flag():
+def test_new_login_clears_stale_smurf_flag_until_new_combat_is_scored():
     r = FakeRedis(age=3, games=12)
     write_accounts(r, [_login(account_age_days="4", games_played="13")])
-    assert r.hashes["player:smurf:p1"]["status"] == "SMURF"
-    assert r.sets["players:smurf"] == {"p1"}
+    assert "player:smurf:p1" not in r.hashes
+    assert "p1" not in r.sets["players:smurf"]
 
 
 def test_partial_first_login_is_stored_without_inventing_eligibility():

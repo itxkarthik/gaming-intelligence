@@ -41,9 +41,14 @@ def main() -> None:
     x = [t["target_rate"] for t in tiers]
     produced = [t["produced_per_s"] for t in tiers]
     # rate is None for a query that had no committed batch at tier start
+    # The raw behavior archiver and server-health side stream can keep up
+    # while the stateful gameplay detectors fall behind. Plot their slowest
+    # input rate as the pipeline's effective throughput.
+    stateful_queries = ("cheat_detection_v3", "behavior_change_steps_v2", "match_quality")
     consumed = [
-        max((d["rate"] for d in t["consumed"].values() if d["rate"] is not None),
-            default=0)
+        min((t["consumed"].get(name, {}).get("rate")
+             for name in stateful_queries
+             if t["consumed"].get(name, {}).get("rate") is not None), default=0)
         for t in tiers
     ]
     # Latency = stream lag in seconds behind (lag_at_end / achieved rate).
@@ -58,7 +63,8 @@ def main() -> None:
 
     ax1.plot(x, x, "--", color="#888888", lw=1.2, label="target input")
     ax1.plot(x, produced, "o-", color="#2563eb", lw=2, label="produced → Kafka")
-    ax1.plot(x, consumed, "s-", color="#16a34a", lw=2, label="consumed (busiest query)")
+    ax1.plot(x, consumed, "s-", color="#16a34a", lw=2,
+             label="consumed (slowest stateful query)")
     ax1.set_xlabel("target events/s")
     ax1.set_ylabel("events/s")
     ax1.set_title("Throughput: input vs pipeline")

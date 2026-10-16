@@ -31,6 +31,7 @@ from src.common.sinks import safe_parquet_archive
 
 HEALTHY_MIN = 80.0
 DEGRADED_MIN = 50.0
+SERVER_STATE_TTL_SECONDS = 90
 
 
 def build_health_pipeline(parsed):
@@ -103,6 +104,7 @@ def write_server_health(r, spark, rows):
             "updated_at": str(int(time.time())),
         }
         pipe.hset(f"server:{server_id}", mapping=server_data)
+        pipe.expire(f"server:{server_id}", SERVER_STATE_TTL_SECONDS)
         pipe.sadd("servers:active", server_id)
         if row["status"] == "CRITICAL":
             alerts.emit(make_alert(

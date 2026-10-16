@@ -403,6 +403,7 @@ def job_quality(spark):
     )
     n = latest.count()
     if not n:
+        latest.unpersist()
         note("no matches")
         return
     buckets = (

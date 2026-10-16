@@ -190,7 +190,14 @@ func newWorld(cfg Config, profiles map[Archetype]*Profile, rng *rand.Rand, out e
 		w.players = append(w.players, p)
 	}
 	if anyShifted {
-		w.shiftAt = start.Add(cfg.Duration / 2)
+		// Behavior CUSUM needs ten 5s baseline buckets plus its 30s event-time
+		// watermark before it can judge a shift.
+		shiftAt := cfg.Duration / 2
+		const behaviorWarmup = 80 * time.Second
+		if shiftAt < behaviorWarmup {
+			shiftAt = behaviorWarmup
+		}
+		w.shiftAt = start.Add(shiftAt)
 	}
 	return w
 }

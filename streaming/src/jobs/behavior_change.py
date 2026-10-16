@@ -74,9 +74,12 @@ def cusum_step(state, x, k=CUSUM_K, h=CUSUM_H):
         s_neg = min(0.0, float(state["s_neg"]) + z + k)
         anomaly = s_pos > h or s_neg < -h
 
-    # Alarm observations are out of control; feeding them into Welford would
-    # move the baseline toward a sustained cheat and eventually hide it.
-    if anomaly:
+    # Keep the baseline stationary while CUSUM is accumulating evidence.
+    # Otherwise even a moderate sustained shift slowly becomes the new normal
+    # before it can cross the alarm threshold.
+    baseline_sample = (n < WARMUP_STEPS or
+                       (not anomaly and abs(z) <= k and s_pos < 2.0 and s_neg > -2.0))
+    if not baseline_sample:
         n1 = n
         mean = float(state.get("mean", 0.0))
         m2 = float(state.get("m2", 0.0))
@@ -91,12 +94,14 @@ def cusum_step(state, x, k=CUSUM_K, h=CUSUM_H):
         "n": n1,
         "mean": mean,
         "m2": m2,
-        "s_pos": 0.0 if anomaly else s_pos,   # reset after a detection
+        "s_pos": 0.0 if anomaly else s_pos,
         "s_neg": 0.0 if anomaly else s_neg,
         "anomalies": int(state.get("anomalies", 0)) + (1 if anomaly else 0),
     }
     if "last_window_end_ms" in state:
         new_state["last_window_end_ms"] = int(state["last_window_end_ms"])
+    if "login_at" in state:
+        new_state["login_at"] = str(state["login_at"])
     return new_state, anomaly, z
 
 
@@ -106,7 +111,7 @@ def apply_behavior_boost(suspicion, behavior_flag):
     return round(min(1.0, boosted), 4)
 
 
-def load_state(raw):
+def load_state(raw, login_at=None):
     """Discard incompatible baselines and cursors from partial-window detectors.
 
     Migration is lazy per player: the first completed v2 steps rebuild from
@@ -114,7 +119,9 @@ def load_state(raw):
     version with that rebuilt state and cursor in one transaction, so replay
     loads the v2 state rather than resetting it again.
     """
-    if not raw or raw.get("state_version") != BEHAVIOR_STATE_VERSION:
+    expected_login = str(login_at) if login_at is not None else (raw or {}).get("login_at", "")
+    if (not raw or raw.get("state_version") != BEHAVIOR_STATE_VERSION
+            or raw.get("login_at", "") != expected_login):
         raw = {}
     state = {
         "state_version": BEHAVIOR_STATE_VERSION,
@@ -126,6 +133,8 @@ def load_state(raw):
         "s_neg": float(raw.get("s_neg", 0.0)),
         "anomalies": int(raw.get("anomalies", 0)),
     }
+    if login_at is not None or "login_at" in raw:
+        state["login_at"] = str(login_at) if login_at is not None else raw["login_at"]
     return state
 
 
@@ -211,11 +220,14 @@ def update_behavior(r, alerts, steps):
     for pid in player_ids:
         pipe.hgetall(f"behavior:cusum:{pid}")
         pipe.exists(f"player:behavior:{pid}")
+        pipe.hgetall(f"player:account:{pid}")
     reads = pipe.execute()
 
     pipe = r.pipeline()
-    for pid, raw, flag_alive in zip(player_ids, reads[::2], reads[1::2]):
-        state = load_state(raw)
+    for index, pid in enumerate(player_ids):
+        raw, flag_alive, account = reads[index * 3:index * 3 + 3]
+        login_at = account.get("login_at") if account else None
+        state = load_state(raw, login_at)
         last_end_ms = int(state.get("last_window_end_ms", 0))
         player_rows = sorted(
             by_player[pid],
@@ -250,6 +262,8 @@ def update_behavior(r, alerts, steps):
             "s_neg": f"{state['s_neg']:.4f}",
             "anomalies": str(state["anomalies"]),
         }
+        if "login_at" in state:
+            mapping["login_at"] = state["login_at"]
         if "last_window_end_ms" in state:
             mapping["last_window_end_ms"] = str(state["last_window_end_ms"])
         pipe.hset(f"behavior:cusum:{pid}", mapping=mapping)

@@ -67,70 +67,52 @@ def _team_tier(team):
 
 
 def build_match_quality_pipeline(gameplay_parsed, player_parsed):
-    """Two parsed streams -> scored match-quality DataFrame.
+    """Two parsed streams -> one bounded-session aggregate -> quality rows.
 
     Pure transformation (no session, no sinks) so it is unit-testable on
     batch DataFrames as well as live streams.
 
-    Both sides aggregate into session windows, then inner-join on match_id
-    with a window-overlap constraint. The player side takes EVERY event of
-    the match (joins, purchases, disconnects, MATCH_END): purchases keep its
-    session continuous, so a late disconnect cannot open a second session
-    that would join the same combat session twice.
+    A union avoids an unbounded stream-stream session join and keeps the
+    session alive across gameplay and lifecycle events. All-event sessions
+    also retain matches with no kills.
     """
-    combat_stats = gameplay_parsed \
-        .filter(F.col("is_kill")) \
-        .withWatermark("event_timestamp", "10 seconds") \
-        .groupBy(F.session_window("event_timestamp", SESSION_GAP), "match_id") \
-        .agg(
-            F.sum(F.when(F.col("team_id") == "team_a", 1).otherwise(0)).alias("kills_a"),
-            F.sum(F.when(F.col("team_id") == "team_b", 1).otherwise(0)).alias("kills_b"),
-            F.count(F.lit(1)).alias("total_kills"),
-        )
-
-    # countDistinct is unsupported in streaming aggregations; a set is exact.
-    # size() is INT; cast to the BIGINT the Parquet archive has always stored
-    # (mergeSchema cannot merge INT with BIGINT).
-    dropped = F.when(F.col("event_type") == "DISCONNECT", F.col("player_id"))
-    player_stats = player_parsed \
+    gameplay = gameplay_parsed.select(
+        "event_timestamp", "event_type", "match_id", "player_id", "team_id",
+        "is_kill", F.lit(None).cast("map<string,string>").alias("metadata"),
+    )
+    players = player_parsed.select(
+        "event_timestamp", "event_type", "match_id", "player_id",
+        F.lit(None).cast("string").alias("team_id"),
+        F.lit(False).alias("is_kill"), "metadata",
+    )
+    events = gameplay.unionByName(players) \
         .filter(F.col("match_id").isNotNull()) \
-        .withWatermark("event_timestamp", "10 seconds") \
-        .groupBy(F.session_window("event_timestamp", SESSION_GAP), "match_id") \
-        .agg(
-            F.size(F.collect_set(dropped)).cast("long").alias("disconnects"),
-            _team_tier("team_a").alias("tier_a"),
-            _team_tier("team_b").alias("tier_b"),
-        )
-
-    # KNOWN SPARK LIMITATION: StreamingJoinHelper cannot extract a state
-    # watermark from SESSION window attributes (verified on 3.5.1), so the
-    # join state store is not watermark-trimmed and logs a WARN per batch.
-    # State grows with distinct matches seen; acceptable at this scale.
-    joined = combat_stats.alias("c").join(
-        player_stats.alias("p"),
-        (F.col("c.match_id") == F.col("p.match_id"))
-        & (F.col("c.session_window.start") <= F.col("p.session_window.end"))
-        & (F.col("p.session_window.start") <= F.col("c.session_window.end")),
-        "inner",
+        .withWatermark("event_timestamp", "10 seconds")
+    dropped = F.when(F.col("event_type") == "DISCONNECT", F.col("player_id"))
+    stats = events.groupBy(F.session_window("event_timestamp", SESSION_GAP), "match_id").agg(
+        F.sum(F.when(F.col("is_kill") & (F.col("team_id") == "team_a"), 1).otherwise(0)).alias("kills_a"),
+        F.sum(F.when(F.col("is_kill") & (F.col("team_id") == "team_b"), 1).otherwise(0)).alias("kills_b"),
+        F.sum(F.col("is_kill").cast("int")).alias("total_kills"),
+        F.size(F.collect_set(dropped)).cast("long").alias("disconnects"),
+        _team_tier("team_a").alias("tier_a"),
+        _team_tier("team_b").alias("tier_b"),
     )
 
     # Match length: first to last lifecycle event (join .. MATCH_END).
     duration = F.greatest(
-        F.unix_timestamp(F.col("p.session_window.end"))
-        - F.unix_timestamp(F.col("p.session_window.start"))
+        F.unix_timestamp(F.col("session_window.end"))
+        - F.unix_timestamp(F.col("session_window.start"))
         - F.lit(SESSION_GAP_SECONDS),
         F.lit(0),
     )
 
-    # Every combat row carries at least one kill (inner join on kill sessions).
     total = F.col("total_kills")
-    pa = F.col("kills_a") / total
-    pb = F.col("kills_b") / total
-    scored = joined.select(
-        F.col("c.match_id").alias("match_id"),
-        F.col("c.session_window").alias("session_window"),
-        "kills_a", "kills_b", "total_kills", "disconnects",
-        (F.abs(F.col("kills_a") - F.col("kills_b")) / total).alias("kill_imbalance"),
+    pa = F.when(total > 0, F.col("kills_a") / total).otherwise(F.lit(0.5))
+    pb = F.when(total > 0, F.col("kills_b") / total).otherwise(F.lit(0.5))
+    scored = stats.select(
+        "match_id", "session_window", "kills_a", "kills_b", "total_kills", "disconnects",
+        F.when(total > 0, F.abs(F.col("kills_a") - F.col("kills_b")) / total)
+         .otherwise(F.lit(0.0)).alias("kill_imbalance"),
         (-(F.when(pa > 0, pa * F.log2(pa)).otherwise(0.0)
            + F.when(pb > 0, pb * F.log2(pb)).otherwise(0.0))).alias("kill_entropy"),
         F.abs(F.coalesce(F.col("tier_a"), F.lit(2.0))

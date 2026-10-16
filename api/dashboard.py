@@ -726,3 +726,18 @@ async def sse_view(view: str):
     if bus is None:
         raise HTTPException(status_code=404, detail=f"no stream {view!r}")
     return _sse(bus)
+
+
+async def shutdown_publishers():
+    """Cancel view publishers before lifespan closes their backing clients."""
+    tasks = []
+    for bus in BUSES.values():
+        task = bus._task
+        if task is not None and not task.done():
+            task.cancel()
+            tasks.append(task)
+        bus._task = None
+        bus._subs.clear()
+        bus._last.clear()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)

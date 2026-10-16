@@ -28,7 +28,7 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 import state
-from dashboard import router as dashboard_router
+from dashboard import router as dashboard_router, shutdown_publishers
 from dashboard import unavailable_page
 from state import HEARTBEAT_SECONDS, as_float
 
@@ -44,6 +44,7 @@ async def lifespan(_app: FastAPI):
     try:
         yield
     finally:
+        await shutdown_publishers()
         listener.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await listener

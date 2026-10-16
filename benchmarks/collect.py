@@ -42,7 +42,7 @@ REDIS = "gaming-redis"
 # Raw behavior archival and finalized CUSUM steps have independent progress.
 DIRS = [
     "server_health",
-    "cheat_detection_v2",
+    "cheat_detection_v3",
     "match_quality",
     "behavior_change",
     "behavior_change_steps_v2",

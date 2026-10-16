@@ -234,6 +234,9 @@ def test_low_shot_window_does_not_overwrite_flagged_profile(detector):
         def hset(self, k, mapping=None):
             self.ops.append(("hset", k, mapping))
 
+        def expire(self, k, ttl):
+            self.ops.append(("expire", k, ttl))
+
         def sadd(self, k, v):
             self.ops.append(("sadd", k, v))
 
@@ -496,7 +499,7 @@ def test_insufficient_window_breaks_streak_without_overwriting_profile(outlier_d
     assert redis.hashes["player:p"] == profile
     assert "p" in redis.sets["players:flagged"]
     assert redis.hashes["player:cheat:evidence:p"]["since"] == ""
-    assert redis.hashes["player:cheat:evidence:p"]["last_judged_window_end_ms"] == "1030000"
+    assert redis.hashes["player:cheat:evidence:p"]["last_judged_window_end_ms"] == "1045000"
     # That same young window later has enough shots; the cleared streak
     # must not recover the old start even though the time gap is only 15 s.
     judged = outlier_detector.write_player_scores(
@@ -646,7 +649,7 @@ def test_archive_failure_replays_original_decision(spark, detector, monkeypatch)
 
 def test_checkpoint_identity_reads_persisted_query_uuid(spark, detector, tmp_path, monkeypatch):
     import json
-    assert detector.CHEAT_CHECKPOINT == "cheat_detection_v2"
+    assert detector.CHEAT_CHECKPOINT == "cheat_detection_v3"
     old_checkpoint = tmp_path / "cheat_detection"
     old_checkpoint.mkdir()
     (old_checkpoint / "metadata").write_text(json.dumps({"id": "incompatible-old-query"}))

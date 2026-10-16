@@ -101,13 +101,17 @@ for RATE in $RATES; do
   T1=$(date +%s)
   stop_stats
 
+  # Measure catch-up from load completion while the slower snapshot and
+  # freshness collectors run, so their runtime is not charged to drain_s.
+  DRAIN_FILE="$OUT/tier_${i}_drain.txt"
+  wait_drained "$T1" > "$DRAIN_FILE" & DRAIN_PID=$!
   python3 "$COLLECT" snapshot > "$S1"
   python3 "$COLLECT" freshness "$T0" "$T1" > "$FRESH"
-
-  DRAIN=$(wait_drained "$T1") || {
+  if ! wait "$DRAIN_PID"; then
     echo "tier $i: could not measure drain (collect.py maxlag kept failing)" >&2
     exit 1
-  }
+  fi
+  DRAIN=$(cat "$DRAIN_FILE")
   python3 "$COLLECT" tier "$RATE" "$T0" "$T1" "$DRAIN" "$S0" "$S1" \
     "$FRESH" "$STATS" "$TIERS_JSONL"
 
