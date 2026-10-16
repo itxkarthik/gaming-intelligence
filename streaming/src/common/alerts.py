@@ -112,7 +112,8 @@ def make_alert(alert_type, severity, entity_type, entity_id, message, details):
 
 
 def _dedup_key(payload):
-    return f"alert:dedup:{payload['alert_type']}:{payload['entity_id']}"
+    return (f"alert:dedup:{payload['alert_type']}:{payload['entity_id']}"
+            f":{payload['severity']}")
 
 
 def _lease_key(alert_id):

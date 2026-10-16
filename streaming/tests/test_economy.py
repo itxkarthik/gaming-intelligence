@@ -5,7 +5,16 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from src.jobs.economy_analytics import summarise_counts
+from src.jobs.economy_analytics import group_windows, summarise_counts
+
+
+def test_null_weapon_ids_are_stored_under_unknown():
+    window = {"start": 1, "end": 2}
+    buckets = group_windows([
+        {"window": window, "weapon_id": None, "kills": 2},
+        {"window": window, "weapon_id": "rifle", "kills": 3},
+    ], "kills")
+    assert buckets[2]["counts"] == {"unknown": 2, "rifle": 3}
 
 
 def test_shares_sum_to_100_and_sort_desc():

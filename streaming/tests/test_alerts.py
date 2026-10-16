@@ -23,7 +23,8 @@ def outbox(monkeypatch):
     client = redis.Redis(host=host, decode_responses=True)
     prefix = f"test:{uuid.uuid4().hex}:"
     monkeypatch.setattr(alerts, "OUTBOX_KEY", prefix + "outbox")
-    monkeypatch.setattr(alerts, "_dedup_key", lambda p: prefix + p["alert_type"] + p["entity_id"])
+    monkeypatch.setattr(alerts, "_dedup_key",
+                        lambda p: prefix + p["alert_type"] + p["entity_id"] + p["severity"])
     monkeypatch.setattr(alerts, "_lease_key", lambda aid: prefix + "lease:" + aid)
     try:
         yield client, prefix
@@ -33,8 +34,15 @@ def outbox(monkeypatch):
             client.delete(*keys)
 
 
-def payload(alert_id="first", entity_id="p1"):
-    return {"alert_id": alert_id, "alert_type": "BEHAVIOR_ANOMALY", "entity_id": entity_id}
+def payload(alert_id="first", entity_id="p1", severity="WARNING"):
+    return {"alert_id": alert_id, "alert_type": "BEHAVIOR_ANOMALY",
+            "entity_id": entity_id, "severity": severity}
+
+
+def test_dedup_key_allows_severity_escalation():
+    warning = payload(severity="WARNING")
+    critical = payload(severity="CRITICAL")
+    assert alerts._dedup_key(warning) != alerts._dedup_key(critical)
 
 
 class Producer:

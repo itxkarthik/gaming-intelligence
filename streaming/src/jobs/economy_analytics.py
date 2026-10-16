@@ -44,7 +44,7 @@ def group_windows(rows, count_col, spend_col=None):
     for row in rows:
         end = row["window"]["end"]
         bucket = windows.setdefault(end, {"window": row["window"], "counts": {}, "spend": 0})
-        weapon = row["weapon_id"]
+        weapon = row["weapon_id"] or "unknown"
         bucket["counts"][weapon] = bucket["counts"].get(weapon, 0) + int(row[count_col])
         if spend_col is not None:
             bucket["spend"] += int(row[spend_col] or 0)  # sum() is null when every cost is null

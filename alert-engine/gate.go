@@ -33,10 +33,10 @@ type Gate interface {
 	Release(ctx context.Context, alertID string, claims ...gateClaim) error
 }
 
-// dedupKey: one alert per (type, entity) per window — the engine's own
-// replay/duplicate filter, independent of the producer-side dedup.
+// dedupKey: one alert per (type, entity, severity) per window. Keeping
+// severity in the key lets a later escalation through both dedup layers.
 func dedupKey(a Alert) string {
-	return dedupKeyPrefix + a.AlertType + ":" + a.EntityID
+	return dedupKeyPrefix + a.AlertType + ":" + a.EntityID + ":" + a.Severity
 }
 
 // rateKey: at most ONE alert per entity per window per severity, regardless

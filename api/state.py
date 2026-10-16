@@ -852,7 +852,7 @@ class EventFeed:
                     assigned: set[TopicPartition]) -> set[TopicPartition]:
         new = {TopicPartition(t, p)
                for t in self._topics
-               for p in consumer.partitions_for_topic(t)
+               for p in (consumer.partitions_for_topic(t) or [])
                if TopicPartition(t, p) not in assigned}
         if not new:
             return assigned

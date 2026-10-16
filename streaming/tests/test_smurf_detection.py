@@ -401,6 +401,7 @@ def test_established_login_between_combat_read_and_exec_cannot_restore_smurf(ale
     alerts = alerts_factory(r)
     unrelated = {
         "alert_id": "queued-cheat-alert", "alert_type": "CHEAT_DETECTED", "entity_id": "p1",
+        "severity": "WARNING",
     }
     alerts.emit(unrelated)
 
@@ -477,6 +478,7 @@ def test_repeated_watch_retries_do_not_lose_unrelated_or_duplicate_smurf_intents
     alerts = alerts_factory(r)
     unrelated = {
         "alert_id": "queued-cheat-alert", "alert_type": "CHEAT_DETECTED", "entity_id": "p1",
+        "severity": "WARNING",
     }
     alerts.emit(unrelated)
 
@@ -512,7 +514,8 @@ def test_write_accounts_and_evaluate_smurfs_lua_scripts_against_real_redis(monke
     smurf_key = f"player:smurf:{pid}"
     outbox_key = prefix + "outbox"
     monkeypatch.setattr(alerts_mod, "OUTBOX_KEY", outbox_key)
-    monkeypatch.setattr(alerts_mod, "_dedup_key", lambda p: prefix + "dedup:" + p["entity_id"])
+    monkeypatch.setattr(alerts_mod, "_dedup_key",
+                        lambda p: prefix + "dedup:" + p["entity_id"] + ":" + p["severity"])
     try:
         client.hset(acct_key, mapping={
             "account_age_days": "3", "games_played": "12", "rank": "bronze",
