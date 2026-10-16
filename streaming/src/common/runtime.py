@@ -1,8 +1,12 @@
 """Session, source and client factories shared by every streaming job."""
 
+import contextlib
+import random
 import sys
+import time
 
 import redis
+from kafka.errors import KafkaError
 
 from src.common.config import (
     KAFKA_BOOTSTRAP_SERVERS,
@@ -45,7 +49,36 @@ def kafka_source(spark, topic):
 
 def redis_client():
     return redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB,
-                       decode_responses=True)
+                       decode_responses=True, socket_connect_timeout=5, socket_timeout=5)
+
+
+@contextlib.contextmanager
+def cached_batch(batch_df):
+    """Persist a foreachBatch DataFrame across isEmpty(), collect() and Parquet write."""
+    batch_df.persist()
+    try:
+        yield batch_df
+    finally:
+        batch_df.unpersist()
+
+
+def run_with_retry(name, fn, attempts=5, initial_delay=0.25, max_delay=2.0):
+    """Run `fn()` with bounded exponential backoff on transient failures.
+
+    If every attempt fails, re-raise so Spark does not commit the micro-batch
+    offset and silently drop append-mode records.
+    """
+    delay = initial_delay
+    for attempt in range(1, attempts + 1):
+        try:
+            return fn()
+        except (redis.ConnectionError, redis.TimeoutError, redis.BusyLoadingError, KafkaError) as e:
+            if attempt >= attempts:
+                warn(f"{name} failed after {attempt} attempts: {e}")
+                raise
+            warn(f"{name} failed (attempt {attempt}/{attempts}), retrying in {delay:.2f}s: {e}")
+            time.sleep(random.uniform(delay / 2, delay))
+            delay = min(delay * 2.0, max_delay)
 
 
 def latest_per_key(rows, key, window_col="window"):

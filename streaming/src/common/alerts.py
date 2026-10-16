@@ -1,9 +1,9 @@
 """Alert emission shared by the streaming jobs.
 
-Every alert goes to BOTH:
-  - Redis `alerts:recent` -> fast path for the REST API
-  - Kafka alerts topic    -> transport for the Go alert engine (second dedup
-    layer, PostgreSQL history, webhooks, WebSocket fan-out)
+Every alert goes through a producer-side Redis dedup gate (`alert:dedup:*`)
+and is flushed to the Kafka `alerts` topic for the Go alert engine (second
+dedup/rate-limit layer, PostgreSQL history, Redis `alerts:stream` pub/sub,
+and optional webhook).
 """
 
 import json
@@ -12,13 +12,26 @@ import time
 from kafka import KafkaProducer
 
 from src.common.config import KAFKA_BOOTSTRAP_SERVERS, KAFKA_TOPICS
-from src.common.runtime import warn
+
 
 ALERTS_TOPIC = KAFKA_TOPICS["alerts"]
 DEDUP_TTL_SECONDS = 300
-RECENT_KEY = "alerts:recent"
-RECENT_MAX = 100
+OUTBOX_KEY = "alerts:outbox"
 _producer = None
+
+# Run inside the same MULTI/EXEC as the serving-state update. A claim cannot
+# exist without a durable delivery intent, even if the connection dies at EXEC.
+_STAGE_ALERT = """
+local holder = redis.call('GET', KEYS[1])
+if holder and holder ~= ARGV[1] then
+    return 0
+end
+if not holder then
+    redis.call('SET', KEYS[1], ARGV[1], 'EX', ARGV[3])
+    redis.call('HSET', KEYS[2], ARGV[1], ARGV[2])
+end
+return 1
+"""
 
 
 def _kafka_producer():
@@ -56,17 +69,12 @@ def _dedup_key(payload):
 
 
 class AlertBatch:
-    """Alerts raised during one micro-batch.
+    """Transactional Redis outbox with at-least-once Kafka delivery.
 
-    emit() claims the dedup key (SET NX EX: at most one alert per type and
-    entity per TTL, or every micro-batch would re-alert the same entity) and
-    pushes the Redis copy. flush() publishes directly from the driver with a
-    reusable Kafka producer, without scheduling a Spark job.
-
-    A failed Kafka write never kills the micro-batch. It releases the dedup
-    claims, so the next batch that still sees the condition publishes again
-    instead of the alert staying muted for the TTL; the Redis copy already
-    landed (and is pushed once more on that retry).
+    Writers call stage(pipe) before committing serving state. flush() also
+    drains intents left by earlier attempts, including replays whose state
+    cursor has already advanced. An intent is removed only after Kafka ACK;
+    an ambiguous ACK/removal can duplicate delivery with the same alert ID.
     """
 
     def __init__(self, r):
@@ -74,23 +82,24 @@ class AlertBatch:
         self.pending = []
 
     def emit(self, payload):
-        if not self.r.set(_dedup_key(payload), "1", nx=True, ex=DEDUP_TTL_SECONDS):
-            return
-        pipe = self.r.pipeline()
-        pipe.lpush(RECENT_KEY, json.dumps(payload))
-        pipe.ltrim(RECENT_KEY, 0, RECENT_MAX - 1)
-        pipe.execute()
         self.pending.append(payload)
 
+    def stage(self, pipe):
+        for payload in self.pending:
+            pipe.eval(
+                _STAGE_ALERT, 2, _dedup_key(payload), OUTBOX_KEY,
+                payload["alert_id"], json.dumps(payload), DEDUP_TTL_SECONDS,
+            )
+        self.pending.clear()
+
     def flush(self):
-        if not self.pending:
-            return
-        pending, self.pending = self.pending, []
-        try:
-            producer = _kafka_producer()
-            futures = [producer.send(ALERTS_TOPIC, payload) for payload in pending]
-            for future in futures:
-                future.get(timeout=15)
-        except Exception as e:  # noqa: BLE001 - any Kafka failure; the batch survives
-            warn(f"alert Kafka flush failed ({len(pending)} alerts): {e}")
-            self.r.delete(*(_dedup_key(p) for p in pending))
+        if self.pending:
+            pipe = self.r.pipeline()
+            self.stage(pipe)
+            pipe.execute()
+        # All drivers may drain the shared outbox. Concurrent delivery is safe
+        # at-least-once; the engine recognizes redelivery by the original ID.
+        for alert_id, encoded in self.r.hscan_iter(OUTBOX_KEY, count=100):
+            payload = json.loads(encoded)
+            _kafka_producer().send(ALERTS_TOPIC, payload).get(timeout=15)
+            self.r.hdel(OUTBOX_KEY, alert_id)

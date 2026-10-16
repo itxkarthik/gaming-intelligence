@@ -110,10 +110,12 @@ services:
     command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077 --cores 2 --memory 2G
 
   # ─── Redis (Real-time State Store) ──────────────────────────────────────
-  # Redis >= 7 is required: the alert engine's gates use SET ... NX GET.
+  # Persist serving state and transactional alert intents before acknowledging
+  # writes. fsync=always favors recovery correctness over peak write throughput.
   redis:
     image: redis:7-alpine
     container_name: gaming-redis
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "always"]
     ports:
       - "6379:6379"
     volumes:

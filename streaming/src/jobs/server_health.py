@@ -19,11 +19,12 @@ from pyspark.sql import functions as F
 from src.common.alerts import AlertBatch, make_alert
 from src.common.config import CHECKPOINT_DIR, DEFAULT_PROCESSING_TIME, KAFKA_TOPICS
 from src.common.runtime import (
+    cached_batch,
     kafka_source,
     latest_per_key,
     redis_client,
+    run_with_retry,
     spark_session,
-    warn,
 )
 from src.common.schemas import parse_stream
 from src.common.sinks import safe_parquet_archive
@@ -109,18 +110,21 @@ def write_server_health(r, spark, rows):
                 f"Server {server_id} critical (health score {health_score})",
                 server_data,
             ))
+    alerts.stage(pipe)
     pipe.execute()
     alerts.flush()
 
 
 def write_server_health_batch(batch_df, batch_id):
-    if batch_df.isEmpty():
-        return
-    try:
-        write_server_health(redis_client(), batch_df.sparkSession, batch_df.collect())
-    except Exception as e:  # noqa: BLE001 - keep the stream alive; next batch retries
-        warn(f"server health batch {batch_id}: {e}")
-    safe_parquet_archive(batch_df, "server_health", batch_id)
+    with cached_batch(batch_df):
+        if batch_df.isEmpty():
+            return
+        rows = batch_df.collect()
+        run_with_retry(
+            f"server health batch {batch_id}",
+            lambda: write_server_health(redis_client(), batch_df.sparkSession, rows),
+        )
+        safe_parquet_archive(batch_df, "server_health", batch_id)
 
 
 def main():

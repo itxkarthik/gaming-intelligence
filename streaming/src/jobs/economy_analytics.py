@@ -15,7 +15,7 @@ import os
 from pyspark.sql import functions as F
 
 from src.common.config import CHECKPOINT_DIR, DEFAULT_PROCESSING_TIME, KAFKA_TOPICS
-from src.common.runtime import kafka_source, redis_client, warn
+from src.common.runtime import cached_batch, kafka_source, redis_client, run_with_retry
 from src.common.schemas import parse_stream
 from src.common.sinks import safe_parquet_archive
 
@@ -74,31 +74,37 @@ def store_window(r, prefix, window, counts, extra_info):
     return True
 
 
+def _store_kill_rows(rows):
+    r = redis_client()
+    for _, bucket in sorted(group_windows(rows, "kills").items()):
+        store_window(r, "economy:weapons", bucket["window"], bucket["counts"],
+                     {"kind": "kill_share"})
+
+
+def _store_purchase_rows(rows):
+    r = redis_client()
+    windows = group_windows(rows, "purchases", "total_spend")
+    for _, bucket in sorted(windows.items()):
+        store_window(r, "economy:purchases", bucket["window"], bucket["counts"],
+                     {"kind": "purchase_count", "total_spend": str(bucket["spend"])})
+
+
 def write_kill_windows(batch_df, batch_id):
-    if batch_df.isEmpty():
-        return
-    try:
-        r = redis_client()
-        for _, bucket in sorted(group_windows(batch_df.collect(), "kills").items()):
-            store_window(r, "economy:weapons", bucket["window"], bucket["counts"],
-                         {"kind": "kill_share"})
-    except Exception as e:  # noqa: BLE001 - keep the stream alive; next batch retries
-        warn(f"economy kills batch {batch_id}: {e}")
-    safe_parquet_archive(batch_df, "economy_weapon_kills", batch_id)
+    with cached_batch(batch_df):
+        if batch_df.isEmpty():
+            return
+        rows = batch_df.collect()
+        run_with_retry(f"economy kills batch {batch_id}", lambda: _store_kill_rows(rows))
+        safe_parquet_archive(batch_df, "economy_weapon_kills", batch_id)
 
 
 def write_purchase_windows(batch_df, batch_id):
-    if batch_df.isEmpty():
-        return
-    try:
-        r = redis_client()
-        windows = group_windows(batch_df.collect(), "purchases", "total_spend")
-        for _, bucket in sorted(windows.items()):
-            store_window(r, "economy:purchases", bucket["window"], bucket["counts"],
-                         {"kind": "purchase_count", "total_spend": str(bucket["spend"])})
-    except Exception as e:  # noqa: BLE001 - keep the stream alive; next batch retries
-        warn(f"economy purchases batch {batch_id}: {e}")
-    safe_parquet_archive(batch_df, "economy_purchases", batch_id)
+    with cached_batch(batch_df):
+        if batch_df.isEmpty():
+            return
+        rows = batch_df.collect()
+        run_with_retry(f"economy purchases batch {batch_id}", lambda: _store_purchase_rows(rows))
+        safe_parquet_archive(batch_df, "economy_purchases", batch_id)
 
 
 def _sliding(df):

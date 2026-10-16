@@ -23,10 +23,11 @@ import os
 import time
 
 from pyspark.sql import functions as F
+from redis.exceptions import WatchError
 
 from src.common.alerts import make_alert
 from src.common.config import CHECKPOINT_DIR, DEFAULT_PROCESSING_TIME, KAFKA_TOPICS
-from src.common.runtime import kafka_source, redis_client, warn
+from src.common.runtime import cached_batch, kafka_source, redis_client, run_with_retry
 from src.common.schemas import parse_stream
 from src.common.sinks import safe_parquet_archive
 
@@ -67,6 +68,12 @@ def parse_account(raw):
         return None
 
 
+def is_candidate(account):
+    """Whether an account is young/inexperienced enough to be a smurf candidate."""
+    return (account["age_days"] < CANDIDATE_MAX_AGE_DAYS
+            and account["games_played"] < CANDIDATE_MAX_GAMES)
+
+
 def evaluate_smurf(account, combat_stats):
     """(smurf_probability, reason), or None when there is nothing to judge.
 
@@ -77,8 +84,7 @@ def evaluate_smurf(account, combat_stats):
     combat_stats: {"total_shots": int, "avg_accuracy": float,
                    "avg_reaction_time": float}
     """
-    if (account["age_days"] >= CANDIDATE_MAX_AGE_DAYS
-            or account["games_played"] >= CANDIDATE_MAX_GAMES
+    if (not is_candidate(account)
             or int(combat_stats["total_shots"]) < MIN_COMBAT_SHOTS):
         return None
 
@@ -93,28 +99,67 @@ def evaluate_smurf(account, combat_stats):
                   f"(acc {z_acc:.1f}σ, rxn {z_rxn:.1f}σ)")
 
 
+def _clear_established(pipe, player_id, account):
+    """Reconcile aged-out candidacy in the same transaction as its source state."""
+    pipe.hset(f"player:smurf:{player_id}", mapping={
+        "player_id": player_id,
+        "probability": "0.000",
+        "status": "CLEAN",
+        "account_age_days": str(account["age_days"]),
+        "games_played": str(account["games_played"]),
+        "declared_rank": account["rank"],
+        "archetype": account["archetype"],
+        "reason": "established account",
+        "updated_at": str(int(time.time())),
+    })
+    pipe.srem("players:smurf", player_id)
+
+
 def evaluate_smurfs(r, alerts, rows):
     """Judge each scored combat window against its player's stored account.
 
     rows: cheat_detection window rows (player_id, total_shots, avg_accuracy,
     avg_reaction_time). Updates `player:smurf:{id}` and the `players:smurf`
-    set (added on SMURF, removed on CLEAN) and raises SMURF_DETECTED alerts.
+    set (added on SMURF, removed on CLEAN or aged-out candidacy) and raises
+    SMURF_DETECTED alerts.
     """
-    pipe = r.pipeline()
-    for row in rows:
-        pipe.hgetall(f"player:account:{row['player_id']}")
-    accounts = pipe.execute()
+    keys = [f"player:account:{row['player_id']}" for row in rows]
+    buffered = list(alerts.pending)
+    while True:
+        committed = False
+        try:
+            with r.pipeline() as pipe:
+                if keys:
+                    pipe.watch(*keys)
+                accounts = [pipe.hgetall(key) for key in keys]
+                pipe.multi()
+                _stage_smurf_evaluations(pipe, alerts, rows, accounts)
+                alerts.stage(pipe)
+                pipe.execute()
+                committed = True
+                return
+        except WatchError:
+            continue
+        finally:
+            if not committed:
+                # stage() consumes pending before EXEC. Preserve unrelated
+                # buffered intents, but never retry an obsolete smurf intent.
+                alerts.pending[:] = buffered
 
-    pipe = r.pipeline()
+
+def _stage_smurf_evaluations(pipe, alerts, rows, accounts):
     for row, raw in zip(rows, accounts):
         account = parse_account(raw)
         if account is None:
             continue  # LOGIN not seen yet
+        player_id = row["player_id"]
+        if not is_candidate(account):
+            _clear_established(pipe, player_id, account)
+            continue
         result = evaluate_smurf(account, row)
         if result is None:
             continue
         prob, reason = result
-        player_id = row["player_id"]
         smurf = prob >= SMURF_PROB_THRESHOLD
         evaluation = {
             "player_id": player_id,
@@ -138,29 +183,49 @@ def evaluate_smurfs(r, alerts, rows):
             ))
         else:
             pipe.srem("players:smurf", player_id)
-    pipe.execute()
 
 
 def write_accounts(r, rows):
-    """Store each LOGIN's account metadata for the combat-time evaluation."""
-    pipe = r.pipeline()
+    """Apply LOGIN metadata in event-time order and reconcile candidacy immediately."""
     for row in rows:
         metadata = row["metadata"] or {}
-        account = {k: metadata[k] for k in ACCOUNT_FIELDS if metadata.get(k) is not None}
-        if account:
-            account["login_at"] = str(row["event_time"])
-            pipe.hset(f"player:account:{row['player_id']}", mapping=account)
-    pipe.execute()
+        update = {k: metadata[k] for k in ACCOUNT_FIELDS if metadata.get(k) is not None}
+        if not update:
+            continue
+        player_id = row["player_id"]
+        key = f"player:account:{player_id}"
+        login_at = int(row["event_time"])
+        update["login_at"] = str(row["event_time"])
+        # Account metadata and eligibility must agree even on replay or when a
+        # concurrent LOGIN writer changes the hash between the read and commit.
+        with r.pipeline() as pipe:
+            while True:
+                try:
+                    pipe.watch(key)
+                    stored = pipe.hgetall(key)
+                    if stored.get("login_at") and login_at < int(stored["login_at"]):
+                        break
+                    account = parse_account({**stored, **update})
+                    pipe.multi()
+                    pipe.hset(key, mapping=update)
+                    if account is not None and not is_candidate(account):
+                        _clear_established(pipe, player_id, account)
+                    pipe.execute()
+                    break
+                except WatchError:
+                    continue
 
 
 def write_accounts_batch(batch_df, batch_id):
-    if batch_df.isEmpty():
-        return
-    try:
-        write_accounts(redis_client(), batch_df.select("player_id", "metadata", "event_time").collect())
-    except Exception as e:  # noqa: BLE001 - keep the stream alive; next batch retries
-        warn(f"smurf account batch {batch_id}: {e}")
-    safe_parquet_archive(batch_df, "smurf_detection", batch_id)
+    with cached_batch(batch_df):
+        if batch_df.isEmpty():
+            return
+        rows = batch_df.select("player_id", "metadata", "event_time").collect()
+        run_with_retry(
+            f"smurf account batch {batch_id}",
+            lambda: write_accounts(redis_client(), rows),
+        )
+        safe_parquet_archive(batch_df, "smurf_detection", batch_id)
 
 
 def start_queries(spark):

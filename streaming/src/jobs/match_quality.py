@@ -27,7 +27,13 @@ from pyspark.sql import functions as F
 
 from src.common.alerts import AlertBatch, make_alert
 from src.common.config import CHECKPOINT_DIR, DEFAULT_PROCESSING_TIME, KAFKA_TOPICS
-from src.common.runtime import kafka_source, redis_client, spark_session, warn
+from src.common.runtime import (
+    cached_batch,
+    kafka_source,
+    redis_client,
+    run_with_retry,
+    spark_session,
+)
 from src.common.schemas import parse_stream
 from src.common.sinks import safe_parquet_archive
 
@@ -185,18 +191,21 @@ def write_matches(r, spark, rows):
                 f"Match {match_id} quality {score} (STOMPED)",
                 match_data,
             ))
+    alerts.stage(pipe)
     pipe.execute()
     alerts.flush()
 
 
 def write_matches_batch(batch_df, batch_id):
-    if batch_df.isEmpty():
-        return
-    try:
-        write_matches(redis_client(), batch_df.sparkSession, batch_df.collect())
-    except Exception as e:  # noqa: BLE001 - keep the stream alive; next batch retries
-        warn(f"match quality batch {batch_id}: {e}")
-    safe_parquet_archive(batch_df, "match_quality", batch_id)
+    with cached_batch(batch_df):
+        if batch_df.isEmpty():
+            return
+        rows = batch_df.collect()
+        run_with_retry(
+            f"match quality batch {batch_id}",
+            lambda: write_matches(redis_client(), batch_df.sparkSession, rows),
+        )
+        safe_parquet_archive(batch_df, "match_quality", batch_id)
 
 
 def main():

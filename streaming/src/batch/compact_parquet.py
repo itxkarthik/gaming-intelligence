@@ -39,6 +39,18 @@ def compact(spark, name, target_files):
                 F.coalesce(F.col("archive_written_at"),
                            F.col("_metadata.file_modification_time")))
         archived.coalesce(target_files).write.mode("overwrite").parquet(temporary)
+        # A published file can precede Spark's checkpoint commit. Retain its
+        # identity even when compacting a stopped/failed query before replay.
+        receipts = os.path.join(temporary, "_archive_commits")
+        previous_receipts = os.path.join(source, "_archive_commits")
+        if os.path.isdir(previous_receipts):
+            shutil.copytree(previous_receipts, receipts)
+        os.makedirs(receipts, exist_ok=True)
+        for filename in os.listdir(source):
+            if filename.startswith("batch-") and filename.endswith(".parquet"):
+                # Also recover the publish -> receipt crash interval.
+                with open(os.path.join(receipts, filename[:-len(".parquet")]), "a"):
+                    pass
         os.rename(source, backup)
         try:
             os.rename(temporary, source)
