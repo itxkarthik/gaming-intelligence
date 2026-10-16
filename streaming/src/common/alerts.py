@@ -20,7 +20,11 @@ from src.common.config import KAFKA_BOOTSTRAP_SERVERS, KAFKA_TOPICS
 
 ALERTS_TOPIC = KAFKA_TOPICS["alerts"]
 DEDUP_TTL_SECONDS = 300
-LEASE_TTL_SECONDS = 30
+SEND_TIMEOUT_SECONDS = 15
+# Exceeds single-item Kafka send + retry budget (max_block_ms=10s +
+# 3 * request_timeout_ms=10s = 40s); slow multi-item chunks also renew active
+# leases every LEASE_TTL_SECONDS / 3.
+LEASE_TTL_SECONDS = 60
 OUTBOX_KEY = "alerts:outbox"
 FLUSH_CHUNK_SIZE = 100
 _producer = None
@@ -37,6 +41,30 @@ if not holder then
     redis.call('HSET', KEYS[2], ARGV[1], ARGV[2])
 end
 return 1
+"""
+
+_RENEW_LEASES = """
+local status = {}
+local ttl = tonumber(ARGV[2])
+for i = 1, #KEYS do
+    if redis.call('GET', KEYS[i]) == ARGV[1] then
+        redis.call('EXPIRE', KEYS[i], ttl)
+        status[i] = 1
+    else
+        status[i] = 0
+    end
+end
+return status
+"""
+
+_RELEASE_LEASES = """
+local released = 0
+for i = 1, #KEYS do
+    if redis.call('GET', KEYS[i]) == ARGV[1] then
+        released = released + redis.call('DEL', KEYS[i])
+    end
+end
+return released
 """
 
 
@@ -102,13 +130,20 @@ class AlertBatch:
             )
         self.pending.clear()
 
+    def _renew_leases(self, lease_keys, token):
+        return self.r.eval(
+            _RENEW_LEASES, len(lease_keys), *lease_keys, token, LEASE_TTL_SECONDS
+        )
+
     def flush(self):
         if self.pending:
             pipe = self.r.pipeline()
             self.stage(pipe)
             pipe.execute()
-        # Claim short-TTL per-alert leases before sending to Kafka so concurrent
-        # drivers skip in-flight entries; crashed drainers' leases expire by TTL.
+        # Claim per-alert leases before sending to Kafka so concurrent drivers
+        # skip in-flight entries; renew during slow chunks and verify token
+        # ownership before deleting so an expired flusher never removes a new
+        # owner's reclaimed lease.
         token = uuid.uuid4().hex
         it = self.r.hscan_iter(OUTBOX_KEY, count=FLUSH_CHUNK_SIZE)
         while True:
@@ -127,15 +162,32 @@ class AlertBatch:
             if not leased:
                 continue
             lease_keys = [_lease_key(alert_id) for alert_id, _ in leased]
+            owned = {alert_id for alert_id, _ in leased}
+            last_renewed = time.monotonic()
+            renew_after = LEASE_TTL_SECONDS / 3
             producer = _kafka_producer()
             acked = []
             try:
-                in_flight = [
-                    (alert_id, producer.send(ALERTS_TOPIC, json.loads(encoded)))
-                    for alert_id, encoded in leased
-                ]
+                in_flight = []
+                for alert_id, encoded in leased:
+                    if time.monotonic() - last_renewed >= renew_after:
+                        statuses = self._renew_leases(lease_keys, token)
+                        owned = {
+                            aid
+                            for (aid, _), ok in zip(leased, statuses)
+                            if ok
+                        }
+                        last_renewed = time.monotonic()
+                    if alert_id not in owned:
+                        continue
+                    in_flight.append(
+                        (alert_id, producer.send(ALERTS_TOPIC, json.loads(encoded)))
+                    )
                 for alert_id, future in in_flight:
-                    future.get(timeout=15)
+                    if time.monotonic() - last_renewed >= renew_after:
+                        self._renew_leases(lease_keys, token)
+                        last_renewed = time.monotonic()
+                    future.get(timeout=SEND_TIMEOUT_SECONDS)
                     acked.append(alert_id)
             finally:
                 try:
@@ -143,4 +195,6 @@ class AlertBatch:
                         self.r.hdel(OUTBOX_KEY, *acked)
                 finally:
                     with contextlib.suppress(redis.RedisError):
-                        self.r.delete(*lease_keys)
+                        self.r.eval(
+                            _RELEASE_LEASES, len(lease_keys), *lease_keys, token
+                        )

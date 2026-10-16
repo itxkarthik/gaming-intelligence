@@ -3,6 +3,7 @@
 import json
 import os
 import sys
+import threading
 import uuid
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -151,6 +152,136 @@ def test_concurrent_flusher_skips_leased_in_flight_alerts(outbox, monkeypatch):
     assert not r.exists(alerts._lease_key("first"))
 
 
+def test_expired_lease_reclaim_not_deleted_by_stale_flusher(outbox, monkeypatch):
+    r, _ = outbox
+    batch = alerts.AlertBatch(r)
+    batch.emit(payload("first"))
+    pipe = r.pipeline()
+    batch.stage(pipe)
+    pipe.execute()
+
+    sent = []
+    lease_key = alerts._lease_key("first")
+    flusher2_in_flight = threading.Event()
+    release_flusher2 = threading.Event()
+
+    class Flusher2Producer:
+        def send(self, topic, value):
+            sent.append(("flusher2", value["alert_id"]))
+            return self
+
+        def get(self, timeout):
+            # Signal that Flusher 2 has reclaimed the expired lease and sent,
+            # then stay in flight while Flusher 1 cleans up and Flusher 3 runs.
+            flusher2_in_flight.set()
+            assert release_flusher2.wait(timeout=5)
+
+    flusher2_thread = threading.Thread(target=lambda: alerts.AlertBatch(r).flush())
+
+    class Flusher1SlowProducer:
+        def send(self, topic, value):
+            sent.append(("flusher1", value["alert_id"]))
+            return self
+
+        def get(self, timeout):
+            # Simulate Flusher 1 stalling past lease TTL expiry: its lease
+            # expires and Flusher 2 reclaims the lease before Flusher 1 exits.
+            r.delete(lease_key)
+            monkeypatch.setattr(alerts, "_kafka_producer", lambda: Flusher2Producer())
+            flusher2_thread.start()
+            assert flusher2_in_flight.wait(timeout=5)
+            raise KafkaTimeoutError("flusher1 stalled past lease TTL")
+
+    monkeypatch.setattr(alerts, "_kafka_producer", lambda: Flusher1SlowProducer())
+    with pytest.raises(KafkaTimeoutError):
+        alerts.AlertBatch(r).flush()
+
+    # Flusher 1's cleanup must compare token before deleting and leave Flusher 2's
+    # reclaimed lease intact, so a third concurrent flusher skips the alert.
+    assert r.exists(lease_key)
+
+    class Flusher3Producer:
+        def send(self, topic, value):
+            sent.append(("flusher3", value["alert_id"]))
+            return self
+
+        def get(self, timeout):
+            pass
+
+    monkeypatch.setattr(alerts, "_kafka_producer", lambda: Flusher3Producer())
+    alerts.AlertBatch(r).flush()
+    assert sent == [("flusher1", "first"), ("flusher2", "first")]
+    assert r.exists(lease_key)
+
+    # Now let Flusher 2 finish its ACK, delete from outbox, and release its lease.
+    release_flusher2.set()
+    flusher2_thread.join(timeout=5)
+    assert r.hlen(alerts.OUTBOX_KEY) == 0
+    assert not r.exists(lease_key)
+
+
+def test_slow_chunk_renews_leases_and_skips_reclaimed_unsent_alerts(outbox, monkeypatch):
+    r, _ = outbox
+    batch = alerts.AlertBatch(r)
+    batch.emit(payload("a1", "p1"))
+    batch.emit(payload("a2", "p2"))
+    batch.emit(payload("a3", "p3"))
+    pipe = r.pipeline()
+    batch.stage(pipe)
+    pipe.execute()
+
+    first_id, second_id, third_id = [
+        k for k, _ in r.hscan_iter(alerts.OUTBOX_KEY, count=alerts.FLUSH_CHUNK_SIZE)
+    ]
+    clock = [100.0]
+    monkeypatch.setattr(alerts.time, "monotonic", lambda: clock[0])
+    sent = []
+
+    class FakeFuture:
+        def __init__(self, alert_id):
+            self.alert_id = alert_id
+
+        def get(self, timeout):
+            if self.alert_id == first_id:
+                assert r.ttl(alerts._lease_key(first_id)) > 10
+                # Simulate first_id's future.get() taking >= LEASE_TTL_SECONDS / 3
+                # while third_id's lease TTL has ticked down.
+                r.expire(alerts._lease_key(third_id), 5)
+                clock[0] += alerts.LEASE_TTL_SECONDS / 3 + 1
+            elif self.alert_id == third_id:
+                # Renewal before third_id.get() must have refreshed third_id's TTL.
+                assert r.ttl(alerts._lease_key(third_id)) > 10
+
+    class SlowChunkProducer:
+        def send(self, topic, value):
+            aid = value["alert_id"]
+            sent.append(aid)
+            if aid == first_id:
+                # Simulate first_id's send taking >= LEASE_TTL_SECONDS / 3 while
+                # first_id's TTL has ticked down and second_id's lease expired
+                # and was reclaimed by another flusher.
+                r.expire(alerts._lease_key(first_id), 5)
+                r.set(
+                    alerts._lease_key(second_id),
+                    "reclaimed-by-other",
+                    ex=alerts.LEASE_TTL_SECONDS,
+                )
+                clock[0] += alerts.LEASE_TTL_SECONDS / 3 + 1
+            return FakeFuture(aid)
+
+    monkeypatch.setattr(alerts, "_kafka_producer", lambda: SlowChunkProducer())
+    alerts.AlertBatch(r).flush()
+
+    # first_id and third_id were renewed, acked, and removed; second_id was
+    # skipped because its lease was reclaimed before send(second_id), and the
+    # new owner's lease remains intact.
+    assert sent == [first_id, third_id]
+    assert list(r.hkeys(alerts.OUTBOX_KEY)) == [second_id]
+    assert r.get(alerts._lease_key(second_id)) == "reclaimed-by-other"
+    assert not r.exists(alerts._lease_key(first_id))
+    assert not r.exists(alerts._lease_key(third_id))
+
+
 def test_flush_pipelines_sends_per_chunk_and_batches_hdel(monkeypatch):
     events = []
     hdels = []
@@ -206,9 +337,15 @@ def test_flush_pipelines_sends_per_chunk_and_batches_hdel(monkeypatch):
             for field in fields:
                 self.items.pop(field, None)
 
-        def delete(self, *keys):
+        def eval(self, script, numkeys, *keys_and_args):
+            keys = keys_and_args[:numkeys]
+            token = keys_and_args[numkeys]
+            released = 0
             for key in keys:
-                self.leases.pop(key, None)
+                if self.leases.get(key) == token:
+                    self.leases.pop(key, None)
+                    released += 1
+            return released
 
     monkeypatch.setattr(alerts, "_kafka_producer", lambda: ChunkProducer())
     monkeypatch.setattr(alerts, "FLUSH_CHUNK_SIZE", 2)
