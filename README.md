@@ -188,6 +188,38 @@ make spark-submit JOB=advanced_analytics   # smurf + behavior change + economy
 Each driver is capped at 1 core, so the four exactly fill the 4-core cluster.
 `make spark-submit` stays attached to the driver; run each in its own terminal.
 
+#### Recovery and checkpoint migration
+
+- Stop the existing drivers before deploying these changes. Cheat detection
+  uses the new `cheat_detection_v2` checkpoint because its aggregation schema
+  now includes source-event bounds. Finalized behavior steps use
+  `behavior_change_steps_v2`; the separate raw-shot archive retains the
+  original `behavior_change` checkpoint. **Do not delete existing checkpoints.**
+  New queries read retained Kafka history; their first catch-up can be large.
+- Behavior state is rebuilt once when migrating from the old partial-window
+  detector to state version 2. It must complete its warm-up again. Steps are
+  5-second event-time windows finalized with a 30-second watermark. Very late
+  data can be dropped; when input stops, the trailing windows remain open until
+  event time advances. Source-offset drain is not proof of window finalization.
+- Redis/Kafka transient failures use bounded retries, then fail the query;
+  restart the affected driver after recovery. Serving-state updates and alert
+  intents commit together in Redis. `alerts:outbox` retains intents until Kafka
+  acknowledges them; replay may deliver duplicates with the same alert ID.
+  Do not expire or manually clear the outbox. Cheat verdicts for the outstanding
+  batch are retained in Redis so archive retries do not recompute decisions.
+- Compose enables Redis AOF with `appendfsync always` to persist acknowledged
+  state/outbox writes. This favors durability over peak write throughput and
+  requires recreating the Redis service to apply to an existing stack; retain
+  its volume. This is not protection against volume loss or disk failure.
+- Parquet failures now fail the batch. Archives publish complete files using
+  atomic rename and keep generation/batch receipts across compaction, preventing
+  replay duplicates. This requires local storage or HDFS, not object-store
+  rename semantics. Compaction must still run only while writers are stopped.
+- Historical cheat analysis reports recorded, judged online decisions separately
+  from raw heuristic sweeps. Legacy/missing decisions are reported as unknown,
+  not fabricated clean verdicts. Source bounds exclude mixed/previous-run
+  windows; legacy boundary windows without bounds are excluded conservatively.
+
 ### 5. Run Event Simulator
 Run against local Kafka:
 ```bash
@@ -227,7 +259,7 @@ jobs hold every cluster core. It reads the Parquet archive the jobs write to
 | `KAFKA_BOOTSTRAP_SERVERS` | `localhost:9092` | compose sets `kafka:9092`; from the host use `localhost:9094` |
 | `ALERTS_TOPIC` | `alerts` | |
 | `ALERT_ENGINE_GROUP` | `alert-engine` | Kafka consumer group (at-least-once: offsets commit after the Postgres insert) |
-| `REDIS_HOST` / `REDIS_PORT` | `localhost` / `6379` | **Redis ≥ 7 required** (gates use `SET … NX GET`) |
+| `REDIS_HOST` / `REDIS_PORT` | `localhost` / `6379` | **Redis ≥ 7 supported deployment** (atomic Lua gates; persistent streaming outbox) |
 | `POSTGRES_URL` | — | full DSN; overrides the `POSTGRES_*` parts below |
 | `POSTGRES_HOST` / `POSTGRES_PORT` | `localhost` / `5432` | from the host the published port is `5433` |
 | `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | `gaming` / `gaming_dev` / `gaming_platform` | |
