@@ -38,12 +38,14 @@ CKPT = PROJECT / "data" / "checkpoints"
 KAFKA = "gaming-kafka"
 REDIS = "gaming-redis"
 
-# checkpoint dirs owned by each streaming query (advanced_analytics = 4 queries)
+# Checkpoint dirs owned by each streaming query (advanced_analytics = 5 queries).
+# Raw behavior archival and finalized CUSUM steps have independent progress.
 DIRS = [
     "server_health",
-    "cheat_detection",
+    "cheat_detection_v2",
     "match_quality",
     "behavior_change",
+    "behavior_change_steps_v2",
     "smurf_detection",
     "economy_kills",
     "economy_purchases",
@@ -138,7 +140,12 @@ def lag_by_dir(snap: dict) -> dict:
 
 
 def cmd_maxlag() -> int:
-    return max(lag_by_dir(cmd_snapshot()).values(), default=0)
+    snap = cmd_snapshot()
+    lags = lag_by_dir(snap)
+    missing = [d for d in DIRS if d not in lags]
+    if missing:
+        sys.exit(f"missing committed checkpoints for: {', '.join(missing)}")
+    return max(lags.values())
 
 
 def cmd_lag(s0: dict, s1: dict, duration: float) -> dict:
@@ -188,8 +195,10 @@ def _parse_ts(s: str) -> float:
 
 
 def cmd_freshness(t0: int, t1: int) -> dict:
-    """updated_at in [t0,t1] minus window_end (event-time end) for match/server
-    result hashes — the ROADMAP's 'event-time to result-time' metric."""
+    """updated_at in [t0,t1] minus window_end (event-time end) for completed
+    match/server result hashes — the ROADMAP's 'event-time to result-time'
+    metric. Partial update-mode windows emitted before window_end are skipped
+    so mid-window updates do not record negative latency."""
     sh = (
         "for k in $(redis-cli --scan --pattern 'match:*'; "
         "redis-cli --scan --pattern 'server:*'); do "
@@ -204,8 +213,9 @@ def cmd_freshness(t0: int, t1: int) -> dict:
             continue
         try:
             upd = int(parts[2])
-            if t0 <= upd <= t1:
-                samples.append(upd - _parse_ts(parts[1]))
+            win_end = _parse_ts(parts[1])
+            if t0 <= upd <= t1 and upd >= win_end:
+                samples.append(upd - win_end)
         except ValueError:
             continue
     if not samples:

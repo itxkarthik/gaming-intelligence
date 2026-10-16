@@ -78,6 +78,7 @@ api-up:
 # ─── Tests ────────────────────────────────────────────────────────────────
 test-go:
 	cd simulator && go test ./... -count=1
+	cd alert-engine && go test ./... -count=1
 
 test-streaming:
 	docker exec -w /opt/spark-apps -e PYTHONPATH=/opt/spark/python:/opt/spark/python/lib/py4j-0.10.9.7-src.zip gaming-spark-master python3 -m pytest tests -q -p no:cacheprovider
@@ -141,7 +142,7 @@ help:
 	@echo "  make spark-compact STREAMS_STOPPED=1 [JOB=<archive|all>] [FILES=4] Compact Parquet archives after stopping streaming jobs"
 	@echo "  make train-model            Train the IsolationForest artifact into streaming/models/"
 	@echo "  make api-up                 Rebuild + restart the FastAPI container (port 8000)"
-	@echo "  make test-go                Run Go simulator unit tests"
+	@echo "  make test-go                Run Go simulator and alert-engine unit tests"
 	@echo "  make test-streaming         Run PySpark pipeline tests in the Spark container"
 	@echo "  make benchmark              Tiered load benchmark (RATES=, DURATION=, DRAIN_MAX=)"
 	@echo "  make benchmark-plot         Plot the newest benchmark run to docs/benchmarks.png (TIERS=<file> for another)"
