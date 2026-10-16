@@ -937,7 +937,7 @@ class EventFeed:
         full = assigned | new
         consumer.assign(sorted(full))
         end = consumer.end_offsets(sorted(new))
-        for tp in new:
+        for tp in sorted(new):
             consumer.seek(tp, max(0, end.get(tp, 0) - self.SEED_PER_PARTITION))
         return full
 

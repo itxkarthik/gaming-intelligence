@@ -5,7 +5,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY main.py dashboard.py state.py ./
+COPY main.py dashboard.py state.py metrics.py tracing.py ./
 COPY templates ./templates
 COPY static ./static
 

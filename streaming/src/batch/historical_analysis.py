@@ -224,7 +224,7 @@ def job_weapon(spark):
         kills.groupBy("weapon_id")
         .agg(
             F.count(F.lit(1)).alias("kills"),
-            F.avg(F.col("is_headshot").cast("int")).alias("hs_rate"),
+            F.coalesce(F.avg(F.col("is_headshot").cast("int")), F.lit(0.0)).alias("hs_rate"),
         )
         .join(accuracy, "weapon_id", "left")
         .orderBy(F.col("kills").desc())

@@ -95,21 +95,46 @@ type handler struct {
 func (h *handler) handle(ctx context.Context, msg kafka.Message) (outcome, error) {
 	alert, err := parseAlert(msg.Value)
 	if err != nil {
+		recordAlertRejected()
 		log.Printf("[WARN] reject partition=%d offset=%d: %v", msg.Partition, msg.Offset, err)
 		return outcomeRejected, nil
 	}
 	alert = normalize(alert, msg.Time, h.now())
+	recordAlertReceived(alert.AlertType, alert.Severity)
 
-	if !shouldForward(ctx, h.gate, alert, h.dedupTTL, h.rateLimitTTL) {
+	trace := StartTrace("alert_engine.process")
+	trace.SetAttr("alert.id", alert.AlertID)
+	trace.SetAttr("alert.type", alert.AlertType)
+	trace.SetAttr("alert.severity", alert.Severity)
+	trace.SetAttr("entity.type", alert.EntityType)
+	trace.SetAttr("entity.id", alert.EntityID)
+	var handleErr error
+	defer func() {
+		trace.Finish(handleErr)
+	}()
+
+	gateSpan := trace.StartChild("gate.admit")
+	shouldFwd := shouldForward(ctx, h.gate, alert, h.dedupTTL, h.rateLimitTTL)
+	gateSpan.Finish(nil)
+
+	if !shouldFwd {
+		recordAlertSuppressed(alert.AlertType)
+		trace.SetAttr("outcome", "suppressed")
 		log.Printf("suppressed type=%s entity=%s/%s id=%s (dedup/rate limit)",
 			alert.AlertType, alert.EntityType, alert.EntityID, alert.AlertID)
 		return outcomeSuppressed, nil
 	}
 
+	storeSpan := trace.StartChild("postgres.store")
+	storeStart := time.Now()
 	err = h.storeRetry.do(ctx, "store alert "+alert.AlertID,
 		func(err error) bool { return !isPermanentStoreError(err) },
 		func(ctx context.Context) error { return h.store.Store(ctx, alert) })
+	recordStoreDuration(time.Since(storeStart))
+	storeSpan.Finish(err)
+
 	if err != nil {
+		handleErr = err
 		if isPermanentStoreError(err) {
 			_ = h.gate.Release(ctx, alert.AlertID,
 				gateClaim{key: dedupKey(alert), ttl: h.dedupTTL},
@@ -120,10 +145,15 @@ func (h *handler) handle(ctx context.Context, msg kafka.Message) (outcome, error
 		return 0, err
 	}
 
-	if err := h.publisher.Publish(ctx, alert); err != nil {
-		log.Printf("[WARN] live publish %s: %v", alert.AlertID, err)
+	pubSpan := trace.StartChild("redis.publish")
+	pubErr := h.publisher.Publish(ctx, alert)
+	pubSpan.Finish(pubErr)
+	if pubErr != nil {
+		log.Printf("[WARN] live publish %s: %v", alert.AlertID, pubErr)
 	}
+
 	if h.notifier != nil {
+		notifySpan := trace.StartChild("webhook.notify")
 		if h.webhookQueue != nil {
 			select {
 			case h.webhookQueue <- alert:
@@ -131,9 +161,15 @@ func (h *handler) handle(ctx context.Context, msg kafka.Message) (outcome, error
 				log.Printf("[WARN] webhook queue full; dropping notification %s", alert.AlertID)
 			}
 		} else if err := h.notifier.Notify(ctx, alert); err != nil {
+			notifySpan.Finish(err)
 			log.Printf("[WARN] webhook %s: %v", alert.AlertID, err)
+		} else {
+			notifySpan.Finish(nil)
 		}
 	}
+
+	recordAlertForwarded(alert.AlertType, alert.Severity)
+	trace.SetAttr("outcome", "forwarded")
 	log.Printf("forwarded type=%s severity=%s entity=%s/%s id=%s",
 		alert.AlertType, alert.Severity, alert.EntityType, alert.EntityID, alert.AlertID)
 	return outcomeForwarded, nil

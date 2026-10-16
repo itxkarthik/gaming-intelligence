@@ -13,5 +13,6 @@ FROM alpine:3.20
 RUN apk add --no-cache ca-certificates && adduser -D -u 10001 engine
 USER engine
 COPY --from=build /out/alert-engine /usr/local/bin/alert-engine
+EXPOSE 9095
 
 ENTRYPOINT ["alert-engine"]

@@ -11,6 +11,7 @@ import contextlib
 import json
 import logging
 import os
+import time
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 
@@ -30,7 +31,10 @@ from fastapi.staticfiles import StaticFiles
 import state
 from dashboard import router as dashboard_router, shutdown_publishers
 from dashboard import unavailable_page
+from metrics import collector
 from state import HEARTBEAT_SECONDS, as_float
+from tracing import parse_traceparent, start_span, start_tracer, stop_tracer
+from fastapi.responses import Response
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(name)s: %(message)s")
 log = logging.getLogger("api")
@@ -38,6 +42,7 @@ log = logging.getLogger("api")
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    start_tracer()
     state.feed.start()
     state.start_throughput_sampler()
     listener = asyncio.create_task(state.run_alert_listener(), name="alert-listener")
@@ -53,6 +58,7 @@ async def lifespan(_app: FastAPI):
                              asyncio.to_thread(state.stop_throughput_sampler))
         await state.close_redis()
         await state.close_pg_pool()
+        stop_tracer()
 
 
 app = FastAPI(
@@ -61,6 +67,62 @@ app = FastAPI(
     version=state.VERSION,
     lifespan=lifespan,
 )
+
+
+class TelemetryASGIMiddleware:
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        start_time = time.time()
+        headers = dict(scope.get("headers") or [])
+        traceparent_header = headers.get(b"traceparent", b"").decode("latin1")
+        trace_id, parent_span_id = parse_traceparent(traceparent_header)
+        path = scope.get("path", "")
+        method = scope.get("method", "GET")
+        status_code = [200]
+
+        async def send_wrapper(message):
+            if message["type"] == "http.response.start":
+                status_code[0] = message.get("status", 200)
+            await send(message)
+
+        async with start_span(
+            f"HTTP {method} {path}",
+            parent_trace_id=trace_id,
+            parent_span_id=parent_span_id,
+            attributes={
+                "http.method": method,
+                "http.path": path,
+            },
+        ) as span:
+            try:
+                await self.app(scope, receive, send_wrapper)
+                span.set_attribute("http.status_code", status_code[0])
+                duration = time.time() - start_time
+                if not path.startswith("/static") and path != "/metrics":
+                    collector.record_request(method, path, status_code[0], duration)
+            except Exception as e:
+                span.set_error(e)
+                duration = time.time() - start_time
+                if not path.startswith("/static") and path != "/metrics":
+                    collector.record_request(method, path, 500, duration)
+                raise
+
+
+app.add_middleware(TelemetryASGIMiddleware)
+
+
+@app.get("/metrics", include_in_schema=False)
+async def prometheus_metrics():
+    """Prometheus metrics endpoint."""
+    body = await collector.generate_metrics_text()
+    return Response(content=body, media_type="text/plain; version=0.0.4; charset=utf-8")
+
 
 app.include_router(dashboard_router)
 app.mount("/static",

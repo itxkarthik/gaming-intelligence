@@ -156,6 +156,9 @@ func serve(ctx context.Context, cfg Config) error {
 		}()
 	}
 
+	startMetricsServer(ctx, os.Getenv("METRICS_PORT"))
+	startTraceExporter(ctx)
+
 	log.Printf("alert-engine up: brokers=%v group=%s topic=%s redis=%s postgres=%s webhook=%s dedup_ttl=%s rate_limit_ttl=%s",
 		cfg.Brokers, cfg.GroupID, cfg.Topic, cfg.RedisAddr, redactDSN(cfg.PostgresURL),
 		webhookDescription(cfg.WebhookURL), cfg.DedupTTL, cfg.RateLimitTTL)

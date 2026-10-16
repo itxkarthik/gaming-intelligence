@@ -276,6 +276,16 @@ your shell or `.env` (empty = default):
 ALERT_DEDUP_TTL=2m ALERT_WEBHOOK_URL=https://hooks.example.com/abc make up
 ```
 
+### Observability & Telemetry (Grafana, Prometheus, Jaeger)
+
+The platform provides end-to-end metrics and distributed tracing across both Python (FastAPI, Redis, Kafka sampler) and Go (Alert Engine):
+
+| Service | Host URL | Description |
+|---|---|---|
+| **Grafana** | [http://localhost:3000](http://localhost:3000) (admin / admin) | Pre-provisioned dashboards for cheaters flagged, smurfs detected, behavior anomalies, server health, match quality, throughput, and alert lifecycle. |
+| **Prometheus** | [http://localhost:9090](http://localhost:9090) | Scrapes `/metrics` from FastAPI (`:8000`) and the Go Alert Engine (`:9095`). |
+| **Jaeger UI** | [http://localhost:16686](http://localhost:16686) | Distributed trace explorer showing end-to-end spans (`gate.admit`, `postgres.store`, `redis.publish`, `webhook.notify`, HTTP endpoints). |
+
 ### Simulator flags
 
 Run `simulator/bin/simulator --help` for the full list. The main ones:

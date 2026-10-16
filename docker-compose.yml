@@ -21,6 +21,7 @@ services:
   kafka:
     image: apache/kafka:3.7.0
     container_name: gaming-kafka
+    hostname: kafka
     ports:
       # Host clients (simulator, benchmarks) use EXTERNAL on 9094. PLAINTEXT
       # 9092 advertises kafka:9092 — only reachable on the compose network —
@@ -165,6 +166,7 @@ services:
       - POSTGRES_USER=gaming
       - POSTGRES_PASSWORD=gaming_dev
       - POSTGRES_DB=gaming_platform
+      - JAEGER_ENDPOINT=http://jaeger:4318/v1/traces
     depends_on:
       redis:
         condition: service_healthy
@@ -186,6 +188,8 @@ services:
       context: ./alert-engine
       dockerfile: Dockerfile
     container_name: gaming-alert-engine
+    ports:
+      - "127.0.0.1:9095:9095" # Prometheus metrics endpoint
     environment:
       - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
       - REDIS_HOST=redis
@@ -198,6 +202,8 @@ services:
       - ALERT_WEBHOOK_URL=${ALERT_WEBHOOK_URL:-}
       - ALERT_DEDUP_TTL=${ALERT_DEDUP_TTL:-}
       - ALERT_RATE_LIMIT_TTL=${ALERT_RATE_LIMIT_TTL:-}
+      - JAEGER_ENDPOINT=http://jaeger:4318/v1/traces
+      - TELEMETRY_PORT=9095
     depends_on:
       kafka:
         condition: service_healthy
@@ -211,6 +217,57 @@ services:
       - gaming-net
     restart: unless-stopped
 
+  # ─── Jaeger (Distributed Tracing) ───────────────────────────────────────
+  jaeger:
+    image: jaegertracing/all-in-one:1.60
+    container_name: gaming-jaeger
+    ports:
+      - "127.0.0.1:16686:16686" # Web UI
+      - "127.0.0.1:4318:4318"   # OTLP HTTP receiver
+      - "127.0.0.1:4317:4317"   # OTLP gRPC receiver
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+    networks:
+      - gaming-net
+    restart: unless-stopped
+
+  # ─── Prometheus (Metrics Collection) ────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.49.1
+    container_name: gaming-prometheus
+    ports:
+      - "127.0.0.1:9090:9090"
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.enable-lifecycle"
+    networks:
+      - gaming-net
+    restart: unless-stopped
+
+  # ─── Grafana (Observability Dashboard) ─────────────────────────────────
+  grafana:
+    image: grafana/grafana:latest
+    container_name: gaming-grafana
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+      - jaeger
+    networks:
+      - gaming-net
+    restart: unless-stopped
+
 networks:
   gaming-net:
     driver: bridge
@@ -219,3 +276,5 @@ volumes:
   kafka_data:
   redis_data:
   postgres_data:
+  prometheus_data:
+  grafana_data:
