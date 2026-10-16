@@ -6,10 +6,13 @@ dedup/rate-limit layer, PostgreSQL history, Redis `alerts:stream` pub/sub,
 and optional webhook).
 """
 
+import contextlib
 import itertools
 import json
 import time
+import uuid
 
+import redis
 from kafka import KafkaProducer
 
 from src.common.config import KAFKA_BOOTSTRAP_SERVERS, KAFKA_TOPICS
@@ -17,6 +20,7 @@ from src.common.config import KAFKA_BOOTSTRAP_SERVERS, KAFKA_TOPICS
 
 ALERTS_TOPIC = KAFKA_TOPICS["alerts"]
 DEDUP_TTL_SECONDS = 300
+LEASE_TTL_SECONDS = 30
 OUTBOX_KEY = "alerts:outbox"
 FLUSH_CHUNK_SIZE = 100
 _producer = None
@@ -70,6 +74,10 @@ def _dedup_key(payload):
     return f"alert:dedup:{payload['alert_type']}:{payload['entity_id']}"
 
 
+def _lease_key(alert_id):
+    return f"alert:lease:{alert_id}"
+
+
 class AlertBatch:
     """Transactional Redis outbox with at-least-once Kafka delivery.
 
@@ -99,23 +107,40 @@ class AlertBatch:
             pipe = self.r.pipeline()
             self.stage(pipe)
             pipe.execute()
-        # All drivers may drain the shared outbox. Concurrent delivery is safe
-        # at-least-once; the engine recognizes redelivery by the original ID.
+        # Claim short-TTL per-alert leases before sending to Kafka so concurrent
+        # drivers skip in-flight entries; crashed drainers' leases expire by TTL.
+        token = uuid.uuid4().hex
         it = self.r.hscan_iter(OUTBOX_KEY, count=FLUSH_CHUNK_SIZE)
         while True:
             chunk = list(itertools.islice(it, FLUSH_CHUNK_SIZE))
             if not chunk:
                 break
-            producer = _kafka_producer()
-            in_flight = [
-                (alert_id, producer.send(ALERTS_TOPIC, json.loads(encoded)))
-                for alert_id, encoded in chunk
+            claim_pipe = self.r.pipeline()
+            for alert_id, _ in chunk:
+                claim_pipe.set(_lease_key(alert_id), token, nx=True, ex=LEASE_TTL_SECONDS)
+            claims = claim_pipe.execute()
+            leased = [
+                (alert_id, encoded)
+                for (alert_id, encoded), claimed in zip(chunk, claims)
+                if claimed
             ]
+            if not leased:
+                continue
+            lease_keys = [_lease_key(alert_id) for alert_id, _ in leased]
+            producer = _kafka_producer()
             acked = []
             try:
+                in_flight = [
+                    (alert_id, producer.send(ALERTS_TOPIC, json.loads(encoded)))
+                    for alert_id, encoded in leased
+                ]
                 for alert_id, future in in_flight:
                     future.get(timeout=15)
                     acked.append(alert_id)
             finally:
-                if acked:
-                    self.r.hdel(OUTBOX_KEY, *acked)
+                try:
+                    if acked:
+                        self.r.hdel(OUTBOX_KEY, *acked)
+                finally:
+                    with contextlib.suppress(redis.RedisError):
+                        self.r.delete(*lease_keys)

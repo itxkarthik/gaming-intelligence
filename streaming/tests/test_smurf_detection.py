@@ -5,7 +5,6 @@ import os
 import sys
 
 import pytest
-from redis.exceptions import WatchError
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
@@ -73,27 +72,14 @@ class FakePipe:
     def __init__(self, r):
         self.r = r
         self.ops = []
-        self.watching = False
-        self.in_multi = False
-        self.watched = {}
 
     def __enter__(self):
         return self
 
     def __exit__(self, *_):
         self.ops.clear()
-        self.watching = False
-
-    def watch(self, *keys):
-        self.watching = True
-        self.watched.update({key: dict(self.r.hashes.get(key, {})) for key in keys})
-
-    def multi(self):
-        self.in_multi = True
 
     def hgetall(self, k):
-        if self.watching and not self.in_multi:
-            return dict(self.r.hashes.get(k, {}))
         self.ops.append(("hgetall", k))
 
     def hset(self, k, mapping=None):
@@ -111,17 +97,20 @@ class FakePipe:
             self.ops.append(("outbox", json.loads(payload)))
         elif numkeys == 3:
             self.ops.append(("write_account", args))
+        elif numkeys == 5:
+            self.ops.append(("evaluate_smurf", args))
 
     def execute(self):
+        if self.ops and all(op[0] == "hgetall" for op in self.ops):
+            self.r.read_batches.append(list(self.ops))
+            res = [dict(self.r.hashes.get(op[1], {})) for op in self.ops]
+            self.ops.clear()
+            return res
+
         self.r.attempts.append(list(self.ops))
         if self.r.on_conflict and any(op[0] != "hgetall" for op in self.ops):
             on_conflict, self.r.on_conflict = self.r.on_conflict, None
             on_conflict(self.r)
-        if any(self.r.hashes.get(key, {}) != value for key, value in self.watched.items()):
-            self.ops.clear()
-            self.watched.clear()
-            self.watching = self.in_multi = False
-            raise WatchError("concurrent LOGIN")
         self.r.transactions.append(list(self.ops))
         res = []
         for op in self.ops:
@@ -167,9 +156,44 @@ class FakePipe:
                     })
                     self.r.sets.setdefault(smurf_set_key, set()).discard(player_id)
                 res.append(1)
+            elif op[0] == "evaluate_smurf":
+                (account_key, smurf_key, smurf_set_key, _dedup_key, _outbox_key,
+                 exp_login_at, exp_age, exp_games, exp_rank, exp_archetype,
+                 action, player_id, prob_str, status_str, age_str, games_str,
+                 rank_str, archetype_str, reason_str, updated_at_str,
+                 _alert_id, alert_json, _ttl_str) = op[1]
+                stored = self.r.hashes.get(account_key, {})
+                if (
+                    str(stored.get("login_at", "")) != exp_login_at
+                    or str(stored.get("account_age_days", "")) != exp_age
+                    or str(stored.get("games_played", "")) != exp_games
+                    or str(stored.get("rank", "")) != exp_rank
+                    or str(stored.get("archetype", "")) != exp_archetype
+                ):
+                    res.append(0)
+                    continue
+                if action == "SKIP":
+                    res.append(1)
+                    continue
+                self.r.hashes.setdefault(smurf_key, {}).update({
+                    "player_id": player_id,
+                    "probability": prob_str,
+                    "status": status_str,
+                    "account_age_days": age_str,
+                    "games_played": games_str,
+                    "declared_rank": rank_str,
+                    "archetype": archetype_str,
+                    "reason": reason_str,
+                    "updated_at": updated_at_str,
+                })
+                if action == "SMURF":
+                    self.r.sets.setdefault(smurf_set_key, set()).add(player_id)
+                    if alert_json:
+                        self.r.outbox.append(json.loads(alert_json))
+                else:
+                    self.r.sets.setdefault(smurf_set_key, set()).discard(player_id)
+                res.append(1)
         self.ops.clear()
-        self.watched.clear()
-        self.watching = self.in_multi = False
         return res
 
 
@@ -186,6 +210,7 @@ class FakeRedis:
             "player:smurf:p1": {"status": "SMURF", "probability": "0.950"},
         }
         self.sets = {"players:smurf": {"p1"}}
+        self.read_batches = []
         self.transactions = []
         self.attempts = []
         self.outbox = []
@@ -333,8 +358,8 @@ def test_smurf_alert_is_staged_in_state_transaction_not_flushed():
     evaluate_smurfs(r, alerts, [{"player_id": "p1", **_combat()}])
     assert len(alerts.emitted) == 1
     assert r.outbox == alerts.emitted
-    assert [op[0] for op in alerts.staged_ops] == ["hset", "sadd"]
-    assert [op[0] for op in r.transactions[-1]] == ["hset", "sadd", "outbox"]
+    assert [op[0] for op in alerts.staged_ops] == ["evaluate_smurf"]
+    assert [op[0] for op in r.transactions[-1]] == ["evaluate_smurf"]
 
 
 def test_staging_failure_does_not_commit_smurf_state():
@@ -387,10 +412,9 @@ def test_established_login_between_combat_read_and_exec_cannot_restore_smurf(ale
     assert r.hashes["player:smurf:p1"]["account_age_days"] == "14"
     assert r.outbox == [unrelated]
     assert alerts.pending == []
-    # The obsolete intent reached only the aborted transaction, never Redis.
-    assert any(op[0] == "outbox" and op[1].get("alert_type") == "SMURF_DETECTED"
-               for op in r.attempts[0])
-    assert [op[0] for op in r.transactions[-1]] == ["hset", "srem", "outbox"]
+    # The obsolete SMURF intent was rejected by the per-player CAS check on pass 1.
+    assert [op[0] for op in r.attempts[0]] == ["evaluate_smurf", "outbox"]
+    assert [op[0] for op in r.transactions[-1]] == ["evaluate_smurf"]
 
 
 def test_watch_retry_uses_new_rank_and_retains_only_matching_smurf_intent():
@@ -434,6 +458,11 @@ def test_watch_covers_every_account_in_multi_player_batch():
     assert len(r.outbox) == 1
     assert r.outbox[0]["entity_id"] == "p1"
     assert alerts.pending == []
+    # Pass 1 pipelined both reads; pass 2 only re-read the conflicted player p2.
+    assert [[op[1] for op in batch] for batch in r.read_batches] == [
+        ["player:account:p1", "player:account:p2"],
+        ["player:account:p2"],
+    ]
 
 
 @pytest.mark.parametrize("alerts_factory", [lambda r: DummyAlerts(), AlertBatch])
@@ -462,24 +491,32 @@ def test_repeated_watch_retries_do_not_lose_unrelated_or_duplicate_smurf_intents
     assert alerts.pending == []
 
 
-def test_write_accounts_lua_script_against_real_redis():
+def test_write_accounts_and_evaluate_smurfs_lua_scripts_against_real_redis(monkeypatch):
     import uuid
     import redis
+    from src.common import alerts as alerts_mod
 
     host = os.getenv("REDIS_TEST_HOST")
     if not host:
         pytest.skip("set REDIS_TEST_HOST to a disposable Redis for Lua integration tests")
     client = redis.Redis(host=host, db=15, decode_responses=True)
-    pid = f"test_p_{uuid.uuid4().hex}"
+    prefix = f"test_smurf_{uuid.uuid4().hex}:"
+    pid = prefix + "p1"
     acct_key = f"player:account:{pid}"
     smurf_key = f"player:smurf:{pid}"
+    outbox_key = prefix + "outbox"
+    monkeypatch.setattr(alerts_mod, "OUTBOX_KEY", outbox_key)
+    monkeypatch.setattr(alerts_mod, "_dedup_key", lambda p: prefix + "dedup:" + p["entity_id"])
     try:
         client.hset(acct_key, mapping={
             "account_age_days": "3", "games_played": "12", "rank": "bronze",
             "archetype": "smurf", "login_at": "1000",
         })
-        client.hset(smurf_key, mapping={"status": "SMURF", "probability": "0.950"})
-        client.sadd("players:smurf", pid)
+        batch = AlertBatch(client)
+        evaluate_smurfs(client, batch, [{"player_id": pid, **_combat()}])
+        assert client.hget(smurf_key, "status") == "SMURF"
+        assert client.sismember("players:smurf", pid)
+        assert client.hlen(outbox_key) == 1
 
         # Older login is ignored by Lua script; newer established login reconciles state
         write_accounts(client, [
@@ -500,5 +537,7 @@ def test_write_accounts_lua_script_against_real_redis():
         assert client.hget(acct_key, "account_age_days") == "14"
         assert client.hget(acct_key, "rank") == "gold"
     finally:
-        client.delete(acct_key, smurf_key)
+        keys = list(client.scan_iter(prefix + "*")) + [acct_key, smurf_key]
+        if keys:
+            client.delete(*keys)
         client.srem("players:smurf", pid)

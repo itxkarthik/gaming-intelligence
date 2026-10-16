@@ -23,6 +23,7 @@ def outbox(monkeypatch):
     prefix = f"test:{uuid.uuid4().hex}:"
     monkeypatch.setattr(alerts, "OUTBOX_KEY", prefix + "outbox")
     monkeypatch.setattr(alerts, "_dedup_key", lambda p: prefix + p["alert_type"] + p["entity_id"])
+    monkeypatch.setattr(alerts, "_lease_key", lambda aid: prefix + "lease:" + aid)
     try:
         yield client, prefix
     finally:
@@ -123,6 +124,33 @@ def test_ack_removal_failure_redelivers_same_id(outbox, monkeypatch):
     assert [p["alert_id"] for p in producer.sent] == ["first", "first"]
 
 
+def test_concurrent_flusher_skips_leased_in_flight_alerts(outbox, monkeypatch):
+    r, _ = outbox
+    batch = alerts.AlertBatch(r)
+    batch.emit(payload("first"))
+    pipe = r.pipeline()
+    batch.stage(pipe)
+    pipe.execute()
+
+    sent = []
+
+    class InterleavedProducer:
+        def send(self, topic, value):
+            sent.append(value["alert_id"])
+            return self
+
+        def get(self, timeout):
+            # A second driver scanning the outbox while the first is awaiting
+            # Kafka ACK must see the active lease and skip duplicate publish.
+            alerts.AlertBatch(r).flush()
+
+    monkeypatch.setattr(alerts, "_kafka_producer", lambda: InterleavedProducer())
+    alerts.AlertBatch(r).flush()
+    assert sent == ["first"]
+    assert r.hlen(alerts.OUTBOX_KEY) == 0
+    assert not r.exists(alerts._lease_key("first"))
+
+
 def test_flush_pipelines_sends_per_chunk_and_batches_hdel(monkeypatch):
     events = []
     hdels = []
@@ -139,12 +167,36 @@ def test_flush_pipelines_sends_per_chunk_and_batches_hdel(monkeypatch):
             events.append(("send", value["alert_id"]))
             return FakeFuture(value["alert_id"])
 
+    class FakeClaimPipe:
+        def __init__(self, r):
+            self.r = r
+            self.keys = []
+
+        def set(self, key, value, nx=False, ex=None):
+            self.keys.append((key, value, nx))
+
+        def execute(self):
+            res = []
+            for key, value, nx in self.keys:
+                if nx and key in self.r.leases:
+                    res.append(False)
+                else:
+                    self.r.leases[key] = value
+                    res.append(True)
+            self.keys.clear()
+            return res
+
     class FakeOutboxRedis:
         def __init__(self):
             self.items = {
                 f"a{i}": json.dumps(payload(f"a{i}", f"p{i}"))
                 for i in range(3)
             }
+            self.leases = {alerts._lease_key("a_leased"): "other-driver"}
+            self.items["a_leased"] = json.dumps(payload("a_leased", "p_leased"))
+
+        def pipeline(self):
+            return FakeClaimPipe(self)
 
         def hscan_iter(self, key, count=100):
             return iter(list(self.items.items()))
@@ -154,15 +206,20 @@ def test_flush_pipelines_sends_per_chunk_and_batches_hdel(monkeypatch):
             for field in fields:
                 self.items.pop(field, None)
 
+        def delete(self, *keys):
+            for key in keys:
+                self.leases.pop(key, None)
+
     monkeypatch.setattr(alerts, "_kafka_producer", lambda: ChunkProducer())
     monkeypatch.setattr(alerts, "FLUSH_CHUNK_SIZE", 2)
     r = FakeOutboxRedis()
     alerts.AlertBatch(r).flush()
     # Chunk 1 sends a0, a1 before waiting on either get(), then batches HDEL(a0, a1);
-    # Chunk 2 sends a2, waits on get(), then HDEL(a2).
+    # Chunk 2 claims a2 and skips already-leased a_leased, then HDEL(a2).
     assert events == [
         ("send", "a0"), ("send", "a1"), ("get", "a0"), ("get", "a1"),
         ("send", "a2"), ("get", "a2"),
     ]
     assert hdels == [("a0", "a1"), ("a2",)]
-    assert r.items == {}
+    assert list(r.items.keys()) == ["a_leased"]
+    assert list(r.leases.keys()) == [alerts._lease_key("a_leased")]
