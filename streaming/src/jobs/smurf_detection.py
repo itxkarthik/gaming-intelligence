@@ -46,22 +46,25 @@ local login_at = tonumber(ARGV[2])
 if stored_login and login_at < stored_login then
     return 0
 end
-local legacy_state = not stored_login and (
-    redis.call('EXISTS', KEYS[2]) == 1
-    or redis.call('SISMEMBER', KEYS[3], ARGV[1]) == 1
-    or redis.call('EXISTS', KEYS[6]) == 1
-    or redis.call('EXISTS', KEYS[7]) == 1
-    or redis.call('SISMEMBER', KEYS[5], ARGV[1]) == 1
-    or redis.call('EXISTS', KEYS[10]) == 1
-)
-if legacy_state or (stored_login and login_at > stored_login) then
-    redis.call('DEL', KEYS[2], KEYS[6], KEYS[7], KEYS[10])
-    redis.call('SREM', KEYS[3], ARGV[1])
-    redis.call('SREM', KEYS[5], ARGV[1])
-    redis.call('SREM', KEYS[8], ARGV[1])
-    redis.call('ZREM', KEYS[9], ARGV[1])
-    if redis.call('EXISTS', KEYS[4]) == 1 then
-        redis.call('HSET', KEYS[4], 'flagged', 'false')
+local reset_session = (stored_login and login_at > stored_login) or not stored_login
+if reset_session then
+    if redis.call('EXISTS', KEYS[2]) == 1 or redis.call('SISMEMBER', KEYS[3], ARGV[1]) == 1 then
+        redis.call('DEL', KEYS[2])
+        redis.call('SREM', KEYS[3], ARGV[1])
+    end
+    local last_cheat_ms = tonumber(redis.call('HGET', KEYS[6], 'last_judged_window_end_ms')) or 0
+    if last_cheat_ms <= login_at then
+        redis.call('DEL', KEYS[6])
+        redis.call('SREM', KEYS[5], ARGV[1])
+        if redis.call('EXISTS', KEYS[4]) == 1 then
+            redis.call('HSET', KEYS[4], 'flagged', 'false')
+        end
+    end
+    local last_cusum_ms = tonumber(redis.call('HGET', KEYS[7], 'last_window_end_ms')) or 0
+    if last_cusum_ms <= login_at then
+        redis.call('DEL', KEYS[7], KEYS[10])
+        redis.call('SREM', KEYS[8], ARGV[1])
+        redis.call('ZREM', KEYS[9], ARGV[1])
     end
 end
 redis.call('HSET', KEYS[1], 'login_at', ARGV[2], unpack(ARGV, 6))
@@ -114,6 +117,7 @@ redis.call(
     'reason', ARGV[14],
     'updated_at', ARGV[15]
 )
+local staged = 0
 if action == 'SMURF' then
     redis.call('SADD', KEYS[3], ARGV[7])
     if ARGV[16] ~= '' then
@@ -121,12 +125,13 @@ if action == 'SMURF' then
         if not holder then
             redis.call('SET', KEYS[4], ARGV[16], 'EX', ARGV[18])
             redis.call('HSET', KEYS[5], ARGV[16], ARGV[17])
+            staged = 1
         end
     end
 else
     redis.call('SREM', KEYS[3], ARGV[7])
 end
-return 1
+return 1 + staged
 """
 
 # Declared-rank population baselines (acc_mean, acc_std, rxn_mean, rxn_std),
@@ -191,6 +196,20 @@ def evaluate_smurf(account, combat_stats):
                   f"(acc {z_acc:.1f}σ, rxn {z_rxn:.1f}σ)")
 
 
+def _dedup_combat_rows(rows):
+    """Pick one representative window per player (most shots, then newest end)."""
+    best = {}
+    for idx, row in enumerate(rows):
+        pid = row["player_id"]
+        shots = int(row.get("total_shots", 0))
+        end_ms = int(row.get("window_end_ms", 0))
+        rank = (shots, end_ms, idx)
+        prev = best.get(pid)
+        if prev is None or rank > prev[0]:
+            best[pid] = (rank, row)
+    return [row for _, row in best.values()]
+
+
 def evaluate_smurfs(r, alerts, rows):
     """Judge each scored combat window against its player's stored account.
 
@@ -198,6 +217,7 @@ def evaluate_smurfs(r, alerts, rows):
     avg_reaction_time). Pipelines `HGETALL` per chunk and applies a per-player
     Lua CAS script so concurrent LOGINs only retry the conflicted player(s).
     """
+    rows = _dedup_combat_rows(rows)
     if not rows:
         if alerts.pending:
             with r.pipeline() as pipe:
@@ -232,12 +252,12 @@ def evaluate_smurfs(r, alerts, rows):
 
             buffered = []
             # Each player queues EVAL plus two TTL commands. Select only each
-            # EVAL result; the remaining pipeline results are not CAS status.
+            # EVAL result; code==2 means a new alert was staged into OUTBOX_KEY.
             eval_results = results[0:3 * len(pending_rows):3]
-            emitted.extend(alert for alert, ok in zip(staged_alerts, eval_results)
-                           if ok and alert is not None)
+            emitted.extend(alert for alert, code in zip(staged_alerts, eval_results)
+                           if code == 2 and alert is not None)
             pending_rows = [
-                row for row, ok in zip(pending_rows, eval_results) if not ok
+                row for row, code in zip(pending_rows, eval_results) if not code
             ]
     return emitted
 

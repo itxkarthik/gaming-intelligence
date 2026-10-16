@@ -211,13 +211,16 @@ class FakePipe:
                     "reason": reason_str,
                     "updated_at": updated_at_str,
                 })
+                staged = 0
                 if action == "SMURF":
                     self.r.sets.setdefault(smurf_set_key, set()).add(player_id)
-                    if alert_json:
+                    if alert_json and _dedup_key not in self.r.dedup:
+                        self.r.dedup[_dedup_key] = _alert_id
                         self.r.outbox.append(json.loads(alert_json))
+                        staged = 1
                 else:
                     self.r.sets.setdefault(smurf_set_key, set()).discard(player_id)
-                res.append(1)
+                res.append(1 + staged)
         self.ops.clear()
         return res
 
@@ -235,6 +238,7 @@ class FakeRedis:
             "player:smurf:p1": {"status": "SMURF", "probability": "0.950"},
         }
         self.sets = {"players:smurf": {"p1"}}
+        self.dedup = {}
         self.read_batches = []
         self.transactions = []
         self.attempts = []
@@ -570,3 +574,22 @@ def test_write_accounts_and_evaluate_smurfs_lua_scripts_against_real_redis(monke
         if keys:
             client.delete(*keys)
         client.srem("players:smurf", pid)
+
+
+def test_evaluate_smurfs_deduplicates_windows_and_reports_only_staged_alerts():
+    r = FakeRedis(age=3, games=12)
+    alerts = DummyAlerts()
+    first = evaluate_smurfs(r, alerts, [
+        {"player_id": "p1", "window_end_ms": 1000, **_combat(acc=0.19, rxn=395.0, shots=10)},
+        {"player_id": "p1", "window_end_ms": 2000, **_combat(acc=0.62, rxn=160.0, shots=50)},
+    ])
+    assert len(r.read_batches) == 1
+    assert len(r.read_batches[0]) == 1
+    assert len(first) == 1
+    assert len(r.outbox) == 1
+
+    # Second call within the dedup window updates state (return code 1) but stages no new alert.
+    second = evaluate_smurfs(r, alerts, [{"player_id": "p1", **_combat()}])
+    assert second == []
+    assert len(r.outbox) == 1
+

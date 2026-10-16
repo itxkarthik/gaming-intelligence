@@ -200,7 +200,7 @@ def flagged_html(rows: list[dict[str, str]], n: int = 10) -> str:
                 ("IF", "Isolation Forest outlier", p.get("iforest_flag") == "true"),
                 ("CUSUM", "Sustained accuracy shift", p.get("behavior_anomaly") == "true"),
             ) if on)
-        out.append(f'<li><a class="mono" href="/players/{quote(html.unescape(pid), safe='')}">{pid}</a>'
+        out.append(f'<li><a class="mono" href="/players/{quote(html.unescape(pid), safe="")}">{pid}</a>'
                    f'<span class="signals">{signals}</span>'
                    f'<span class="score {_suspicion_class(eff)}">{eff * 100:.0f}%</span></li>')
     return "".join(out)
@@ -258,7 +258,7 @@ def cheat_rows_html(rows: list[dict[str, str]]) -> str:
         ml_flag = '<span class="chip warn">IF</span>' if p.get("iforest_flag") == "true" else "—"
         out.append(
             f'<tr>'
-            f'<td><a class="mono" href="/players/{quote(html.unescape(pid), safe='')}">{pid}</a></td>'
+            f'<td><a class="mono" href="/players/{quote(html.unescape(pid), safe="")}">{pid}</a></td>'
             f'<td class="bar-cell"><div class="bar"><div class="bar-fill {cls}" '
             f'style="width:{max(2, min(100, eff * 100)):.0f}%"></div></div>'
             f'<span class="bar-num {cls}">{eff:.2f}</span></td>'
@@ -282,7 +282,7 @@ def match_rows_html(rows: list[dict[str, Any]]) -> str:
         cls = _match_class(status)
         out.append(
             f'<tr>'
-            f'<td><a class="mono" href="/matches/{quote(html.unescape(mid), safe='')}">{mid}</a></td>'
+            f'<td><a class="mono" href="/matches/{quote(html.unescape(mid), safe="")}">{mid}</a></td>'
             f'<td class="bar-cell"><div class="bar"><div class="bar-fill {cls}" '
             f'style="width:{max(2, min(100, score)):.0f}%"></div></div>'
             f'<span class="bar-num {cls}">{score:.1f}</span></td>'
@@ -312,7 +312,7 @@ def behavior_rows_html(rows: list[dict[str, str]]) -> str:
         pid = E(str(a.get("player_id", "?")))
         out.append(
             f'<tr>'
-            f'<td><a class="mono" href="/players/{quote(html.unescape(pid), safe='')}">{pid}</a></td>'
+            f'<td><a class="mono" href="/players/{quote(html.unescape(pid), safe="")}">{pid}</a></td>'
             f'<td class="num">{E(str(a.get("last_batch_mean", "—")))}</td>'
             f'<td class="num">{E(str(a.get("baseline_mean", "—")))}'
             f' <span class="hint">n={E(str(a.get("baseline_n", "0")))}</span></td>'
@@ -332,7 +332,7 @@ def smurf_rows_html(rows: list[dict[str, str]]) -> str:
         prob = as_float(s.get("probability"))
         out.append(
             f'<tr>'
-            f'<td><a class="mono" href="/players/{quote(html.unescape(pid), safe='')}">{pid}</a></td>'
+            f'<td><a class="mono" href="/players/{quote(html.unescape(pid), safe="")}">{pid}</a></td>'
             f'<td class="bar-cell"><div class="bar"><div class="bar-fill warn" '
             f'style="width:{max(2, min(100, prob * 100)):.0f}%"></div></div>'
             f'<span class="bar-num warn">{prob:.2f}</span></td>'
@@ -367,7 +367,7 @@ def tournament_html(snap: dict[str, Any]) -> str:
     worst = mt["worst"]
     if worst:
         wid = E(str(worst["match_id"]))
-        worst_html = (f'Worst match: <a class="mono" href="/matches/{quote(html.unescape(wid), safe='')}">{wid}</a>'
+        worst_html = (f'Worst match: <a class="mono" href="/matches/{quote(html.unescape(wid), safe="")}">{wid}</a>'
                       f' · score {worst["score"]:.1f}')
     else:
         worst_html = "No matches scored yet."

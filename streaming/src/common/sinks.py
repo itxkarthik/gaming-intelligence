@@ -10,7 +10,7 @@ from pyspark.sql import functions as F
 from src.common.config import CHECKPOINT_DIR, HDFS_OUTPUT_DIR
 
 _CHECKPOINTS = {
-    "cheat_detection": "cheat_detection_v2",
+    "cheat_detection": "cheat_detection_v3",
     "economy_weapon_kills": "economy_kills",
 }
 

@@ -661,3 +661,38 @@ def test_checkpoint_identity_reads_persisted_query_uuid(spark, detector, tmp_pat
     assert detector.checkpoint_identity(spark) == "original-query"
     metadata.write_text(json.dumps({"id": "reset-query"}))
     assert detector.checkpoint_identity(spark) == "reset-query"
+
+
+def test_wallhack_is_flagged_while_diamond_is_not(spark):
+    wh_rows = _chain("p_wallhack", "m1", accuracy=0.45, reaction=120,
+                     shots=30, hits=14, kills=5, kill_hs=3)
+    diamond_rows = _chain("p_diamond", "m1", accuracy=0.42, reaction=190,
+                          shots=30, hits=13, kills=5, kill_hs=4, start=100)
+    scored = _score(spark, wh_rows + diamond_rows)
+    assert scored["p_wallhack"]["suspicion_score"] >= 0.70
+    assert scored["p_diamond"]["suspicion_score"] < 0.50
+
+
+def test_recomputed_same_window_clears_since_when_clean(outlier_detector, monkeypatch):
+    redis = StateRedis()
+    outlier_detector.write_player_scores(
+        redis, None, [decision_row(suspicion=0, end=1000)], "query", 0)
+    assert redis.hashes["player:cheat:evidence:p"]["since"] == "1000.0"
+
+    monkeypatch.setattr(outlier_detector, "score_rows", lambda model, rows: [None] * len(rows))
+    recomputed = outlier_detector.write_player_scores(
+        redis, None, [decision_row(suspicion=0, end=1000)], "query", 1)
+    assert recomputed[0]["iforest_flag"] is False
+    assert redis.hashes["player:cheat:evidence:p"]["since"] == ""
+
+
+def test_pre_login_window_does_not_pollute_new_login_state(outlier_detector):
+    redis = StateRedis()
+    redis.hashes["player:account:p"] = {"login_at": "1020000"}
+    stale = decision_row(suspicion=0.95, end=1015)
+    verdicts = outlier_detector.write_player_scores(redis, None, [stale], "query", 0)
+    assert verdicts[0]["judged"] is False
+    assert verdicts[0]["flagged"] is False
+    assert "player:p" not in redis.hashes
+    assert "p" not in redis.sets.get("players:flagged", set())
+

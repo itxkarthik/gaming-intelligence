@@ -190,12 +190,14 @@ func newWorld(cfg Config, profiles map[Archetype]*Profile, rng *rand.Rand, out e
 		w.players = append(w.players, p)
 	}
 	if anyShifted {
-		// Behavior CUSUM needs ten 5s baseline buckets plus its 30s event-time
-		// watermark before it can judge a shift.
+		// Behavior CUSUM needs ten 5s baseline buckets (~55s) on long runs,
+		// while leaving at least 35s of post-shift time on shorter runs so
+		// shifted windows precede the 30s event-time watermark horizon.
 		shiftAt := cfg.Duration / 2
-		const behaviorWarmup = 80 * time.Second
+		const behaviorWarmup = 55 * time.Second
+		const postShiftWindow = 35 * time.Second
 		if shiftAt < behaviorWarmup {
-			shiftAt = behaviorWarmup
+			shiftAt = max(shiftAt, min(behaviorWarmup, cfg.Duration-postShiftWindow))
 		}
 		w.shiftAt = start.Add(shiftAt)
 	}

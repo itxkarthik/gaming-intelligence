@@ -402,6 +402,7 @@ async def tournament_snapshot() -> dict[str, Any]:
 
 _pg_pool: asyncpg.Pool | None = None
 _pg_pool_lock = asyncio.Lock()
+_ALERT_HISTORY_SCHEMA_LOCK_ID = 74839201
 _ALERT_HISTORY_SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS alert_history (
     id BIGSERIAL PRIMARY KEY,
@@ -437,7 +438,12 @@ async def get_pg_pool() -> asyncpg.Pool:
                     PG_DSN, min_size=1, max_size=5, timeout=3, command_timeout=5)
                 try:
                     async with pool.acquire() as conn:
-                        await conn.execute(_ALERT_HISTORY_SCHEMA_SQL)
+                        async with conn.transaction():
+                            await conn.execute(
+                                "SELECT pg_advisory_xact_lock($1)",
+                                _ALERT_HISTORY_SCHEMA_LOCK_ID,
+                            )
+                            await conn.execute(_ALERT_HISTORY_SCHEMA_SQL)
                 except Exception:
                     await pool.close()
                     raise

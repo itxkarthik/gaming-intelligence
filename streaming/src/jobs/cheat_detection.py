@@ -112,13 +112,20 @@ def build_suspicion_pipeline(parsed):
     # Per-window profile means (simulator/profiles): accuracy normals 0.18-0.42,
     # aimbot 0.93; headshots per hit normals 0.08-0.28 (smurf 0.35), wallhack
     # 0.20, aimbot 0.88; reaction normals 190-380 ms, wallhack 120, aimbot 85.
+    wh_score = (
+        _ramp("avg_reaction_time", 142.0, 118.0)
+        * _ramp("avg_accuracy", 0.33, 0.43)
+    )
     return aggregated \
         .withColumn("acc_score", _ramp("avg_accuracy", 0.50, 0.95)) \
         .withColumn("hs_score", _ramp("headshot_ratio", 0.40, 0.80)) \
         .withColumn("rxn_score", _ramp("avg_reaction_time", 140.0, 40.0)) \
         .withColumn(
             "suspicion_score",
-            F.col("acc_score") * 0.45 + F.col("hs_score") * 0.40 + F.col("rxn_score") * 0.15,
+            F.greatest(
+                F.col("acc_score") * 0.45 + F.col("hs_score") * 0.40 + F.col("rxn_score") * 0.15,
+                wh_score * 0.85 + F.col("rxn_score") * 0.15,
+            ),
         )
 
 
@@ -269,9 +276,20 @@ def write_player_scores(r, spark, rows, checkpoint_id=None, batch_id=None):
         evidence_key = f"player:cheat:evidence:{player_id}"
         run_id = json.dumps([checkpoint_id, login_at])
         last_judged = evidence.get("last_judged_window_end_ms")
-        # Older windows can arrive in a catch-up batch after newer ones.
-        # They remain in the archive but cannot rewind online state.
-        stale_window = bool(last_judged and window_end_ms < int(last_judged))
+        pre_login = False
+        if login_at:
+            try:
+                login_at_ms = int(login_at)
+                source_min = row.get("source_event_min")
+                pre_login = (
+                    window_end_ms <= login_at_ms
+                    or (source_min is not None and int(source_min) < login_at_ms)
+                )
+            except (TypeError, ValueError):
+                pre_login = False
+        # Older windows or watermark-delayed windows from before a new LOGIN
+        # remain in the archive but cannot rewind or pollute online state.
+        stale_window = bool((last_judged and window_end_ms < int(last_judged)) or pre_login)
         judged = enough_shots and not stale_window
 
         new_context = (evidence.get("match_id") != row["match_id"]
@@ -296,14 +314,21 @@ def write_player_scores(r, spark, rows, checkpoint_id=None, batch_id=None):
             pipe.expire(evidence_key, PLAYER_STATE_TTL_SECONDS)
         elif judged:
             # Same window may be recomputed with more rows. Preserve the streak
-            # and do not count it as a second persistence interval.
+            # and do not count it as a second persistence interval; clear if clean.
             raw_since = evidence.get("since")
-            since = float(raw_since) if raw_since else None
-            if since is None and raw_iforest_flag:
-                since = window_end_ms / 1000.0
-                evidence["since"] = str(since)
-                pipe.hset(evidence_key, mapping={"since": str(since)})
-                pipe.expire(evidence_key, PLAYER_STATE_TTL_SECONDS)
+            if not raw_iforest_flag:
+                since = None
+                if raw_since:
+                    evidence["since"] = ""
+                    pipe.hset(evidence_key, mapping={"since": ""})
+                    pipe.expire(evidence_key, PLAYER_STATE_TTL_SECONDS)
+            else:
+                since = float(raw_since) if raw_since else None
+                if since is None:
+                    since = window_end_ms / 1000.0
+                    evidence["since"] = str(since)
+                    pipe.hset(evidence_key, mapping={"since": str(since)})
+                    pipe.expire(evidence_key, PLAYER_STATE_TTL_SECONDS)
             persistent = bool(since and
                               window_end_ms / 1000.0 - float(since) >= FOREST_PERSIST_SECONDS)
         elif enough_shots is False and not stale_window and advances:

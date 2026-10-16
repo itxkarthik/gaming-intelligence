@@ -126,18 +126,19 @@ func serve(ctx context.Context, cfg Config) error {
 		},
 		now: time.Now,
 	}
+	var webhookDone chan struct{}
 	if cfg.WebhookURL != "" {
 		h.notifier = webhookNotifier{client: &http.Client{Timeout: webhookTimeout}, url: cfg.WebhookURL}
 		h.webhookQueue = make(chan Alert, 128)
+		webhookDone = make(chan struct{})
 		go func() {
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case alert := <-h.webhookQueue:
-					if err := h.notifier.Notify(context.Background(), alert); err != nil {
-						log.Printf("[WARN] webhook %s: %v", alert.AlertID, err)
-					}
+			defer close(webhookDone)
+			for alert := range h.webhookQueue {
+				notifyCtx, cancel := context.WithTimeout(context.Background(), webhookTimeout)
+				err := h.notifier.Notify(notifyCtx, alert)
+				cancel()
+				if err != nil {
+					log.Printf("[WARN] webhook %s: %v", alert.AlertID, err)
 				}
 			}
 		}()
@@ -148,6 +149,10 @@ func serve(ctx context.Context, cfg Config) error {
 		webhookDescription(cfg.WebhookURL), cfg.DedupTTL, cfg.RateLimitTTL)
 
 	stats, err := consume(ctx, reader, h)
+	if h.webhookQueue != nil {
+		close(h.webhookQueue)
+		<-webhookDone
+	}
 	log.Printf("shutdown: %s", stats)
 	return err
 }

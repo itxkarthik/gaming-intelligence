@@ -361,3 +361,47 @@ def test_empty_completed_batch_still_retries_outbox_flush(monkeypatch):
 
     behavior_change.write_behavior_batch(EmptyBatch(), 0)
     assert r.outbox == []
+
+
+def test_normal_variance_does_not_collapse_and_shift_does_not_drift_baseline():
+    import math
+    import random
+
+    rng = random.Random(42)
+    false_positives = 0
+    sds = []
+    for _ in range(100):
+        series = [rng.gauss(0.28, 0.08 / math.sqrt(5)) for _ in range(60)]
+        state, anomalies = _run(series)
+        sd = math.sqrt(state["m2"] / (state["n"] - 1))
+        assert sd > 0.020, f"baseline sd collapsed to {sd}"
+        sds.append(sd)
+        if anomalies > 0:
+            false_positives += 1
+    assert sum(sds) / len(sds) > 0.030
+    assert false_positives <= 5, f"expected <=5% false positives, got {false_positives}%"
+
+    # Sustained moderate shift flags without pulling baseline mean up to shifted level
+    rng = random.Random(7)
+    warmup = [rng.gauss(0.28, 0.035) for _ in range(12)]
+    shifted = [rng.gauss(0.48, 0.035) for _ in range(25)]
+    state, anomalies = _run(warmup + shifted)
+    assert anomalies >= 1
+    assert state["mean"] < 0.34
+
+
+def test_pre_login_watermark_delayed_windows_are_ignored():
+    r = _FakeRedis()
+    r.hashes["player:account:p1"] = {"login_at": "1700000100000"}
+    alerts = _DummyAlerts()
+    steps = [
+        {"player_id": "p1", "shots": 5, "mean_accuracy": 0.90,
+         "window": {"end": 1_700_000_080_000}},
+        {"player_id": "p1", "shots": 5, "mean_accuracy": 0.28,
+         "window": {"end": 1_700_000_105_000}},
+    ]
+    update_behavior(r, alerts, steps)
+    assert r.hashes["behavior:cusum:p1"]["n"] == "1"
+    assert r.hashes["behavior:cusum:p1"]["mean"] == "0.280000"
+    assert r.hashes["behavior:cusum:p1"]["last_window_end_ms"] == "1700000105000"
+

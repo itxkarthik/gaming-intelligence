@@ -63,6 +63,8 @@ func isPermanentStoreError(err error) bool {
 }
 
 const schemaSQL = `
+BEGIN;
+SELECT pg_advisory_xact_lock(74839201);
 CREATE TABLE IF NOT EXISTS alert_history (
 	id         BIGSERIAL PRIMARY KEY,
 	alert_id   TEXT UNIQUE NOT NULL,
@@ -74,7 +76,12 @@ CREATE TABLE IF NOT EXISTS alert_history (
 	details    JSONB NOT NULL DEFAULT '{}'::jsonb,
 	ts         TIMESTAMPTZ NOT NULL,
 	received_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);`
+);
+CREATE INDEX IF NOT EXISTS alert_history_type_id_desc_idx
+	ON alert_history (alert_type, id DESC);
+CREATE INDEX IF NOT EXISTS alert_history_severity_id_desc_idx
+	ON alert_history (severity, id DESC);
+COMMIT;`
 
 const insertAlertSQL = `
 INSERT INTO alert_history

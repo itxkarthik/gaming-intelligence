@@ -95,3 +95,10 @@ def test_missing_checkpoint_identity_is_not_silently_ignored(spark, archive):
     df = spark.createDataFrame([("shot-1",)], "event_id string")
     with pytest.raises(Exception):
         sinks.safe_parquet_archive(df, "behavior_change", 0)
+
+
+def test_checkpoint_mapping_matches_cheat_detection_job():
+    from src.jobs.cheat_detection import CHEAT_CHECKPOINT
+
+    assert sinks._CHECKPOINTS["cheat_detection"] == CHEAT_CHECKPOINT
+

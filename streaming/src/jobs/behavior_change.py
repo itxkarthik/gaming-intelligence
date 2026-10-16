@@ -74,11 +74,10 @@ def cusum_step(state, x, k=CUSUM_K, h=CUSUM_H):
         s_neg = min(0.0, float(state["s_neg"]) + z + k)
         anomaly = s_pos > h or s_neg < -h
 
-    # Keep the baseline stationary while CUSUM is accumulating evidence.
-    # Otherwise even a moderate sustained shift slowly becomes the new normal
-    # before it can cross the alarm threshold.
+    # Keep the baseline stationary while CUSUM is accumulating evidence or
+    # seeing an outlier, without censoring normal in-control variation.
     baseline_sample = (n < WARMUP_STEPS or
-                       (not anomaly and abs(z) <= k and s_pos < 2.0 and s_neg > -2.0))
+                       (not anomaly and abs(z) < 3.5 and s_pos < 3.5 and s_neg > -3.5))
     if not baseline_sample:
         n1 = n
         mean = float(state.get("mean", 0.0))
@@ -120,8 +119,17 @@ def load_state(raw, login_at=None):
     loads the v2 state rather than resetting it again.
     """
     expected_login = str(login_at) if login_at is not None else (raw or {}).get("login_at", "")
+    raw_login = (raw or {}).get("login_at", "")
+    try:
+        same_run_untagged = (
+            not raw_login
+            and bool(expected_login)
+            and int((raw or {}).get("last_window_end_ms", 0) or 0) > int(expected_login)
+        )
+    except (TypeError, ValueError):
+        same_run_untagged = False
     if (not raw or raw.get("state_version") != BEHAVIOR_STATE_VERSION
-            or raw.get("login_at", "") != expected_login):
+            or (raw_login != expected_login and not same_run_untagged)):
         raw = {}
     state = {
         "state_version": BEHAVIOR_STATE_VERSION,
@@ -227,6 +235,12 @@ def update_behavior(r, alerts, steps):
     for index, pid in enumerate(player_ids):
         raw, flag_alive, account = reads[index * 3:index * 3 + 3]
         login_at = account.get("login_at") if account else None
+        login_at_ms = None
+        if login_at:
+            try:
+                login_at_ms = int(login_at)
+            except (TypeError, ValueError):
+                login_at_ms = None
         state = load_state(raw, login_at)
         last_end_ms = int(state.get("last_window_end_ms", 0))
         player_rows = sorted(
@@ -238,8 +252,11 @@ def update_behavior(r, alerts, steps):
         progressed = False
         for row in player_rows:
             win_end_ms = _window_end_ms(row)
-            if win_end_ms is not None and win_end_ms <= last_end_ms:
-                continue  # already processed (replay or overlapping batch)
+            if win_end_ms is not None and (
+                win_end_ms <= last_end_ms
+                or (login_at_ms is not None and win_end_ms <= login_at_ms)
+            ):
+                continue  # already processed or predates current login
             batch_mean = float(row["mean_accuracy"])
             state, anomaly, z = cusum_step(state, batch_mean)
             progressed = True
