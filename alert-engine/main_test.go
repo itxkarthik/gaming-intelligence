@@ -135,12 +135,12 @@ func TestKeyFormats(t *testing.T) {
 	}
 }
 
-// ─── shouldForward: dedup + rate limiting ──────────────────────────────────
+// ─── shouldForward (dedup) and shouldNotify (webhook rate limit) ───────────
 
 func TestShouldForwardFirstTime(t *testing.T) {
 	g := newFakeGate()
 	a := Alert{AlertID: "a1", AlertType: "CHEAT_DETECTED", EntityType: "PLAYER", EntityID: "p1"}
-	if !shouldForward(context.Background(), g, a, 5*time.Minute, 5*time.Minute) {
+	if !shouldForward(context.Background(), g, a, 5*time.Minute) {
 		t.Error("first alert must forward")
 	}
 }
@@ -150,40 +150,43 @@ func TestShouldForwardDeduplicatesSameTypeAndEntity(t *testing.T) {
 	first := Alert{AlertID: "a1", AlertType: "CHEAT_DETECTED", EntityType: "PLAYER", EntityID: "p1"}
 	repeat := first
 	repeat.AlertID = "a2"
-	shouldForward(context.Background(), g, first, time.Minute, time.Minute)
-	if shouldForward(context.Background(), g, repeat, time.Minute, time.Minute) {
+	shouldForward(context.Background(), g, first, time.Minute)
+	if shouldForward(context.Background(), g, repeat, time.Minute) {
 		t.Error("new alert with duplicate (type+entity) must be suppressed")
 	}
 }
 
-func TestShouldForwardRateLimitsAcrossTypesWithoutClaimingDedupKey(t *testing.T) {
+// A behavior shift or smurf verdict must never keep a cheat detection for
+// the same player out of history; only the webhook page is rate limited.
+func TestDifferentTypesForSameEntityAreAllForwarded(t *testing.T) {
 	g := newFakeGate()
-	first := Alert{AlertID: "a1", AlertType: "BEHAVIOR_ANOMALY", Severity: "WARNING", EntityType: "PLAYER", EntityID: "p1"}
-	second := Alert{AlertID: "a2", AlertType: "SMURF_DETECTED", Severity: "WARNING", EntityType: "PLAYER", EntityID: "p1"}
-	shouldForward(context.Background(), g, first, time.Minute, time.Minute)
-	// Same entity, different type: rate limit blocks it, and must NOT claim
-	// the suppressed alert's dedupKey.
-	if shouldForward(context.Background(), g, second, time.Minute, time.Minute) {
-		t.Error("second alert for same entity within window must be rate limited")
+	behavior := Alert{AlertID: "a1", AlertType: "BEHAVIOR_ANOMALY", Severity: "WARNING", EntityType: "PLAYER", EntityID: "p1"}
+	cheat := Alert{AlertID: "a2", AlertType: "CHEAT_DETECTED", Severity: "WARNING", EntityType: "PLAYER", EntityID: "p1"}
+	for _, a := range []Alert{behavior, cheat} {
+		if !shouldForward(context.Background(), g, a, time.Minute) {
+			t.Errorf("%s must be forwarded to history", a.AlertType)
+		}
 	}
-	if _, held := g.holders[dedupKey(second)]; held {
-		t.Errorf("rate-limited alert must not claim %s", dedupKey(second))
+	if !shouldNotify(context.Background(), g, behavior, time.Minute) {
+		t.Error("first page for the entity must be sent")
+	}
+	if shouldNotify(context.Background(), g, cheat, time.Minute) {
+		t.Error("second WARNING page for the same entity within the window must be rate limited")
+	}
+	if _, held := g.holders[rateKey(cheat)]; !held {
+		t.Errorf("rate key %s must stay claimed by the first page", rateKey(cheat))
 	}
 }
 
-func TestShouldForwardWarningDoesNotMaskCritical(t *testing.T) {
+func TestShouldNotifyWarningDoesNotMaskCritical(t *testing.T) {
 	g := newFakeGate()
-	warning := Alert{AlertID: "a1", AlertType: "CHEAT_DETECTED", Severity: "WARNING", EntityType: "PLAYER", EntityID: "p1"}
+	warning := Alert{AlertID: "a1", AlertType: "BEHAVIOR_ANOMALY", Severity: "WARNING", EntityType: "PLAYER", EntityID: "p1"}
 	critical := Alert{AlertID: "a2", AlertType: "CHEAT_DETECTED", Severity: "CRITICAL", EntityType: "PLAYER", EntityID: "p1"}
-	another := Alert{AlertID: "a3", AlertType: "CHEAT_DETECTED", Severity: "WARNING", EntityType: "PLAYER", EntityID: "p1"}
-	if !shouldForward(context.Background(), g, warning, time.Minute, time.Minute) {
-		t.Fatal("first warning must be forwarded")
+	if !shouldNotify(context.Background(), g, warning, time.Minute) {
+		t.Fatal("first warning page must be sent")
 	}
-	if !shouldForward(context.Background(), g, critical, time.Minute, time.Minute) {
-		t.Error("a CRITICAL alert must not be rate limited by an earlier WARNING")
-	}
-	if shouldForward(context.Background(), g, another, time.Minute, time.Minute) {
-		t.Error("a second WARNING for the same entity within the window must be rate limited")
+	if !shouldNotify(context.Background(), g, critical, time.Minute) {
+		t.Error("a CRITICAL page must not be rate limited by an earlier WARNING")
 	}
 }
 
@@ -191,10 +194,10 @@ func TestShouldForwardIndependentEntities(t *testing.T) {
 	g := newFakeGate()
 	a1 := Alert{AlertID: "a1", AlertType: "CHEAT_DETECTED", EntityType: "PLAYER", EntityID: "p1"}
 	a2 := Alert{AlertID: "a2", AlertType: "CHEAT_DETECTED", EntityType: "PLAYER", EntityID: "p2"}
-	if !shouldForward(context.Background(), g, a1, time.Minute, time.Minute) {
+	if !shouldForward(context.Background(), g, a1, time.Minute) {
 		t.Error("p1 must forward")
 	}
-	if !shouldForward(context.Background(), g, a2, time.Minute, time.Minute) {
+	if !shouldForward(context.Background(), g, a2, time.Minute) {
 		t.Error("p2 must forward independently of p1")
 	}
 }
@@ -204,10 +207,10 @@ func TestShouldForwardServerEntity(t *testing.T) {
 	a := Alert{AlertID: "s1", AlertType: "SERVER_DEGRADED", EntityType: "SERVER", EntityID: "eu-central-1"}
 	b := a
 	b.AlertID = "s2"
-	if !shouldForward(context.Background(), g, a, time.Minute, time.Minute) {
+	if !shouldForward(context.Background(), g, a, time.Minute) {
 		t.Error("server alert must forward")
 	}
-	if shouldForward(context.Background(), g, b, time.Minute, time.Minute) {
+	if shouldForward(context.Background(), g, b, time.Minute) {
 		t.Error("server alert must dedup within window")
 	}
 }
@@ -229,12 +232,12 @@ func TestShouldForwardIdempotentGate(t *testing.T) {
 		{"first sighting forwards", original, true},
 		{"different alert, same type+entity, suppressed", otherSameKeys, false},
 		{"redelivery of same alert_id forwards", original, true},
-		{"different type, same entity, rate limited", otherTypeSameEntity, false},
+		{"different type, same entity, forwards", otherTypeSameEntity, true},
 		{"second redelivery still forwards", original, true},
 	}
 	g := newFakeGate()
 	for _, s := range steps {
-		if got := shouldForward(context.Background(), g, s.alert, time.Minute, time.Minute); got != s.want {
+		if got := shouldForward(context.Background(), g, s.alert, time.Minute); got != s.want {
 			t.Errorf("%s: shouldForward(%s) = %v, want %v", s.name, s.alert.AlertID, got, s.want)
 		}
 	}
@@ -245,8 +248,11 @@ func TestShouldForwardFailsOpenOnGateError(t *testing.T) {
 	g.err = errors.New("redis: connection refused")
 	a := Alert{AlertID: "a1", AlertType: "CHEAT_DETECTED", EntityType: "PLAYER", EntityID: "p1"}
 	for i := range 2 {
-		if !shouldForward(context.Background(), g, a, time.Minute, time.Minute) {
+		if !shouldForward(context.Background(), g, a, time.Minute) {
 			t.Errorf("call %d: gate error must fail open (forward)", i+1)
+		}
+		if !shouldNotify(context.Background(), g, a, time.Minute) {
+			t.Errorf("call %d: gate error must fail open (notify)", i+1)
 		}
 	}
 }

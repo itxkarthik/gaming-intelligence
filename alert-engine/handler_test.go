@@ -388,3 +388,26 @@ type storeFunc func(ctx context.Context, a Alert) error
 func (f storeFunc) Store(ctx context.Context, a Alert) error {
 	return f(ctx, a)
 }
+
+func TestHandleRateLimitsOnlyTheWebhook(t *testing.T) {
+	store, pub, notifier := &fakeStore{}, &fakePublisher{}, &fakeNotifier{}
+	h := newTestHandler(store, pub, notifier)
+	smurf := sampleAlert("a1")
+	smurf.AlertType, smurf.Severity, smurf.EntityID = "SMURF_DETECTED", "WARNING", "player_7"
+	cheat := sampleAlert("a2")
+	cheat.Severity, cheat.EntityID = "WARNING", "player_7"
+
+	for _, a := range []Alert{smurf, cheat} {
+		got, err := h.handle(context.Background(), alertMessage(t, a))
+		if err != nil || got != outcomeForwarded {
+			t.Fatalf("%s: outcome %v err %v; want forwarded", a.AlertType, got, err)
+		}
+	}
+	if len(store.stored) != 2 || len(pub.published) != 2 {
+		t.Fatalf("stored %d, published %d; want both alerts in history and on the live stream",
+			len(store.stored), len(pub.published))
+	}
+	if len(notifier.notified) != 1 || notifier.notified[0].AlertID != "a1" {
+		t.Fatalf("notified %v; want only the first page for the entity", notifier.notified)
+	}
+}

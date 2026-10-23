@@ -62,6 +62,8 @@ func isPermanentStoreError(err error) bool {
 	return false
 }
 
+// schemaSQL is the only definition of alert_history: the engine owns the
+// table and the API only reads it (it serves empty history until this runs).
 const schemaSQL = `
 BEGIN;
 SELECT pg_advisory_xact_lock(74839201);

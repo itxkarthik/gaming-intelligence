@@ -60,7 +60,7 @@ type outcome int
 
 const (
 	outcomeForwarded  outcome = iota // stored and fanned out
-	outcomeSuppressed                // dedup / rate limit
+	outcomeSuppressed                // dedup
 	outcomeRejected                  // poison pill: can never be processed
 )
 
@@ -92,6 +92,8 @@ type handler struct {
 //     a failure is logged and the message is still committed. Holding the
 //     partition (or redelivering, which would re-notify) for a missed
 //     real-time push is worse than the miss; history is already durable.
+//     The webhook is also rate limited per entity (rateKey); history and the
+//     live stream are not.
 func (h *handler) handle(ctx context.Context, msg kafka.Message) (outcome, error) {
 	alert, err := parseAlert(msg.Value)
 	if err != nil {
@@ -114,13 +116,13 @@ func (h *handler) handle(ctx context.Context, msg kafka.Message) (outcome, error
 	}()
 
 	gateSpan := trace.StartChild("gate.admit")
-	shouldFwd := shouldForward(ctx, h.gate, alert, h.dedupTTL, h.rateLimitTTL)
+	shouldFwd := shouldForward(ctx, h.gate, alert, h.dedupTTL)
 	gateSpan.Finish(nil)
 
 	if !shouldFwd {
 		recordAlertSuppressed(alert.AlertType)
 		trace.SetAttr("outcome", "suppressed")
-		log.Printf("suppressed type=%s entity=%s/%s id=%s (dedup/rate limit)",
+		log.Printf("suppressed type=%s entity=%s/%s id=%s (dedup)",
 			alert.AlertType, alert.EntityType, alert.EntityID, alert.AlertID)
 		return outcomeSuppressed, nil
 	}
@@ -137,8 +139,7 @@ func (h *handler) handle(ctx context.Context, msg kafka.Message) (outcome, error
 		handleErr = err
 		if isPermanentStoreError(err) {
 			_ = h.gate.Release(ctx, alert.AlertID,
-				gateClaim{key: dedupKey(alert), ttl: h.dedupTTL},
-				gateClaim{key: rateKey(alert), ttl: h.rateLimitTTL})
+				gateClaim{key: dedupKey(alert), ttl: h.dedupTTL})
 			log.Printf("[ERROR] reject partition=%d offset=%d: %v", msg.Partition, msg.Offset, err)
 			return outcomeRejected, nil
 		}
@@ -152,12 +153,19 @@ func (h *handler) handle(ctx context.Context, msg kafka.Message) (outcome, error
 		log.Printf("[WARN] live publish %s: %v", alert.AlertID, pubErr)
 	}
 
-	if h.notifier != nil {
+	if h.notifier != nil && !shouldNotify(ctx, h.gate, alert, h.rateLimitTTL) {
+		trace.SetAttr("webhook", "rate_limited")
+		log.Printf("webhook rate limited type=%s entity=%s/%s id=%s",
+			alert.AlertType, alert.EntityType, alert.EntityID, alert.AlertID)
+	} else if h.notifier != nil {
 		notifySpan := trace.StartChild("webhook.notify")
 		if h.webhookQueue != nil {
+			// The span covers the hand-off; the worker sends asynchronously.
 			select {
 			case h.webhookQueue <- alert:
+				notifySpan.Finish(nil)
 			default:
+				notifySpan.Finish(errWebhookQueueFull)
 				log.Printf("[WARN] webhook queue full; dropping notification %s", alert.AlertID)
 			}
 		} else if err := h.notifier.Notify(ctx, alert); err != nil {
@@ -182,6 +190,10 @@ type messageReader interface {
 	FetchMessage(ctx context.Context) (kafka.Message, error)
 	CommitMessages(ctx context.Context, msgs ...kafka.Message) error
 }
+
+// errWebhookQueueFull marks a notification dropped because the async
+// webhook worker is behind.
+var errWebhookQueueFull = errors.New("webhook queue full")
 
 // fetchErrorBackoff is the pause after a failed fetch before trying again.
 const fetchErrorBackoff = time.Second

@@ -35,31 +35,41 @@ type Gate interface {
 
 // dedupKey: one alert per (type, entity, severity) per window. Keeping
 // severity in the key lets a later escalation through both dedup layers.
+// This is the only gate in front of alert history: distinct detections of
+// one entity (a smurf, a behavior shift, a cheat) are all stored.
 func dedupKey(a Alert) string {
 	return dedupKeyPrefix + a.AlertType + ":" + a.EntityID + ":" + a.Severity
 }
 
-// rateKey: at most ONE alert per entity per window per severity, regardless
-// of type — the roadmap's "max 1 alert per player per 5 min", applied per
-// severity so a routine WARNING can never mask a CRITICAL that follows it.
+// rateKey: at most ONE webhook notification per entity per window per
+// severity, regardless of type — the roadmap's "max 1 alert per player per
+// 5 min", applied to paging only so it can never drop a different detection
+// from history, and per severity so a routine WARNING can never mask the
+// page for a CRITICAL that follows it.
 func rateKey(a Alert) string {
 	return rateLimitKeyPrefix + a.EntityType + ":" + a.EntityID + ":" + a.Severity
 }
 
-// shouldForward atomically applies the dedup gate and the entity-wide rate
-// limit; both must admit the alert before either key is claimed.
+// shouldForward atomically applies the dedup gate: whether the alert is
+// stored and published at all.
 //
 // The gate fails open: when Redis errors, the alert is forwarded (and the
-// error logged once) because the producers already dedup and dropping an
-// alert is worse than delivering a duplicate.
-func shouldForward(ctx context.Context, g Gate, a Alert, dedupTTL, rateTTL time.Duration) bool {
-	claims := []gateClaim{
-		{key: dedupKey(a), ttl: dedupTTL},
-		{key: rateKey(a), ttl: rateTTL},
-	}
+// error logged) because the producers already dedup and dropping an alert
+// is worse than delivering a duplicate.
+func shouldForward(ctx context.Context, g Gate, a Alert, dedupTTL time.Duration) bool {
+	return admit(ctx, g, a, "gate", gateClaim{key: dedupKey(a), ttl: dedupTTL})
+}
+
+// shouldNotify applies the per-entity rate limit to the webhook. It fails
+// open like shouldForward: an extra page beats a missed one.
+func shouldNotify(ctx context.Context, g Gate, a Alert, rateTTL time.Duration) bool {
+	return admit(ctx, g, a, "webhook rate limit", gateClaim{key: rateKey(a), ttl: rateTTL})
+}
+
+func admit(ctx context.Context, g Gate, a Alert, name string, claims ...gateClaim) bool {
 	ok, err := g.Admit(ctx, a.AlertID, claims...)
 	if err != nil {
-		log.Printf("[WARN] gate unavailable, failing open for alert %s: %v", a.AlertID, err)
+		log.Printf("[WARN] %s unavailable, failing open for alert %s: %v", name, a.AlertID, err)
 		return true
 	}
 	return ok

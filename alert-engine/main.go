@@ -3,11 +3,12 @@
 // It consumes the Kafka `alerts` topic written by the Spark streaming jobs
 // and applies a second, engine-side processing layer (roadmap Phase 4):
 //
-//	dedup + rate limiting (Redis, max 1 alert / entity / 5 min by default)
+//	dedup (Redis, one alert per type / entity / severity / 5 min by default)
 //	severity classification / normalization
 //	PostgreSQL alert history (idempotent on alert_id)
 //	Redis publish on alerts:stream → FastAPI WebSocket fan-out
-//	outbound webhook (Discord/Slack-style JSON POST, optional)
+//	outbound webhook (Discord/Slack-style JSON POST, optional), rate limited
+//	to one page per entity / severity / 5 min by default
 //
 // Processing is at-least-once: a Kafka offset is committed only after its
 // alert is stored in PostgreSQL, suppressed by the gate, or rejected as a
@@ -156,7 +157,7 @@ func serve(ctx context.Context, cfg Config) error {
 		}()
 	}
 
-	startMetricsServer(ctx, os.Getenv("METRICS_PORT"))
+	startMetricsServer(ctx, os.Getenv("TELEMETRY_PORT"))
 	startTraceExporter(ctx)
 
 	log.Printf("alert-engine up: brokers=%v group=%s topic=%s redis=%s postgres=%s webhook=%s dedup_ttl=%s rate_limit_ttl=%s",
