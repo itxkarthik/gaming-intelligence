@@ -56,11 +56,23 @@ const (
 	shiftAccuracyCap  = 0.95
 )
 
-// Late-arrival injection. The streaming jobs use a 10 s watermark, so this
-// range produces both late-but-accepted and too-late-to-count events.
+// Late-arrival injection. The event-time streaming jobs use a 30 s
+// watermark, so every injected delay is late but still counted; server
+// metrics are never delayed.
 const (
 	lateMinDelay = 5 * time.Second
 	lateMaxDelay = 19 * time.Second
+)
+
+// Account history (see accountHistory). Profiles give each archetype a
+// typical age and game count; every account is jittered around it, and a
+// share of legitimate accounts are genuinely new, so a young account alone
+// never identifies a smurf.
+const (
+	newAccountShare    = 0.08 // legitimate accounts younger than the smurf gate
+	newAccountMaxDays  = 13
+	newAccountMaxGames = 29
+	accountJitter      = 0.5 // age and games drawn from profile * [1-j, 1+j]
 )
 
 // Archetype mix within a class (see chooseArchetype).
@@ -114,10 +126,12 @@ type Server struct {
 // Player is one account. Identity (ID, archetype) is stable across runs;
 // everything below the blank line is per-run state.
 type Player struct {
-	ID        string
-	Archetype Archetype
-	Profile   *Profile
-	shifted   bool // selected for the behaviour-shift injection
+	ID             string
+	Archetype      Archetype
+	Profile        *Profile
+	AccountAgeDays int
+	GamesPlayed    int
+	shifted        bool // selected for the behaviour-shift injection
 
 	connected bool
 	match     *Match // nil while queued or offline between matches
@@ -179,12 +193,15 @@ func newWorld(cfg Config, profiles map[Archetype]*Profile, rng *rand.Rand, out e
 		id := fmt.Sprintf("player_%04d", i+1)
 		roll, rankRoll := archetypeSeeds(id)
 		a := chooseArchetype(roll, rankRoll, cfg.CheaterRatio, cfg.SmurfRatio, cfg.ToxicRatio)
+		age, games := accountHistory(id, a, profiles[a])
 		p := &Player{
-			ID:        id,
-			Archetype: a,
-			Profile:   profiles[a],
-			shifted:   rng.Float64() < cfg.BehaviorShiftRatio,
-			damageBy:  map[string]int{},
+			ID:             id,
+			Archetype:      a,
+			Profile:        profiles[a],
+			AccountAgeDays: age,
+			GamesPlayed:    games,
+			shifted:        rng.Float64() < cfg.BehaviorShiftRatio,
+			damageBy:       map[string]int{},
 		}
 		anyShifted = anyShifted || p.shifted
 		w.players = append(w.players, p)
@@ -216,6 +233,25 @@ func archetypeSeeds(playerID string) (roll, rankRoll float64) {
 	return float64(h1.Sum64()%1_000_000_000) / 1e9, float64(h2.Sum64()%1_000_000_000) / 1e9
 }
 
+// accountHistory derives an account's age and game count from its ID, so
+// they stay stable across runs like the archetype. Smurfs stay young (that
+// is what a smurf account is); other accounts scatter around their profile,
+// and newAccountShare of legitimate players are brand new, so the
+// smurf detector must separate them by skill, not by account age.
+func accountHistory(playerID string, a Archetype, p *Profile) (ageDays, games int) {
+	h := fnv.New64a()
+	io.WriteString(h, playerID+"#account")
+	r := rand.New(rand.NewPCG(h.Sum64(), 0x5eed))
+	jitter := func(v int) int {
+		return max(1, int(math.Round(float64(v)*(1-accountJitter+2*accountJitter*r.Float64()))))
+	}
+	legit := a != ArchetypeSmurf && a != ArchetypeCheaterAimbot && a != ArchetypeCheaterWallhack
+	if legit && r.Float64() < newAccountShare {
+		return 1 + r.IntN(newAccountMaxDays), 1 + r.IntN(newAccountMaxGames)
+	}
+	return jitter(p.AccountAgeDays), jitter(p.GamesPlayed)
+}
+
 // chooseArchetype maps the two draws to a class: roll picks cheater / smurf /
 // toxic / normal by the configured ratios, rankRoll picks within the class.
 func chooseArchetype(roll, rankRoll, cheaterRatio, smurfRatio, toxicRatio float64) Archetype {
@@ -244,8 +280,8 @@ func (w *World) begin(now time.Time) {
 		p.connected = true
 		w.emitPlayer(p, EventLogin, map[string]string{
 			"archetype":        string(p.Archetype),
-			"account_age_days": strconv.Itoa(p.Profile.AccountAgeDays),
-			"games_played":     strconv.Itoa(p.Profile.GamesPlayed),
+			"account_age_days": strconv.Itoa(p.AccountAgeDays),
+			"games_played":     strconv.Itoa(p.GamesPlayed),
 			"rank":             p.Profile.SkillTier,
 		}, now)
 		w.enqueue(p, now)

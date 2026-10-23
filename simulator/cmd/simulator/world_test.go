@@ -1,8 +1,10 @@
 package main
 
 import (
+	"fmt"
 	"math"
 	"slices"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -109,7 +111,9 @@ func TestLoginCarriesGroundTruth(t *testing.T) {
 				t.Fatalf("%s LOGIN lacks %q: %v", e.PlayerID, key, e.Metadata)
 			}
 		}
-		if e.Metadata["archetype"] != string(p.Archetype) || e.Metadata["rank"] != p.Profile.SkillTier {
+		if e.Metadata["archetype"] != string(p.Archetype) || e.Metadata["rank"] != p.Profile.SkillTier ||
+			e.Metadata["account_age_days"] != strconv.Itoa(p.AccountAgeDays) ||
+			e.Metadata["games_played"] != strconv.Itoa(p.GamesPlayed) {
 			t.Fatalf("%s LOGIN metadata %v does not match its profile", p.ID, e.Metadata)
 		}
 	}
@@ -401,5 +405,43 @@ func TestReportsComeFromMatchmates(t *testing.T) {
 		if !slices.Contains(reportReasons, r.Metadata["reason"]) {
 			t.Fatalf("unknown reason %q", r.Metadata["reason"])
 		}
+	}
+}
+
+// smurf_detection's candidate gate (streaming/src/jobs/smurf_detection.py).
+const smurfGateDays, smurfGateGames = 14, 30
+
+func TestAccountHistoryIsNotGroundTruth(t *testing.T) {
+	profiles := testProfiles(t)
+	youngLegit, youngSmurf, smurfs := 0, 0, 0
+	for i := range 5000 {
+		id := fmt.Sprintf("player_%04d", i+1)
+		for _, a := range []Archetype{ArchetypeNormalGold, ArchetypeSmurf} {
+			age, games := accountHistory(id, a, profiles[a])
+			if again, againGames := accountHistory(id, a, profiles[a]); again != age || againGames != games {
+				t.Fatalf("%s account history is not stable across calls", id)
+			}
+			if age < 1 || games < 1 {
+				t.Fatalf("%s/%s got age %d games %d", id, a, age, games)
+			}
+			young := age < smurfGateDays && games < smurfGateGames
+			switch {
+			case a == ArchetypeSmurf:
+				smurfs++
+				if young {
+					youngSmurf++
+				}
+			case young:
+				youngLegit++
+			}
+		}
+	}
+	if youngSmurf != smurfs {
+		t.Fatalf("%d of %d smurf accounts fall outside the candidate gate", smurfs-youngSmurf, smurfs)
+	}
+	// Roughly newAccountShare of legitimate accounts must look new, or the
+	// gate alone would identify every smurf.
+	if share := float64(youngLegit) / 5000; share < newAccountShare/2 || share > newAccountShare*2 {
+		t.Fatalf("young legitimate share = %.3f; want about %.2f", share, newAccountShare)
 	}
 }
